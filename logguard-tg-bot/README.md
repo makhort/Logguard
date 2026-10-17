@@ -161,6 +161,30 @@ format (see `src/outbox.rs` and logguard's `src/botbox.rs`):
 Check it as root: `logguard -c /etc/logguard/logguard.toml notify-test --telegram` puts a test
 in the outbox and waits until logguard-tg-bot has sent it.
 
+## Install from a release bundle
+
+Instead of `deploy.sh` (step 2 below), without a Rust toolchain: every version tag `logguard-tg-bot-v<version>` gets its bundle, `logguard-tg-bot-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit, `config.env.example`, `SHA256SUMS` and `install.sh`.
+
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+
+```bash
+gh release download logguard-tg-bot-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-tg-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-tg-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-tg-bot-v0.1.0
+```
+
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-tg-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+
+On the server (`apt install unzip` if needed):
+
+```bash
+unzip logguard-tg-bot-*-x86_64-linux-musl.zip && cd logguard-tg-bot-*-x86_64-linux-musl
+sudo ./install.sh          # install or upgrade; the first time also /opt/logguard-tg-bot/config.env
+sudo ./install.sh rollback # back to the previous version
+```
+
+The first install, as with `deploy.sh`, doesn't start the bot while the token and admin id are placeholders: continue with step 3. `install.sh` checks every file against `SHA256SUMS` in a copy only root can write, then runs the same installer as `deploy.sh` (`./install.sh --check` only checks the files).
+
 ## Setup
 
 1. **Create the bot** with [@BotFather](https://t.me/BotFather): `/newbot`, then

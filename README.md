@@ -54,9 +54,26 @@ targets on stable over their seeds.
 
 ## Deployment
 
-Each crate has a `deploy/` directory: a `deploy.sh` that runs `ci.sh`, builds the binary and
-copies everything to a host over SSH, and an `install.sh` to run there as root. It also holds
-the systemd units, logrotate files and config templates. logguard ships three config
+**From a release bundle** (no Rust needed): one zip per crate,
+`<crate>-<version>-<commit>-x86_64-linux-musl.zip`. It holds the static binary, the systemd
+units, logrotate files and config templates, `SHA256SUMS`, and an `install.sh`. Unzip it on
+the server and run `sudo ./install.sh` (the first run of each puts a config in place to edit,
+then you run it again). Each crate's README has a section "Install from a release bundle",
+with how to download and verify one.
+
+**Releases:** a version is a tag `<crate>-v<version>` (`logguard-v0.1.0`,
+`logguard-xmpp-bot-v0.1.0`, ...), with the version in that crate's `Cargo.toml`
+(`./scripts/bundle.sh --check-tag TAG` checks it). Pushing the tag runs that crate's workflow,
+which refuses a tag that doesn't match, tests, builds and installs the bundle as on every
+commit, then attaches it to the GitHub Release of the tag, with its `.sha256` and (in a public
+repository) a signed build provenance attestation, `.sigstore.json`, that
+`gh attestation verify` checks. Every CI run, tagged or not, also keeps its zip as a workflow
+artifact.
+
+**From a checkout:** each crate has a `deploy/` directory: a `deploy.sh` that runs `ci.sh`,
+builds the binary and copies everything to a host over SSH, and an `install.sh` to run there
+as root. It also holds the systemd units, logrotate files and config templates.
+`scripts/bundle.sh` builds the release bundle locally. logguard ships three config
 templates: `logguard.toml` (XMPP server), `logguard-standalone.toml` (a host with SSH and UFW
 only, e.g. a VPN server) and `logguard-tg.toml` (Telegram relay node).
 

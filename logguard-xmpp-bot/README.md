@@ -276,6 +276,32 @@ interest in network and information security (GDPR art. 6(1)(f), recital 49).
 `systemctl start logguard-abuse-report`, then `journalctl -u logguard-abuse-report` and the
 bot's log (`outbox: … sent to the admin (OMEMO media)`).
 
+## Install from a release bundle
+
+Without a Rust toolchain: every version tag `logguard-xmpp-bot-v<version>` gets its bundle, `logguard-xmpp-bot-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit and logrotate files, `config.env.example`, `SHA256SUMS` and `install.sh`.
+
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+
+```bash
+gh release download logguard-xmpp-bot-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-xmpp-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-xmpp-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-xmpp-bot-v0.1.0
+```
+
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-xmpp-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+
+On the XMPP server (`apt install unzip` if needed):
+
+```bash
+unzip logguard-xmpp-bot-*-x86_64-linux-musl.zip && cd logguard-xmpp-bot-*-x86_64-linux-musl
+sudo ./install.sh          # first time: only /opt/logguard-xmpp-bot/config.env, from the template
+sudoedit /opt/logguard-xmpp-bot/config.env                     # the bot's account, ADMIN_JID, XMPP_DOMAIN ("Settings")
+sudo ./install.sh          # installs and starts the bot; later: upgrades it
+sudo ./install.sh rollback # back to the previous version
+```
+
+It refuses to install while `config.env` still holds `REPLACE…` placeholders. It checks every file against `SHA256SUMS` in a copy only root can write, then runs the same `install.sh` as `deploy.sh` below (`./install.sh --check` only checks the files). An existing `/opt/xmpp-bot` (the bot's old name) is moved over as with `deploy.sh`.
+
 ## Build, test, deploy
 
 ```bash

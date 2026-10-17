@@ -672,6 +672,34 @@ TUI keys: `1-8`/`Tab` switch tabs (Overview, Offenders, Bans, Events, Accounts, 
 
 `tui --actions <file>...` reads decision logs (`/var/log/logguard/actions.jsonl` and its rotated `.gz` copies, also ones copied to another machine, or the logs of several servers together) without the daemon and shows the state at their end: the bans still active then, the decisions, and per country and network the active bans, the sources banned during the period, their evidence lines and the ports in them. Nothing is re-scored. The tabs are Overview (period, bans per cause, from which peer, bans per hour), Bans, Events, Countries, Map and Trends; scores, accounts and the exposure scan aren't in the log. **Trends** (6) shows bans per day over the whole log (as many recent days as fit) and a table of weeks (Monday to Sunday, UTC), newest first: bans, the change from the week before, distinct sources, and the three countries and networks most bans went to. Use it after a tuning change, e.g. a new `slow_threshold`, to see whether it cut the noise or let more through; merge rotated copies (`actions.jsonl*`) to cover more weeks. Places come from the `[geo]` database when it's set up on that machine, else from the ban messages, which name the place only for bans decided on that server (bans from peers stay "unlocated"). Given several logs, a decision logged twice counts once: the same line in two files, or a ban received from a peer whose own log, with the original ban, is among the files (within 5 minutes). What's still banned at the end is worked out per log, so an unban in one log never ends another server's ban.
 
+## Install from a release bundle
+
+Without a Rust toolchain: every version tag `logguard-v<version>` gets its bundle, `logguard-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, everything `deploy.sh` copies to a server, the config templates in `configs/`, `SHA256SUMS`, and `install.sh`.
+
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+
+```bash
+gh release download logguard-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-v0.1.0
+```
+
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+
+On the server (`unzip` comes with `apt install unzip`):
+
+```bash
+unzip logguard-*-x86_64-linux-musl.zip && cd logguard-*-x86_64-linux-musl
+sudo ./install.sh --template logguard-standalone.toml   # a new server: only puts /etc/logguard/logguard.toml in place
+sudoedit /etc/logguard/logguard.toml             # allowlist, [notify], [cluster] node_id and peers, ...
+sudo ./install.sh                                # installs and starts logguard (in shadow mode)
+```
+
+- **Templates** (`configs/`, `--template` takes the file name, or the short one: `tg` for `logguard-tg.toml`): `logguard.toml` for an XMPP server (the default), `logguard-standalone.toml` for a host with SSH and UFW only, `logguard-tg.toml` for the Telegram relay node. A finished config can go in at once: `sudo ./install.sh --config my.toml`.
+- **Upgrades:** run `sudo ./install.sh` from the new bundle. Your config stays; the matching template (by `[cluster] node_id`) lands next to it as `logguard.toml.new`, and `config-diff` shows what the new version changes. The previous binary stays as `/usr/local/bin/logguard.prev`.
+- **Cluster key:** the first node whose config has `[cluster] enabled` gets a new `/etc/logguard/cluster.key`. Copy it to the others (as root, mode 0600) and install them with `sudo ./install.sh --cluster-key FILE`.
+- **What it checks:** root, Linux on x86_64, systemd. It copies the bundle into a directory only root can write and checks every file against `SHA256SUMS` there, so a non-root owner of the unzipped files can't swap them in between; then it runs the same `install.sh` as `deploy.sh` (below). `./install.sh --check` only checks the files. `SHA256SUMS` catches damaged files, not a forged bundle: that is what the attestation (above) is for.
+
 ## Rollout
 
 1. **Deploy in shadow mode** (the default), next to the existing cron jobs:

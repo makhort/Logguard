@@ -1,20 +1,36 @@
 name: logguard-tg-bot
 
+# Two kinds of push run this:
+#   - a branch push that changes these paths: the tests, then the bundle as a workflow artifact
+#   - a push of this crate's version tag, e.g. logguard-tg-bot-v0.1.0 (the version must be
+#     Cargo.toml's): the same, then the release job attaches the bundle to the GitHub Release
+#     of that tag. GitHub doesn't evaluate paths for tag pushes; other crates' tags don't match.
 on:
   push:
+    branches: ["**"]
     paths: ["logguard-tg-bot/**", ".github/workflows/logguard-tg-bot.yml"]
+    tags: ["logguard-tg-bot-v[0-9]*"]
   pull_request:
     paths: ["logguard-tg-bot/**", ".github/workflows/logguard-tg-bot.yml"]
+
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
     timeout-minutes: 30         # a hung test fails the job instead of running for 6 h
+    outputs:
+      bundle: ${{ steps.bundle.outputs.file }}
+      sha256: ${{ steps.bundle.outputs.sha256 }}
     defaults:
       run:
         working-directory: logguard-tg-bot
     steps:
       - uses: actions/checkout@v7
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: ./scripts/bundle.sh --check-tag "$GITHUB_REF_NAME"
       # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,7 +43,85 @@ jobs:
         with:
           tool: cargo-audit
       - run: ./scripts/ci.sh
+      # The release bundle (scripts/bundle.sh): binary, deploy files, installer. Its installer is
+      # tried as root on this throwaway runner, then the zip is published as it is (not zipped again).
+      - id: bundle
+        run: |
+          out=$(./scripts/bundle.sh)
+          zip=${out##*$'\n'}                      # its last line: the zip's path
+          sum=$(sha256sum "$zip")
+          echo "file=${zip##*/}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sum%% *}" >> "$GITHUB_OUTPUT"
+      - name: Install the bundle on the runner
+        run: |
+          d=$(mktemp -d) && unzip -q target/bundle/*.zip -d "$d" && cd "$d"/logguard-tg-bot-*
+          ./install.sh --check
+          sudo ./install.sh                                 # first install: config.env from the template
+          sudo test -f /opt/logguard-tg-bot/config.env
+          if systemctl is-active -q logguard-tg-bot; then exit 1; fi             # not started until it is filled in
+          /opt/logguard-tg-bot/logguard-tg-bot --version
       - uses: actions/upload-artifact@v7
         with:
-          name: logguard-tg-bot-x86_64-linux-musl
-          path: logguard-tg-bot/target/x86_64-unknown-linux-musl/release/logguard-tg-bot
+          path: logguard-tg-bot/target/bundle/*.zip
+          archive: false
+          if-no-files-found: error
+
+  # Tag pushes only, once check passed: the bundle check built and installed, its .sha256, and
+  # (in a public repository: GitHub offers attestations for private ones only with Enterprise
+  # Cloud) a signed build provenance attestation, attached to the GitHub Release of the tag.
+  release:
+    needs: check
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write           # create the Release, upload its assets
+      id-token: write           # the attestation: an OIDC token for the Sigstore certificate
+      attestations: write
+      artifact-metadata: write
+    env:
+      BUNDLE: ${{ needs.check.outputs.bundle }}
+    steps:
+      # upload-artifact named the artifact after the file (archive: false)
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.check.outputs.bundle }}
+          path: dist
+          skip-decompress: true   # the bundle is itself a zip: keep it as it is
+      - name: Check the bundle and write its .sha256
+        working-directory: dist
+        env:
+          SHA256: ${{ needs.check.outputs.sha256 }}
+        run: |
+          f=$(find . -type f)
+          [ -n "$f" ] && [ "$(printf '%s\n' "$f" | wc -l)" = 1 ] || { ls -lR; exit 1; }
+          [ "$f" = "./$BUNDLE" ] || mv -- "$f" "$BUNDLE"
+          echo "$SHA256  $BUNDLE" > "$BUNDLE.sha256"
+          sha256sum -c "$BUNDLE.sha256"           # the very file check built and installed
+      - id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ needs.check.outputs.bundle }}
+      - name: Attach to the GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          assets=("$BUNDLE" "$BUNDLE.sha256")
+          if [ -n "$ATTESTATION" ]; then
+              cp -- "$ATTESTATION" "$BUNDLE.sigstore.json"
+              assets+=("$BUNDLE.sigstore.json")
+          fi
+          if gh release view "$tag" > /dev/null 2>&1; then
+              gh release upload "$tag" "${assets[@]}" --clobber    # a re-run: replace them
+          else
+              printf '%s\n' \
+                  "Install: $GITHUB_SERVER_URL/$GH_REPO/blob/$tag/logguard-tg-bot/README.md#install-from-a-release-bundle" "" \
+                  "Verify: \`sha256sum -c $BUNDLE.sha256\`" \
+                  "and \`gh attestation verify $BUNDLE --repo $GH_REPO --source-ref refs/tags/$tag\`" |
+                  gh release create "$tag" "${assets[@]}" --verify-tag --title "$tag" --notes-file -
+          fi
