@@ -161,15 +161,20 @@ pub const MAX_DOWNLOAD: u64 = 16 << 20;
 /// at `max` bytes, so a huge or endless answer can't exhaust memory or disk.
 pub fn fetch_into(cmd: &[String], url: &str, out: &mut dyn std::io::Write, max: u64) -> Result<u64> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     let (prog, args) = cmd.split_first().context("empty fetch command")?;
+    // In a process group of its own, so the whole tree can be stopped: a wrapper (`sh -c`,
+    // which dash forks from instead of exec'ing) leaves children that hold the pipes open.
     let mut child = Command::new(prog)
         .args(args)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("running {prog}"))?;
+    let group = child.id();
     // Drained separately (only the start kept), so a chatty program can't block on it.
     let mut err_pipe = child.stderr.take().context("stderr")?;
     let errors = std::thread::spawn(move || {
@@ -183,7 +188,8 @@ pub fn fetch_into(cmd: &[String], url: &str, out: &mut dyn std::io::Write, max: 
     // Too big, or the output can't be written (disk full): stop the program, which would
     // otherwise block forever on its full pipe.
     if copied.as_ref().map_or(true, |n| *n > max) {
-        let _ = child.kill();
+        drop(stdout);
+        kill_group(group);
         let _ = child.wait();
         let _ = errors.join();
         return match copied {
@@ -193,12 +199,36 @@ pub fn fetch_into(cmd: &[String], url: &str, out: &mut dyn std::io::Write, max: 
     }
     drop(stdout);
     let status = child.wait()?;
+    // Something it left behind still holds stderr open, and the reader would wait for it:
+    // stop that too. (The group then still has members, so its id is still theirs.)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !errors.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !errors.is_finished() {
+        kill_group(group);
+    }
     let err = errors.join().unwrap_or_default();
     let n = copied?;
     if !status.success() {
         bail!("{prog} failed ({status}): {}", String::from_utf8_lossy(&err).trim());
     }
     Ok(n)
+}
+
+/// SIGKILL to every process in the group `fetch_into` started. Only while the group's id can't
+/// have been reused: its leader not yet reaped, or members still holding its pipes.
+fn kill_group(group: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9; // Linux and macOS
+    let Ok(pgid) = i32::try_from(group) else { return };
+    // SAFETY: kill(2) takes plain integers and touches no memory; a negative pid names a
+    // process group, here the one of a child we started (see above).
+    unsafe {
+        kill(-pgid, SIGKILL);
+    }
 }
 
 /// Fetches a URL with the configured command (curl, falling back to wget), at most `MAX_DOWNLOAD` bytes.
@@ -333,6 +363,20 @@ mod tests {
         assert!(buf.len() <= (1 << 20) + 1, "stopped at the cap");
         let err = fetch_into(&cmd("echo nope >&2; exit 22"), "http://x", &mut Vec::new(), 10).unwrap_err().to_string();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn stops_what_the_command_started() {
+        let cmd = |script: &str| ["sh", "-c", script, "sh"].map(String::from).to_vec();
+        let start = std::time::Instant::now();
+        // `yes` as a child of the shell (as dash runs `sh -c yes`): killing the shell alone
+        // left it blocked on the full pipe, holding stderr open, and fetch_into waiting forever
+        let err = fetch_into(&cmd("yes; true"), "http://x", &mut Vec::new(), 1 << 16).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
+        // a background process left holding stderr after the command is done
+        let mut buf = Vec::new();
+        assert_eq!(fetch_into(&cmd("sleep 60 > /dev/null & echo ok"), "http://x", &mut buf, 100).unwrap(), 3);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
     }
 
     #[test]
