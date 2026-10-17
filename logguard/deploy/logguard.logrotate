@@ -1,0 +1,21 @@
+# /etc/logrotate.d/logguard - the daemon keeps actions.jsonl open (append mode),
+# so copytruncate rotates it without a restart.
+/var/log/logguard/actions.jsonl {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+
+# Written once a day by logguard-avscan; logguard remembers what it already reported.
+/var/log/logguard/avscan.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+}

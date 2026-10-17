@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ClamAV scan for logguard
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10min
+# Catch up after the server was down (e.g. the weekly upgrade reboot) at scan time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

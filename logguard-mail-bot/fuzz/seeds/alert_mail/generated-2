@@ -1,0 +1,15 @@
+To: admin
+Subject: [vpn] logguard: new registration
+
+[vpn] logguard: new registration
+
+account x@example.org
+Bcc: evil@example.net
+
+--=_logguard_0
+Content-Type: text/html
+.
+..
+From me
+=?utf-8?b?QQ==?=
+=3D

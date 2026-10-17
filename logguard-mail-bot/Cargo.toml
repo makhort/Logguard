@@ -1,0 +1,38 @@
+[package]
+name = "logguard-mail-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Send-only mail bot delivering logguard's admin alerts, digests and reports, OpenPGP-encrypted"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+clap = { version = "4", features = ["derive", "env"] }
+# the pseudonyms of SANITIZE=on (src/redact.rs, as logguard-tg-bot)
+hmac = "0.12"
+# SMTP: blocking client (the bot only sends), rustls with ring (as the other bots): no
+# OpenSSL, no aws-lc, so the static musl build works. The system's CA store (/etc/ssl/certs).
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls", "ring", "rustls-native-certs"] }
+log = { version = "0.4", features = ["std"] }
+# OpenPGP (seal.rs): pure Rust, MIT/Apache; it takes rand 0.8's RNG traits
+pgp = { version = "0.21", default-features = false }
+quoted_printable = "0.5"
+rand = "0.9"
+rand08 = { package = "rand", version = "0.8" }
+# lettre's own source of the system's CAs; the bot checks there are some
+rustls-native-certs = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+signal-hook = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# the fake mail server in tests/fake_smtp.rs: a test CA and a TLS server
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

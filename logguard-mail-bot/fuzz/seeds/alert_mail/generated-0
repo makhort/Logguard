@@ -1,0 +1,17 @@
+To: admin
+Subject: [xmpp] logguard daily digest
+
+[xmpp] logguard daily digest
+
+Period 2026-10-16 07:05 → 2026-10-17 07:05 UTC (1d)
+Mode: Enforce. Active bans now: 3.
+
+Attention:
+  • certificate example.org:5223 expires in 5d
+  • cluster peer 198.51.100.20:7946 failing: connect: timed out
+
+Bans (2):
+  10.1.2.3  40 pts  banned (2)  Germany / Example (AS64496)
+
+Exposed: 22 sshd, [2001:db8::10]:5223 ejabberd
+Certificates: example.org:5223 85d, nextcloud.example.org:443 5d

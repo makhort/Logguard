@@ -1,0 +1,16 @@
+# Settings for /usr/local/sbin/logguard-avscan (run daily by logguard-avscan.timer).
+# Change the time with:  systemctl edit logguard-avscan.timer
+
+# What to scan (space-separated; shell wildcards like /home/*/www work). Keep it to places where software and uploads live:
+# a full-disk scan of Docker volumes or Nextcloud data takes hours.
+#AVSCAN_PATHS="/etc /opt /root /home /srv /usr/local /var/www /var/spool/cron /tmp /var/tmp /dev/shm"
+
+# Directory regexes to skip (clamscan only), e.g. "^/home/[^/]+/backups ^/opt/big-cache"
+#AVSCAN_EXCLUDE=""
+
+# auto (clamdscan if clamav-daemon runs, else clamscan), clamscan or clamdscan.
+# clamscan loads all signatures (~1-1.5 GB RAM) for each run; clamd keeps them loaded.
+#AVSCAN_SCANNER=auto
+
+# Must match [antivirus] log in /etc/logguard/logguard.toml.
+#AVSCAN_LOG=/var/log/logguard/avscan.log

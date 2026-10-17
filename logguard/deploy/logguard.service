@@ -1,0 +1,57 @@
+[Unit]
+Description=logguard - behaviour-based protection for SSH, ejabberd and UFW
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+# logguard reports READY=1 and pings the watchdog from its main loop: if that loop ever
+# hangs (a stuck nft/ejabberdctl call, a deadlock), systemd kills and restarts it.
+Type=notify
+NotifyAccess=main
+WatchdogSec=2min
+ExecStart=/usr/local/bin/logguard --config /etc/logguard/logguard.toml run
+Restart=always
+RestartSec=5
+# /run/logguard, /var/lib/logguard, /var/log/logguard
+RuntimeDirectory=logguard
+StateDirectory=logguard
+LogsDirectory=logguard
+
+# Runs as root: needs the journal, CAP_NET_ADMIN for nftables and /etc/ufw for the ufw fallback.
+NoNewPrivileges=yes
+PrivateTmp=yes
+# read-only, not yes: the cron watch reads scripts that crontabs run from /root or /home.
+ProtectHome=read-only
+ProtectSystem=true
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+# journalctl, docker and the control socket (Unix), nft and ufw (netlink), the cluster,
+# downloads and the ejabberd API (IP)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Not ProtectSystem=strict or a capability bound: logguard runs nft, ufw (which rewrites
+# /etc/ufw), docker and ejabberdctl. If nft stops working under this, logguard falls back
+# to ufw and raises a high "nft-setup" alert.
+# Measured peak: ~10 MB replaying a month of real traffic (~50 MB with the [geo] database);
+# ~80 MB (~115 MB with geo) in a synthetic flood of 450,000 sources and 222,000 bans in 42 h,
+# far beyond what UFW's own log rate limit lets through. Child processes count too:
+# journalctl, docker logs (~20 MB), and briefly ejabberdctl and ufw. ejabberdctl starts a
+# whole Erlang VM (tens of MB) per call unless ejabberd's CTL_OVER_HTTP is set up (README,
+# "XMPP notifications"); then it is a short curl call.
+# If the limit is ever hit, disabling [geo] frees ~30-40 MB. MemoryHigh makes the kernel
+# reclaim page cache early instead of killing.
+MemoryHigh=112M
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

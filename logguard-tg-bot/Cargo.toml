@@ -1,0 +1,30 @@
+[package]
+name = "logguard-tg-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram bot delivering logguard's admin alerts, digests and reports"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+clap = { version = "4", features = ["derive", "env"] }
+hmac = "0.12"
+log = { version = "0.4", features = ["std"] }
+# OpenPGP for the files (seal.rs): pure Rust, MIT/Apache; it takes rand 0.8's RNG traits
+pgp = { version = "0.21", default-features = false }
+rand = "0.9"
+rand08 = { package = "rand", version = "0.8" }
+# rustls with ring (as logguard-xmpp-bot): no OpenSSL, no aws-lc, so the static musl build works
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros", "time", "signal", "sync", "net", "io-util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

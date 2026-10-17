@@ -1,0 +1,7 @@
+# cargo audit (scripts/ci.sh) reads this.
+[advisories]
+# RUSTSEC-2023-0071 (rsa, "Marvin"): timing side channels in RSA private-key operations
+# (decryption, signing). logguard-tg-bot only encrypts to the admin's public key (src/seal.rs, through
+# rpgp) and holds no RSA private key; no fixed rsa version exists. Look again when rpgp moves
+# to rsa 0.10 or the advisory changes.
+ignore = ["RUSTSEC-2023-0071"]

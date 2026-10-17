@@ -1,0 +1,11 @@
+# The bot keeps bot.log open (appending), so it is copied and truncated in place.
+# Rotated weekly, one old copy kept: no line is older than 14 days (the README says so).
+/var/log/logguard-mail-bot/bot.log {
+    su logguard-mail-bot logguard-mail-bot
+    weekly
+    rotate 1
+    maxage 14
+    missingok
+    notifempty
+    copytruncate
+}

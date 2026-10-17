@@ -1,0 +1,45 @@
+# Settings for /usr/local/sbin/logguard-abuse-report (run weekly by
+# logguard-abuse-report.timer). Change the time with:  systemctl edit logguard-abuse-report.timer
+# (keep it the same on every server).
+
+# auto: relay on a node with [notify] xmpp = false and cluster peers (a relay node for Telegram or
+# mail), else merge where a bot's outbox exists (any server with logguard-xmpp-bot, logguard-tg-bot or
+# logguard-mail-bot; one without cluster peers merges at once), else send to the cluster peers if
+# there are any (the VPN server), else off. Or send, merge, relay, off.
+#ABUSE_REPORT_ROLE=auto
+
+# The window of each report.
+#ABUSE_REPORT_SINCE=7d
+
+# merge: the peers' node ids to wait for (up to ABUSE_REPORT_WAIT_MIN minutes). Empty:
+# merge as soon as the first peer report arrives (enough with one peer).
+#ABUSE_REPORT_PEERS="vpn"
+#ABUSE_REPORT_WAIT_MIN=15
+
+# merge: look up each network's abuse mailbox (RDAP via rdap.org); no leaves them out.
+#ABUSE_REPORT_CONTACTS=yes
+
+# merge: the XMPP bot's outbox and the user it runs as (it must be able to delete the file).
+# Default: logguard's [notify] bot_outbox (else /opt/logguard-xmpp-bot/outbox) and bot_user.
+#ABUSE_REPORT_OUTBOX=/opt/logguard-xmpp-bot/outbox
+#ABUSE_REPORT_OWNER=ejabberd
+
+# merge and relay: the Telegram bot's outbox (logguard-tg-bot), which sends the report encrypted to the
+# admin's OpenPGP key. Default: logguard's [notify] tg_outbox and tg_user; empty: no copy.
+#ABUSE_REPORT_TG_OUTBOX=/opt/logguard-tg-bot/outbox
+#ABUSE_REPORT_TG_OWNER=logguard-tg-bot
+
+# merge and relay: the mail bot's outbox (logguard-mail-bot), which mails the report encrypted to
+# the recipients' OpenPGP keys. Default: logguard's [notify] mail_outbox and mail_user; empty: no copy.
+#ABUSE_REPORT_MAIL_OUTBOX=/opt/logguard-mail-bot/outbox
+#ABUSE_REPORT_MAIL_OWNER=logguard-mail-bot
+
+# With a Telegram relay node (deploy/logguard-tg.toml; role relay there, picked by auto):
+# on the XMPP server (merge), wait for its report too and send it the merged text report:
+#ABUSE_REPORT_PEERS="vpn tg"
+#ABUSE_REPORT_FORWARD_TO="203.0.113.10:7946"
+# on the relay node, send its own report to the merging server only, and wait this long for
+# the merged one (the merging server waits for its peers first, then looks up the mailboxes;
+# if none comes, the relay node merges itself):
+#ABUSE_REPORT_SEND_TO="11.17.39.236:7946"
+#ABUSE_REPORT_RELAY_WAIT_MIN=60

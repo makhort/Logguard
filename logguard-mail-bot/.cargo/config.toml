@@ -1,0 +1,14 @@
+# Static Linux build from macOS without a C cross toolchain:
+#   cargo build --release --target x86_64-unknown-linux-musl
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# ring (the TLS crypto) has some C and assembly. Apple clang compiles them as freestanding
+# x86_64 objects; RING_CORE_NOSTDLIBINC makes ring skip the libc headers it would
+# otherwise want (there are no musl headers on this Mac). llvm-ar (rustup component
+# llvm-tools) packs them in an archive the ELF linker can read.
+[env]
+AR_x86_64_unknown_linux_musl = { value = "scripts/llvm-ar", relative = true }
+CC_x86_64_unknown_linux_musl = "clang"
+CFLAGS_x86_64_unknown_linux_musl = "--target=x86_64-unknown-linux-gnu -ffreestanding -DRING_CORE_NOSTDLIBINC=1"

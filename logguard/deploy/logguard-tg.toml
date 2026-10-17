@@ -1,0 +1,213 @@
+# logguard for the Telegram relay node: a small VPS with SSH + UFW, no ejabberd, running logguard-tg-bot.
+# It delivers the cluster's admin messages (its own, and those the XMPP and VPN nodes relay)
+# to Telegram through logguard-tg-bot, so the XMPP server never talks to Telegram itself. The other
+# nodes limit what it may hand them ([cluster] peer_accept there): notices and the weekly
+# report's input, never bans or trust. Add this node to their peers and peer_accept (their
+# templates have the lines, commented out) and its address to ufw there (install.sh does).
+# `logguard -c /etc/logguard/logguard.toml print-config` shows every effective setting.
+mode = "shadow"
+state_file = "/var/lib/logguard/state.json"
+socket = "/run/logguard/logguard.sock"
+actions_log = "/var/log/logguard/actions.jsonl"
+
+[sources]
+ejabberd = false
+ssh = true
+ufw = true
+oom = true                # alert when the kernel kills a process for lack of memory ("system" topic)
+services = ["logguard-tg-bot.service"]   # a failed logguard-tg-bot becomes a system alert, relayed to the XMPP admin
+
+[ports]
+# Nothing is served here: logguard-tg-bot only connects out (HTTPS to api.telegram.org).
+whitelist = []
+# One UFW-blocked connection attempt to any of these = immediate ban (TCP only: UDP is spoofable).
+tripwire = [
+    "21/tcp", "23/tcp", "2323/tcp",                      # FTP, Telnet
+    "25/tcp", "465/tcp", "587/tcp",                      # SMTP, SMTPS, submission (no MX points here)
+    "110/tcp", "995/tcp", "143/tcp", "993/tcp",          # POP3(S), IMAP(S)
+    "135/tcp", "139/tcp", "445/tcp", "3389/tcp", "5985/tcp", "5986/tcp", # Windows RPC, NetBIOS, SMB, RDP, WinRM
+    "5900/tcp", "5901/tcp", "1723/tcp", "7547/tcp", "8291/tcp", # VNC, PPTP, TR-069, MikroTik Winbox
+    "389/tcp", "2375/tcp", "2376/tcp",                   # LDAP, Docker API
+    "1433/tcp", "1521/tcp", "3306/tcp", "5432/tcp", "27017/tcp", # MS SQL, Oracle, MySQL, PostgreSQL, MongoDB
+    "6379/tcp", "9200/tcp", "11211/tcp",                 # Redis, Elasticsearch, Memcached
+]
+# Names in the dashboard's port histogram (the cluster port is named from [cluster]).
+names = {}
+
+[canary]
+# SSH names attackers try first: one attempt = immediate ban. Remove the name YOU log in with
+# (or, if sshd admits a single key-only user, use ssh = ["*"] with that user in `except`).
+ssh = ["admin", "test", "user", "oracle", "postgres", "git", "pi", "ftpuser", "guest",
+       "support", "deploy", "docker", "mysql", "ubnt", "debian", "centos"]
+except = []
+
+[silence]                 # warn when UFW or sshd logging goes quiet ("0s" = never)
+ufw = "2h"
+ssh = "2d"
+
+# Kernel rate limits on new connections per source address (enforce mode, nftables only).
+[[ratelimit]]
+ports = ["22/tcp"]        # SSH (this host's sshd port): same idea as ufw's LIMIT (6 per 30 s), but before UFW
+rate = "6/minute"
+burst = 6
+
+[allowlist]
+nets = [
+  "127.0.0.0/8",
+  "::1",
+  "11.35.43.31",
+  # Upstream DNS (UDP sources can be spoofed: a forged flood "from" a resolver must never ban it).
+  "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+]
+trust_authenticated = true   # per service, not shared (see logguard.toml)
+trust_ttl = "24h"
+
+[bans]
+ladder = ["1h", "6h", "1d", "7d", "30d"]
+forgive_after = "30d"
+
+[enforce]
+backend = "auto"          # nftables (prerouting, so Docker-published ports are covered), falling back to ufw, then iptables
+
+[notify]
+# No ejabberd here: admin messages (this node's, and the ones the other nodes relay) go only
+# to the Telegram bot's outbox; logguard-tg-bot sends them with XMPP account names replaced.
+enabled = true
+xmpp = false
+tg_outbox = "/opt/logguard-tg-bot/outbox"
+tg_user = "logguard-tg-bot"
+# The mail bot can relay here too (or instead: drop tg_outbox): logguard-mail-bot's README.
+#mail_outbox = "/opt/logguard-mail-bot/outbox"
+#mail_user = "logguard-mail-bot"
+bot_stuck_after = "1h"            # then a system alert, relayed to the XMPP admin
+
+[cluster]
+# Share bans, suspicion reports and trusted addresses with other logguard nodes over an
+# encrypted, authenticated TCP link (no VPN needed). All nodes use the same key; deploy.sh
+# generates deploy/cluster.key once and installs it as /etc/logguard/cluster.key.
+enabled = true
+node_id = "tg"
+listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
+peers = ["11.17.39.236:7946", "11.25.48.86:7946"]   # xmpp, vpn; peers are never banned here
+key_file = "/etc/logguard/cluster.key"
+rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
+sync_interval = "10s"
+full_sync_every = "10m"
+# Its own alerts and digest go to the XMPP admin too (relay_notices below). It takes the
+# others' bans for its own firewall, but passes none on (share covers forwarded facts too):
+# the others accept only notices and files from it anyway (their peer_accept).
+share = ["notices"]
+accept = ["bans", "unbans", "reports", "trust", "notices"]
+relay_notices = true
+# Bans learned from peers last at most this long here. The built-in default (1d) limits what a
+# compromised or mistaken node can do to the others; both nodes here are equally trusted, so
+# mirror the origin's full ban ladder (a peer's 7d ban is 7d here too).
+max_remote_ban = "30d"
+report_factor = 0.5                # peer-reported points count half
+min_report_points = 10
+max_hops = 3
+max_clock_skew = "5m"              # nodes need roughly correct clocks (systemd-timesyncd)
+# Files peers send once (`logguard cluster-send-report`): here the weekly abuse report the
+# XMPP server merged, which the abuse-report timer (role relay) hands to logguard-tg-bot. "" refuses them.
+inbox = "/var/lib/logguard/inbox"
+
+[exposure]
+enabled = true
+interval = "60s"
+ufw = "/usr/sbin/ufw"
+ignore = []
+startup_grace = "15m"     # weekly reboot: wg-easy starts after logguard
+new_after_scans = 2
+gone_after_scans = 5
+
+[feeds]
+# Public blocklists in their own nftables sets (feed4/feed6), refreshed daily.
+# `logguard feeds clear` empties them in one step; enabled = false removes them on restart.
+enabled = true
+urls = [
+  "https://www.spamhaus.org/drop/drop.txt",                 # Spamhaus DROP (includes former EDROP)
+  "https://www.spamhaus.org/drop/dropv6.txt",
+  "https://iplists.firehol.org/files/firehol_level1.netset",  # FireHOL level1 (private ranges are filtered out)
+]
+refresh = "24h"
+cache_dir = "/var/lib/logguard/feeds"
+fetch = ["curl", "-fsSL", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"]   # falls back to wget
+max_entries = 100000
+min_prefix_v4 = 12        # one bad entry must not drop a whole /8
+min_prefix_v6 = 24
+max_growth = 2.0          # refuse a refresh covering >2x the last accepted list (keeps that one)
+
+[digest]
+# One summary message per day at `at` (UTC): bans by cause, top offenders, alerts,
+# exposure, cluster, feeds and certificate expiry.
+# To Telegram, and (relay_notices) through the cluster to the XMPP admin, prefixed with "[tg]".
+enabled = true
+at = "07:05"
+certs = []   # host:port, or host:port/xmpp for STARTTLS
+cert_warn_days = 21
+check_certs_every = "6h"
+openssl = "/usr/bin/openssl"
+
+[geo]
+# Readable places ("Germany / Hetzner Online GmbH (AS24940)") in new-login alerts, bans, the TUI,
+# `status` and the digest. Lookups happen in memory; only the databases are downloaded (weekly,
+# ~12 MB, no account): DB-IP's free lite databases, CC BY 4.0 - credit "IP locations: DB-IP.com".
+# A new /16 of a provider the account already used is no longer a "new network".
+enabled = true
+country_url = "https://download.db-ip.com/free/dbip-country-lite-{month}.csv.gz"
+asn_url = "https://download.db-ip.com/free/dbip-asn-lite-{month}.csv.gz"
+# Public-domain alternative for the network half (registry handles instead of company names):
+# asn_url = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
+dir = "/var/lib/logguard/geo"
+refresh = "7d"
+
+[cron]
+# New or changed scheduled tasks are a classic sign of a break-in. Watched: /etc/crontab,
+# /etc/cron.d/*, every user's crontab (what `crontab -l` shows), /etc/cron.{hourly,daily,
+# weekly,monthly,yearly}, enabled systemd timers, and the scripts crontab lines run
+# (e.g. /usr/local/bin/*.sh). Everything present during `learn` is accepted; after that
+# each change is reported once ("integrity" admin topic) and becomes the new normal.
+# Files installed by a package and unmodified (MD5 recorded by dpkg) are reported as warnings,
+# anything else as high. See what is watched:  logguard -c ... integrity
+enabled = true
+interval = "1m"
+learn = "1d"
+# crontabs = ["/etc/crontab", "/etc/anacrontab", "/etc/cron.d/*", "/var/spool/cron/crontabs/*", "/var/spool/cron/*"]
+# dirs = ["/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/etc/cron.yearly", "/etc/systemd/system/timers.target.wants"]
+scripts = true
+# Other files whose changes are reported (`*` within one path component, in any component):
+# SSH keys, sudoers, users, sshd settings, systemd units, preloaded libraries. Files of a
+# pattern added later are learned silently; files of a removed pattern are forgotten.
+# files = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/sudoers.d/*",
+#          "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/*", "/root/.ssh/authorized_keys",
+#          "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys2",
+#          "/etc/ld.so.preload", "/etc/rc.local", "/etc/profile.d/*",
+#          "/etc/systemd/system/*", "/etc/systemd/system/*.wants/*", "/etc/systemd/system/*.d/*.conf"]
+dpkg_db = "/var/lib/dpkg"       # read directly (no dpkg process); "" on hosts without dpkg
+
+[antivirus]
+# Reports infected files found by scheduled ClamAV scans (critical), scans that did not
+# finish (killed for memory, typically) and scans that stopped happening (stale_after).
+# install.sh enables logguard-avscan.timer (daily 02:30, scan paths in
+# /etc/default/logguard-avscan), which writes this log. Plain `clamscan --stdout` output
+# appended to a file works too, e.g. log = "/var/log/av_scan_result.log".
+enabled = false            # ClamAV is not installed here; apt install clamav clamav-freshclam, then true
+log = "/var/log/logguard/avscan.log"
+stale_after = "36h"
+
+[journal]
+journalctl = "/usr/bin/journalctl"
+initial_lookback = "1h"
+
+[resources]
+# Low disk space (warning below 10% free, high below 5%) and memory that stays short
+# (under 10% available for 15 min, or tasks stalled on memory 10% of the time), checked
+# every minute; each alert at most every 6 hours. /tmp is listed in case it is a tmpfs (in RAM).
+enabled = true
+interval = "60s"
+disks = ["/", "/tmp"]
+disk_warn_percent = 10
+disk_high_percent = 5
+mem_warn_percent = 10
+mem_sustain = "15m"
+psi_full_percent = 10

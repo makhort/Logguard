@@ -1,0 +1,46 @@
+[Unit]
+Description=logguard - weekly abuse report (sent by the admin bots)
+After=network-online.target logguard.service
+Wants=network-online.target
+Documentation=file:///etc/default/logguard-abuse-report
+
+[Service]
+Type=oneshot
+# work files: private, removed with the unit (the system is read-only otherwise)
+RuntimeDirectory=logguard-abuse-report
+RuntimeDirectoryMode=0700
+Environment=ABUSE_REPORT_WORKDIR=/run/logguard-abuse-report
+EnvironmentFile=-/etc/default/logguard-abuse-report
+ExecStart=/usr/local/sbin/logguard-abuse-report
+Nice=10
+IOSchedulingClass=idle
+
+# Sandbox: reads logguard's records, writes the cluster inbox (/var/lib/logguard) and the
+# bots' outboxes (logguard-xmpp-bot's, logguard-tg-bot's, logguard-mail-bot's; any may be missing), talks to the peers and
+# rdap.org. An outbox elsewhere needs  ReadWritePaths=<it>  (systemctl edit logguard-abuse-report).
+StateDirectory=logguard
+ReadWritePaths=-/opt/logguard-xmpp-bot/outbox
+ReadWritePaths=-/opt/logguard-tg-bot/outbox
+ReadWritePaths=-/opt/logguard-mail-bot/outbox
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# install -o <bot user> needs CAP_CHOWN; nothing else beyond root's own files
+CapabilityBoundingSet=CAP_CHOWN
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

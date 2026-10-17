@@ -1,0 +1,59 @@
+[Unit]
+Description=XMPP Admin Chatbot Service
+After=network.target ejabberd.service
+Wants=ejabberd.service
+
+[Service]
+Type=simple
+# The user ejabberd runs as: ejabberdctl works for it directly, with no root and no
+# capabilities. install.sh sets the owners and modes of /opt/logguard-xmpp-bot to match.
+User=ejabberd
+Group=ejabberd
+WorkingDirectory=/opt/logguard-xmpp-bot
+
+# The Python bot's file (read by systemd): the bot reads BOT_JID, BOT_PASSWORD, XMPP_PORT,
+# ... straight from the environment, so no password on the command line.
+EnvironmentFile=/opt/logguard-xmpp-bot/config.env
+ExecStart=/opt/logguard-xmpp-bot/logguard-xmpp-bot
+
+Restart=always
+RestartSec=5
+# 78: wrong password, no SCRAM-SHA-256, or a bad setting. Restarting would only feed
+# mod_fail2ban.
+RestartPreventExitStatus=78
+# Stopping the bot stops only the bot: a pending /restart (ejabberdctl restart_kindly,
+# waiting out its delay) carries on.
+KillMode=process
+
+# Hardening; ejabberdctl and openssl inherit it.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# Other users' processes are hidden (ejabberd's own run as the same user, so a pending
+# restart_kindly is still seen).
+ProtectProc=invisible
+# XMPP and ejabberdctl's Erlang node (TCP to epmd), Unix sockets, netlink for getifaddrs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Not MemoryDenyWriteExecute: the Erlang VM that ejabberdctl starts compiles code (JIT).
+# If ejabberdctl fails under these settings, the bot stops at its startup check and
+# install.sh reports it (rollback: bash /opt/logguard-xmpp-bot/install.sh rollback).
+
+[Install]
+WantedBy=multi-user.target

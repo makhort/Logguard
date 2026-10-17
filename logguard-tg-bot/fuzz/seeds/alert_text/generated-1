@@ -1,0 +1,7 @@
+To: telegram
+Subject: [xmpp] logguard: account under attack
+
+[xmpp] logguard: account under attack
+
+[High] account ejabberd:alice@example.org under distributed attack: ~40 failures from 9 addresses
+  10-16 12:00:01 auth failed: Failed c2s SCRAM-SHA-256 authentication for Bob(1)@Example.org/Conversations.x1 from ::ffff:192.0.2.10

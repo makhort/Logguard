@@ -1,0 +1,6 @@
+Oct 12 10:00:01 example.org ejabberdctl[26427]: 2026-10-12 10:00:01.107 [info] (#PID<0.28856.0>) Accepted connection [::ffff:198.51.100.7]:59195 -> [::ffff:192.0.2.1]:5223
+Oct 12 10:00:01 example.org ejabberdctl[26427]: 2026-10-12 10:00:01.207 [warning] (tls|<0.28856.0>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000102:SSL routines::unsupported protocol
+Oct 12 10:00:02 example.org ejabberdctl[26427]: 2026-10-12 10:00:02.107 [info] (#PID<0.28857.0>) Accepted connection [::ffff:198.51.100.8]:40000 -> [::ffff:192.0.2.1]:5222
+Oct 12 10:00:02 example.org ejabberdctl[26427]: 2026-10-12 10:00:02.327 [info] (tls|<0.28857.0>) Failed c2s SCRAM-SHA-256 authentication for alice@example.org from ::ffff:198.51.100.8: Invalid username or password
+Oct 12 10:00:03 example.org ejabberdctl[26427]: 2026-10-12 10:00:03.327 [info] (tls|<0.28858.0>) Accepted c2s SCRAM-SHA-512-PLUS authentication for bob@example.org by sql backend from ::ffff:203.0.113.9
+Oct 12 10:00:04 example.org ejabberdctl[26427]: 2026-10-12 10:00:04.000 [info] (#PID<0.28859.0>) Accepted connection hidden_by_ejabberd -> hidden_by_ejabberd

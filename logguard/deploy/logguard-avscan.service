@@ -1,0 +1,50 @@
+[Unit]
+Description=logguard - scheduled ClamAV scan (results reported by logguard)
+After=clamav-freshclam.service clamav-daemon.service
+Documentation=file:///etc/default/logguard-avscan
+
+[Service]
+Type=oneshot
+# clamscan's temporary files (archives unpacked): the rest of the system is read-only.
+CacheDirectory=logguard-avscan
+Environment=TMPDIR=/var/cache/logguard-avscan
+EnvironmentFile=-/etc/default/logguard-avscan
+ExecStart=/usr/local/sbin/logguard-avscan
+
+# Sandbox: the scanner parses hostile files as root. It may read everything (it has to),
+# write only its log and temporary files, and has no network (clamdscan reaches clamd over
+# its Unix socket; a clamd on TCP needs PrivateNetwork=no and AF_INET added).
+# An AVSCAN_LOG outside /var/log/logguard needs  ReadWritePaths=<its directory>  (systemctl edit).
+LogsDirectory=logguard
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Not MemoryDenyWriteExecute: ClamAV's bytecode JIT needs writable code pages.
+# 1 = infected files found, 2 = some files unreadable: logguard reports both from the log.
+SuccessExitStatus=1 2
+# Run in the background of everything else, and if memory runs out, be the one killed
+# (logguard then reports the scan as unfinished) rather than ejabberd or a database.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+OOMScoreAdjust=900
+# The default (stop) would end the whole unit when the kernel kills clamscan, script
+# included, before it logs the exit code; that's what restarted cron.service each time
+# the old cron job was killed. continue: the script logs "exit=137" and logguard reports it.
+OOMPolicy=continue

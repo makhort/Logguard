@@ -1,0 +1,6 @@
+#!/bin/sh
+# The archiver for the Linux target: macOS ar writes a Mach-O symbol index that the ELF
+# linker cannot read. llvm-ar comes with:  rustup component add llvm-tools
+sysroot=$(rustc --print sysroot)
+host=$(rustc -vV | sed -n 's/^host: //p')
+exec "$sysroot/lib/rustlib/$host/bin/llvm-ar" "$@"

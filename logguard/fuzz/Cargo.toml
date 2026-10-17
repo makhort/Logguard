@@ -1,0 +1,25 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run records
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "records"
+path = "fuzz_targets/records.rs"
+test = false
+doc = false
+bench = false

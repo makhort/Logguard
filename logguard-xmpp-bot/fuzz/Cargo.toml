@@ -1,0 +1,39 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run omemo_decrypt
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-xmpp-bot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-xmpp-bot = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "omemo_wire"
+path = "fuzz_targets/omemo_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "omemo_decrypt"
+path = "fuzz_targets/omemo_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "omemo_stanza"
+path = "fuzz_targets/omemo_stanza.rs"
+test = false
+doc = false
+bench = false

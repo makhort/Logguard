@@ -1,0 +1,22 @@
+# ejabberd's own log files (/opt/ejabberd/logs), kept 14 days at most as /privacy says:
+# rotated weekly, one old copy. Meant for ejabberd's size rotation switched off
+# (log_rotate_size: infinity in ejabberd.yml); copies that rotation made (*.log.0) are
+# deleted here once older than 14 days, so it is safe either way. ejabberd reopens its
+# files after rotation (reopen_log), as its documentation recommends. That includes
+# mod_antispam's dump of blocked messages (logs/spam/), which reopens on reopen_log too.
+/opt/ejabberd/logs/*.log /opt/ejabberd/logs/spam/*.log {
+    su ejabberd ejabberd
+    weekly
+    rotate 1
+    maxage 14
+    missingok
+    notifempty
+    create 0640 ejabberd ejabberd
+    sharedscripts
+    firstaction
+        find /opt/ejabberd/logs /opt/ejabberd/logs/spam -maxdepth 1 -name '*.log.[0-9]*' -mtime +14 -delete
+    endscript
+    postrotate
+        /usr/sbin/ejabberdctl reopen_log >/dev/null 2>&1 || true
+    endscript
+}

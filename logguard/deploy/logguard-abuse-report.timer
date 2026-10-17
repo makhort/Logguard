@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly abuse report for the admin (logguard + logguard-xmpp-bot)
+
+[Timer]
+# The same time on every server: the merging one waits for the others' reports.
+OnCalendar=Mon *-*-* 06:00:00 UTC
+# Catch up after the server was down at that time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

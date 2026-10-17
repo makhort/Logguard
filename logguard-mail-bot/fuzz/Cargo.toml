@@ -1,0 +1,46 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run alert_mail
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-mail-bot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-mail-bot = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "alert_mail"
+path = "fuzz_targets/alert_mail.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_mail"
+path = "fuzz_targets/file_mail.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_keys"
+path = "fuzz_targets/openpgp_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signing_key"
+path = "fuzz_targets/signing_key.rs"
+test = false
+doc = false
+bench = false

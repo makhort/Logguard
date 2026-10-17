@@ -1,0 +1,1 @@
+{"ok":true,"result":[{"update_id":20,"message":{"message_id":5,"from":{"id":42,"is_bot":false,"first_name":"A"},"chat":{"id":42,"type":"private"},"date":1760000000,"text":"/start 0011aabbccddeeff"}},{"update_id":21,"my_chat_member":{}},{"update_id":"x"}]}

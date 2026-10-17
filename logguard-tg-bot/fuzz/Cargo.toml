@@ -1,0 +1,46 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run alert_text
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-tg-bot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-tg-bot = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "alert_text"
+path = "fuzz_targets/alert_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telegram_reply"
+path = "fuzz_targets/telegram_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_key"
+path = "fuzz_targets/openpgp_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_names"
+path = "fuzz_targets/server_names.rs"
+test = false
+doc = false
+bench = false

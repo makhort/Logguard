@@ -1,0 +1,3 @@
+Oct 12 10:02:00 example.org kernel: [UFW BLOCK] IN=eth0 OUT= MAC=00 SRC=198.51.100.30 DST=192.0.2.1 LEN=40 TOS=0x00 PREC=0x00 TTL=240 ID=1 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0
+Oct 12 10:02:01 example.org kernel: [UFW BLOCK] IN=eth0 OUT= MAC=00 SRC=2001:db8::30 DST=2001:db8::1 LEN=60 PROTO=UDP SPT=5353 DPT=161 LEN=20
+Oct 12 10:02:02 example.org kernel: Out of memory: Killed process 785891 (clamscan) total-vm:970112kB, anon-rss:920752kB, file-rss:68kB, shmem-rss:0kB, UID:0 pgtables:1928kB oom_score_adj:0

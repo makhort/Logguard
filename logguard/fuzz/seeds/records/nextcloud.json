@@ -1,0 +1,2 @@
+{"reqId":"x","level":2,"time":"2026-10-11T19:16:24+00:00","remoteAddr":"198.51.100.50","user":"--","app":"core","method":"POST","url":"/login","message":"Login failed: alice (Remote IP: 198.51.100.50)","userAgent":"curl"}
+{"time":"2026-10-11T19:16:25+00:00","remoteAddr":"198.51.100.50","message":"Login failed: 'bob' (Remote IP: '198.51.100.50')"}

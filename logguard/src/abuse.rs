@@ -1,0 +1,846 @@
+//! Abuse reports: the addresses banned in a time window, with the evidence behind each ban,
+//! formatted for the network owner's abuse desk.
+//!
+//! Built from the actions log (`actions.jsonl` and its rotated copies), so it covers
+//! everything decided in the window, not just what the daemon still remembers. What would
+//! help an attacker or expose users is left out: account names (except non-existent ones
+//! that attackers tried), decoy-account names, internal scores, and bans that other cluster
+//! nodes decided (their evidence is in their own report).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Read};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::engine::{Action, ActionKind};
+use crate::net::Net;
+use crate::time::{self, Micros, SEC};
+
+/// One reported address (or network), with what it did.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Offender {
+    pub net: Net,
+    pub first: Micros,
+    pub last: Micros,
+    pub bans: u32,
+    /// What the bans were for (tripwire, port scan, ssh, xmpp, web, canary, ...).
+    pub categories: BTreeSet<String>,
+    /// Sanitised evidence, oldest first.
+    pub evidence: Vec<Line>,
+    /// For a network ban: the addresses in it that took part.
+    pub members: Vec<IpAddr>,
+    pub place: Option<String>,
+    pub contact: Option<Contact>,
+}
+
+/// One evidence line.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Line {
+    pub ts: Micros,
+    /// Which of our servers saw it (set when reports of several servers are merged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Contact {
+    pub abuse: Vec<String>,
+    pub network: String,
+}
+
+/// The actions log and its rotated copies (`.1`, `.2.gz`, ...) touched since `from`.
+fn log_files(path: &Path, from: Micros) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return out };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let rotated = n.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
+            let recent = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_none_or(|d| d.as_micros() as Micros >= from);
+            if rotated && recent {
+                out.push(e.path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Ban actions taken since `from`, from the actions log and its rotated (gzip) copies.
+pub fn load_bans(path: &Path, from: Micros) -> Result<Vec<Action>> {
+    let files = log_files(path, from);
+    if files.is_empty() {
+        anyhow::bail!("no actions log at {} (see `actions_log` in the config)", path.display());
+    }
+    let mut out = Vec::new();
+    for f in files {
+        let file = std::fs::File::open(&f).with_context(|| format!("opening {}", f.display()))?;
+        let reader: Box<dyn Read> =
+            if f.extension().is_some_and(|e| e == "gz") { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if !line.contains("\"ban\"") {
+                continue;
+            }
+            if let Ok(a) = serde_json::from_str::<Action>(&line) {
+                if a.kind == ActionKind::Ban && a.ts >= from && a.target.is_some() {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out.sort_by_key(|a| a.ts);
+    Ok(out)
+}
+
+/// An evidence line (`10-12 14:03:11 invalid user oracle`) with private details withheld;
+/// None for lines that aren't evidence of this host (other nodes' reports).
+pub fn sanitize(text: &str) -> Option<String> {
+    // A network ban's lines name the member first: "192.0.2.9 failed password for alice".
+    if let Some((ip, rest)) = text.split_once(' ').filter(|(ip, _)| ip.parse::<IpAddr>().is_ok()) {
+        return sanitize(rest).map(|r| format!("{ip} {r}"));
+    }
+    if text.starts_with("peer ") {
+        return None;
+    }
+    let cut = |s: &str, at: &str| s.find(at).map(|i| s[..i].to_string());
+    let t = if text.contains("canary account") {
+        if text.starts_with(crate::event::CANARY_LOGIN) {
+            "logged in to a decoy account (credentials that are never used legitimately)".to_string()
+        } else if text.starts_with("registration of") {
+            "tried to register a decoy account name".to_string()
+        } else {
+            "login attempt on a decoy account (password guessing)".to_string()
+        }
+    } else if let Some(rest) = text.strip_prefix("failed ") {
+        // "failed password for alice" / "failed publickey for invalid user bob"
+        match rest.split_once(" for invalid user ") {
+            Some((method, user)) => format!("failed {method} login as non-existent user {user}"),
+            None => format!("failed {} login (account name withheld)", rest.split(" for ").next().unwrap_or(rest)),
+        }
+    } else if text.starts_with("user ") && text.contains(" not allowed") {
+        "login attempt as a user that may not log in (name withheld)".to_string()
+    } else if text.starts_with("gave up authenticating as ") {
+        "gave up authenticating (account name withheld)".to_string()
+    } else if text.starts_with("nextcloud login failed for ") {
+        "failed Nextcloud login (account name withheld)".to_string()
+    } else if text.starts_with("registered account ") {
+        "registered an account".to_string()
+    } else if let Some(c) = cut(text, " (+") {
+        c // never show internal points
+    } else {
+        text.to_string()
+    };
+    // Anything still looking like an account or e-mail address.
+    let t: Vec<String> = t.split(' ').map(|w| if w.contains('@') { "[account]".to_string() } else { w.to_string() }).collect();
+    Some(t.join(" ").chars().filter(|c| !c.is_control()).take(300).collect())
+}
+
+/// `10-12 14:03:11 text` with the year of the ban it belongs to (December lines in a
+/// January ban are from the year before).
+fn evidence_time(line: &str, ban_ts: Micros) -> Option<(Micros, &str)> {
+    let (date, rest) = line.split_once(' ')?;
+    let (clock, text) = rest.split_once(' ')?;
+    let (month, _) = date.split_once('-')?;
+    let ban_year = time::year_of(ban_ts);
+    let ban_month: u32 = time::fmt_ts(ban_ts)[5..7].parse().ok()?;
+    let year = if month.parse::<u32>().ok()? > ban_month { ban_year - 1 } else { ban_year };
+    let (t, _) = time::parse_iso_prefix(&format!("{year}-{date} {clock}"))?;
+    Some((t, text))
+}
+
+pub struct Filter {
+    /// Only these addresses / networks (empty = all).
+    pub only: Vec<Net>,
+    /// Leave out offenders with fewer evidence lines (a single blocked packet isn't worth a report).
+    pub min_events: usize,
+}
+
+/// Groups the bans by target, keeping this host's own evidence only.
+pub fn collect(bans: &[Action], filter: &Filter) -> Vec<Offender> {
+    let mut by: BTreeMap<Net, Offender> = BTreeMap::new();
+    for a in bans {
+        let Some(net) = a.target else { continue };
+        // Peer bans carry another node's evidence; a reinstated ban (put back when a network
+        // ban covering it expired) is no new activity.
+        if matches!(a.category.as_deref(), Some("from peers" | "reinstated")) || a.message.contains("(from peer ") {
+            continue;
+        }
+        if !filter.only.is_empty() && !filter.only.iter().any(|f| f.contains_net(&net) || net.contains_net(f)) {
+            continue;
+        }
+        let o = by.entry(net).or_insert_with(|| Offender {
+            net,
+            first: a.ts,
+            last: a.ts,
+            bans: 0,
+            categories: BTreeSet::new(),
+            evidence: vec![],
+            members: vec![],
+            place: None,
+            contact: None,
+        });
+        o.bans += 1;
+        o.last = o.last.max(a.ts);
+        if let Some(c) = &a.category {
+            o.categories.insert(c.clone());
+        }
+        for e in &a.evidence {
+            if let Ok(ip) = e.trim().parse::<IpAddr>() {
+                if !o.members.contains(&ip) {
+                    o.members.push(ip);
+                }
+                continue;
+            }
+            if let Some((t, text)) = evidence_time(e, a.ts) {
+                if let Some(text) = sanitize(text) {
+                    o.first = o.first.min(t);
+                    let line = Line { ts: t, server: None, text };
+                    if !o.evidence.contains(&line) {
+                        o.evidence.push(line);
+                    }
+                }
+            }
+        }
+    }
+    // A network's members carry their own evidence from their own bans.
+    let member_events: BTreeMap<IpAddr, usize> = by.values().filter(|o| o.net.is_host()).map(|o| (o.net.addr, o.evidence.len())).collect();
+    let mut out: Vec<Offender> = by
+        .into_values()
+        .filter(|o| {
+            let events = o.evidence.len() + o.members.iter().map(|m| member_events.get(m).copied().unwrap_or(1)).sum::<usize>();
+            events >= filter.min_events.max(1)
+        })
+        .collect();
+    for o in &mut out {
+        o.evidence.sort();
+        o.members.sort();
+        // "Seen" is when the activity happened, not when bans were decided.
+        if let (Some(f), Some(l)) = (o.evidence.first(), o.evidence.last()) {
+            (o.first, o.last) = (f.ts, l.ts);
+        }
+    }
+    rank(&mut out);
+    out
+}
+
+pub(crate) fn service_of(proto: &str, port: u16) -> Option<&'static str> {
+    Some(match (proto, port) {
+        ("TCP", 21) => "FTP",
+        ("TCP", 22) => "SSH",
+        ("TCP", 23) | ("TCP", 2323) => "Telnet",
+        ("TCP", 25) => "SMTP",
+        ("TCP", 80) => "Web HTTP",
+        ("TCP", 110) => "POP3",
+        ("TCP", 135) => "MS RPC",
+        ("TCP", 139) => "NetBIOS",
+        ("TCP", 143) => "IMAP",
+        ("TCP", 389) => "LDAP",
+        ("TCP", 443) => "Web HTTPS",
+        ("UDP", 443) => "Web QUIC",
+        ("TCP", 445) => "SMB",
+        ("TCP", 465) => "SMTPS",
+        ("TCP", 587) => "SMTP submission",
+        ("TCP", 993) => "IMAPS",
+        ("TCP", 995) => "POP3S",
+        ("TCP", 1433) => "MS SQL",
+        ("TCP", 1521) => "Oracle DB",
+        ("TCP", 1723) => "PPTP",
+        ("TCP", 2375) | ("TCP", 2376) => "Docker API",
+        ("TCP", 3306) => "MySQL",
+        ("TCP", 3389) => "RDP",
+        ("UDP", 3478) | ("TCP", 3478) => "STUN/TURN",
+        ("TCP", 5349) | ("UDP", 5349) => "TURN over TLS",
+        ("TCP", 5432) => "PostgreSQL",
+        ("TCP", 5900) | ("TCP", 5901) => "VNC",
+        ("TCP", 5985) | ("TCP", 5986) => "WinRM",
+        ("TCP", 6379) => "Redis",
+        ("TCP", 7547) => "TR-069",
+        ("TCP", 8000) | ("TCP", 8080) | ("TCP", 8888) => "Web HTTP alt",
+        ("TCP", 8291) => "MikroTik Winbox",
+        ("TCP", 8443) => "Web HTTPS alt",
+        ("TCP", 9200) => "Elasticsearch",
+        ("TCP", 11211) => "Memcached",
+        ("TCP", 27017) => "MongoDB",
+        ("TCP", 34567) => "DVR (Xiongmai)",
+        ("UDP", 161) => "SNMP",
+        ("UDP", 5060) | ("TCP", 5060) => "SIP",
+        _ => return None,
+    })
+}
+
+/// One sentence per kind of activity, for the summary line.
+/// What kinds of activity the evidence itself shows, for bans without a usable category
+/// (reinstated bans, or ones logged by older versions).
+fn inferred_categories(o: &Offender) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for l in &o.evidence {
+        let t = l.text.split_once(' ').filter(|(ip, _)| ip.parse::<IpAddr>().is_ok()).map_or(l.text.as_str(), |(_, rest)| rest);
+        let c = if t.starts_with("tripwire block ") {
+            "tripwire"
+        } else if t.starts_with("block ") || t.starts_with("port scan:") {
+            "port scan"
+        } else if t.contains("decoy account") {
+            "canary"
+        } else if t.contains(" login") || t.starts_with("invalid user") || t.contains("authenticat") || t.starts_with("sshd ") {
+            "ssh"
+        } else if t.starts_with("TLS failed") || t.contains("XMPP") || t.starts_with("s2s ") || t.contains("without authentication") {
+            "xmpp"
+        } else {
+            continue;
+        };
+        out.insert(c.to_string());
+    }
+    if !o.members.is_empty() {
+        out.insert("subnet".into());
+    }
+    out
+}
+
+fn describe(o: &Offender) -> String {
+    const KNOWN: [&str; 9] = ["tripwire", "port scan", "ssh", "xmpp", "web", "canary", "distributed probing", "subnet", "cluster evidence"];
+    let categories = if o.categories.iter().any(|c| KNOWN.contains(&c.as_str())) { o.categories.clone() } else { inferred_categories(o) };
+    let mut parts = Vec::new();
+    for c in &categories {
+        let p = match c.as_str() {
+            "tripwire" => {
+                let mut ports: Vec<String> = o
+                    .evidence
+                    .iter()
+                    .filter_map(|l| l.text.strip_prefix("tripwire block "))
+                    .map(|pp| {
+                        let (proto, port) = pp.split_once('/').unwrap_or(("", pp));
+                        match port.parse().ok().and_then(|n| service_of(proto, n)) {
+                            Some(s) => format!("{pp} ({s})"),
+                            None => pp.to_string(),
+                        }
+                    })
+                    .collect();
+                ports.sort();
+                ports.dedup();
+                format!("connections to closed ports of commonly attacked services: {}", ports.join(", "))
+            }
+            "port scan" => "port scanning (connection attempts to many closed ports)".into(),
+            "ssh" => "SSH probing / login attempts".into(),
+            "xmpp" => "probing the XMPP (chat) service: failed TLS handshakes, connections without authentication, failed logins".into(),
+            "web" => "web vulnerability scanning / failed Nextcloud logins".into(),
+            "canary" => "login attempts with decoy credentials (password guessing)".into(),
+            "distributed probing" | "subnet" => "coordinated probing from several addresses of this network".into(),
+            "cluster evidence" => "activity also seen by our other servers".into(),
+            "reinstated" => continue,
+            other => other.to_string(),
+        };
+        parts.push(p);
+    }
+    if parts.is_empty() {
+        "malicious activity".into()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// Evidence in words an abuse desk understands: "tripwire block TCP/5900" becomes
+/// "connection attempt to closed port TCP/5900 (VNC)".
+fn plain(text: &str) -> String {
+    let (who, rest) = match text.split_once(' ') {
+        Some((ip, rest)) if ip.parse::<IpAddr>().is_ok() => (format!("{ip} "), rest),
+        _ => (String::new(), text),
+    };
+    let Some(pp) = rest.strip_prefix("tripwire block ").or_else(|| rest.strip_prefix("block ")) else { return text.to_string() };
+    let (proto, port) = pp.split_once('/').unwrap_or(("", pp));
+    let svc = port.parse().ok().and_then(|n| service_of(proto, n)).map(|s| format!(" ({s})")).unwrap_or_default();
+    format!("{who}connection attempt to closed port {pp}{svc}")
+}
+
+fn ts(t: Micros) -> String {
+    format!("{} UTC", time::fmt_ts(t))
+}
+
+/// A server whose logs a report is built from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Server {
+    pub host: String,
+    /// Public addresses: the destination of the attacks.
+    pub addresses: Vec<IpAddr>,
+}
+
+impl Server {
+    /// How evidence lines name this server: its first public IPv4 address, else its name.
+    fn tag(&self) -> String {
+        self.addresses.iter().find(|a| a.is_ipv4()).or(self.addresses.first()).map_or(self.host.clone(), |a| a.to_string())
+    }
+}
+
+/// A complete report; `--json` writes this, `--merge` combines several.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Report {
+    pub servers: Vec<Server>,
+    pub from: Micros,
+    pub to: Micros,
+    pub offenders: Vec<Offender>,
+}
+
+/// A `--json` report file, plain or gzip-compressed (as `cluster-send-report` delivers it).
+pub fn read_report_file(path: &Path) -> Result<String> {
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if !raw.starts_with(&[0x1f, 0x8b]) {
+        return String::from_utf8(raw).with_context(|| format!("{} is not UTF-8", path.display()));
+    }
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(raw.as_slice()).read_to_string(&mut text).with_context(|| format!("decompressing {}", path.display()))?;
+    Ok(text)
+}
+
+/// Combines the reports of several servers: one entry per source, evidence lines marked
+/// with the server that saw them. A report identical in server and period to one already
+/// merged (the same file given twice) is skipped, as it would double every count; its
+/// position is returned.
+pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
+    let mut by: BTreeMap<Net, Offender> = BTreeMap::new();
+    let mut servers: Vec<Server> = vec![];
+    let mut skipped = vec![];
+    let (mut from, mut to) = (Micros::MAX, 0);
+    let mut seen: Vec<String> = vec![];
+    for (n, r) in reports.into_iter().enumerate() {
+        let id = serde_json::to_string(&(&r.servers, r.from, r.to)).unwrap_or_default();
+        if seen.contains(&id) {
+            skipped.push(n);
+            continue;
+        }
+        seen.push(id);
+        from = from.min(r.from);
+        to = to.max(r.to);
+        let tag = r.servers.first().map(Server::tag);
+        servers.extend(r.servers);
+        for mut o in r.offenders {
+            for l in &mut o.evidence {
+                l.server = l.server.take().or_else(|| tag.clone());
+            }
+            match by.get_mut(&o.net) {
+                None => {
+                    by.insert(o.net, o);
+                }
+                Some(m) => {
+                    m.first = m.first.min(o.first);
+                    m.last = m.last.max(o.last);
+                    m.bans += o.bans;
+                    m.categories.extend(o.categories);
+                    for l in o.evidence {
+                        if !m.evidence.contains(&l) {
+                            m.evidence.push(l);
+                        }
+                    }
+                    for ip in o.members {
+                        if !m.members.contains(&ip) {
+                            m.members.push(ip);
+                        }
+                    }
+                    m.place = m.place.take().or(o.place);
+                    m.contact = m.contact.take().or(o.contact);
+                }
+            }
+        }
+    }
+    let mut offenders: Vec<Offender> = by.into_values().collect();
+    for o in &mut offenders {
+        o.evidence.sort();
+        o.members.sort();
+    }
+    rank(&mut offenders);
+    (Report { servers, from: if from == Micros::MAX { 0 } else { from }, to, offenders }, skipped)
+}
+
+/// Most persistent first: repeated bans, then the amount of evidence.
+pub fn rank(list: &mut [Offender]) {
+    list.sort_by_key(|o| std::cmp::Reverse((o.bans, o.evidence.len() + o.members.len())));
+}
+
+/// Evidence lines (and network members) behind an entry.
+pub fn events(o: &Offender) -> usize {
+    o.evidence.len() + o.members.len()
+}
+
+const MAX_LINES: usize = 25;
+
+/// Plain text, grouped by abuse contact when known (one section per e-mail to send).
+pub fn render_text(r: &Report) -> String {
+    // merged reports come from peers, and carry RDAP and geo text: nothing hidden in it
+    crate::event::plain_text(&render_text_raw(r))
+}
+
+fn render_text_raw(r: &Report) -> String {
+    let offenders = &r.offenders;
+    let mut s = String::new();
+    let servers: Vec<String> = r
+        .servers
+        .iter()
+        .map(|sv| {
+            let addrs: Vec<String> = sv.addresses.iter().map(|a| a.to_string()).collect();
+            format!("{} ({})", sv.host, if addrs.is_empty() { "-".into() } else { addrs.join(", ") })
+        })
+        .collect();
+    s += &format!("Abuse report from {}\n", servers.join(" and "));
+    s += &format!("Period: {} to {}. All times are UTC.\n", ts(r.from), ts(r.to));
+    s += &format!(
+        "{} source{} below, each flagged by our intrusion detection for the activity shown.\n",
+        offenders.len(),
+        if offenders.len() == 1 { "" } else { "s" }
+    );
+    s += "Evidence is taken from our server logs (firewall and the attacked services). Account names are withheld.\n";
+
+    let mut groups: BTreeMap<String, Vec<&Offender>> = BTreeMap::new();
+    for o in offenders {
+        let key = match &o.contact {
+            Some(c) if !c.abuse.is_empty() => c.abuse.join(", "),
+            _ => String::new(),
+        };
+        groups.entry(key).or_default().push(o);
+    }
+    for (contact, list) in &groups {
+        s += "\n==========================================================================\n";
+        if contact.is_empty() {
+            s += "Abuse contact: unknown (run with --contacts, or look up the network owner)\n";
+        } else {
+            let net = list.iter().find_map(|o| o.contact.as_ref().map(|c| c.network.clone())).unwrap_or_default();
+            s += &format!("To: {contact}{}\n", if net.is_empty() { String::new() } else { format!("   (network: {net})") });
+            s += "\nHello,\n\nthe following address(es) in your network attacked our server. Please investigate and stop\nthe abuse; the log excerpts below are in UTC.\n";
+        }
+        for o in list {
+            s += "\n--------------------------------------------------------------------------\n";
+            s += &format!("Source: {}{}\n", o.net, o.place.as_ref().map(|p| format!("   [{p}]")).unwrap_or_default());
+            s += &format!("Seen: {} - {} ({} incident{})\n", ts(o.first), ts(o.last), o.bans, if o.bans == 1 { "" } else { "s" });
+            s += &format!("Activity: {}\n", describe(o));
+            if !o.members.is_empty() {
+                let m: Vec<String> = o.members.iter().map(|m| m.to_string()).collect();
+                s += &format!("Addresses involved: {}\n", m.join(", "));
+            }
+            if !o.evidence.is_empty() {
+                s += "Log excerpt:\n";
+                for l in o.evidence.iter().take(MAX_LINES) {
+                    let to = l.server.as_ref().map(|sv| format!("(to {sv}) ")).unwrap_or_default();
+                    s += &format!("  {}  {to}{}\n", ts(l.ts), plain(&l.text));
+                }
+                if o.evidence.len() > MAX_LINES {
+                    s += &format!("  ... and {} more\n", o.evidence.len() - MAX_LINES);
+                }
+            }
+        }
+    }
+    s
+}
+
+// ------------------------------------------------------------------ abuse contacts (RDAP)
+
+/// RDAP data is written by the network's owner, who may be the attacker: only plain
+/// e-mail addresses are taken, so nothing can be smuggled into the report.
+fn plain_email(e: &str) -> Option<String> {
+    let e = e.trim().to_lowercase();
+    let ok = e.len() <= 100
+        && e.matches('@').count() == 1
+        && !e.starts_with('@')
+        && e.contains('.')
+        && e.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c));
+    ok.then_some(e)
+}
+
+fn vcard_emails(entity: &serde_json::Value) -> Vec<String> {
+    let mut out = vec![];
+    if let Some(items) = entity.get("vcardArray").and_then(|v| v.get(1)).and_then(|v| v.as_array()) {
+        for item in items {
+            if item.get(0).and_then(|v| v.as_str()) == Some("email") {
+                if let Some(e) = item.get(3).and_then(|v| v.as_str()).and_then(plain_email) {
+                    out.push(e);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn abuse_emails(v: &serde_json::Value, out: &mut Vec<String>) {
+    for e in v.get("entities").and_then(|e| e.as_array()).into_iter().flatten() {
+        let abuse = e.get("roles").and_then(|r| r.as_array()).is_some_and(|r| r.iter().any(|x| x.as_str() == Some("abuse")));
+        if abuse {
+            for m in vcard_emails(e) {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        }
+        abuse_emails(e, out);
+    }
+}
+
+/// The abuse mailbox and network name from an RDAP response (`rdap.org/ip/<addr>`).
+pub fn parse_rdap(json: &str) -> Option<(Contact, Option<(IpAddr, IpAddr)>)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut abuse = vec![];
+    abuse_emails(&v, &mut abuse);
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let handle = v.get("handle").and_then(|n| n.as_str()).unwrap_or("");
+    let network: String = match (name, handle) {
+        ("", h) => h.to_string(),
+        (n, "") => n.to_string(),
+        (n, h) => format!("{n}, {h}"),
+    }
+    .chars()
+    .filter(|c| !c.is_control())
+    .take(100)
+    .collect();
+    abuse.truncate(5);
+    let range = (|| {
+        let a = v.get("startAddress")?.as_str()?.parse().ok()?;
+        let b = v.get("endAddress")?.as_str()?.parse().ok()?;
+        Some((a, b))
+    })();
+    Some((Contact { abuse, network }, range))
+}
+
+/// Looks up abuse contacts (one RDAP request per network, ~1 per second).
+pub fn add_contacts(offenders: &mut [Offender], cfg: &crate::feeds::FeedsCfg, progress: impl Fn(usize, usize)) -> Vec<String> {
+    let mut known: Vec<((IpAddr, IpAddr), Contact)> = vec![];
+    let mut errors = vec![];
+    let total = offenders.len();
+    for (i, o) in offenders.iter_mut().enumerate() {
+        let ip = o.net.addr;
+        if let Some((_, c)) = known.iter().find(|((a, b), _)| *a <= ip && ip <= *b) {
+            o.contact = Some(c.clone());
+            continue;
+        }
+        progress(i + 1, total);
+        match crate::feeds::download(cfg, &format!("https://rdap.org/ip/{ip}")) {
+            Ok(json) => match parse_rdap(&json) {
+                Some((c, range)) => {
+                    // Reuse the answer for other addresses only within a plausible allocation
+                    // that contains this one: a forged answer claiming the whole internet
+                    // would otherwise receive every other attacker's evidence.
+                    if let Some(r) = range.filter(|(a, b)| plausible_range(*a, *b) && *a <= ip && ip <= *b) {
+                        known.push((r, c.clone()));
+                    }
+                    o.contact = Some(c);
+                }
+                None => errors.push(format!("{ip}: unreadable RDAP answer")),
+            },
+            Err(e) => errors.push(format!("{ip}: {e:#}")),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    errors
+}
+
+/// At most a /8 (IPv4) or /32 (IPv6), the largest blocks registries hand out.
+fn plausible_range(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => u32::from(b).checked_sub(u32::from(a)).is_some_and(|n| n < 1 << 24),
+        (IpAddr::V6(a), IpAddr::V6(b)) => u128::from(b).checked_sub(u128::from(a)).is_some_and(|n| n < 1 << 96),
+        _ => false,
+    }
+}
+
+pub fn window_start(now: Micros, since: crate::time::Dur) -> Micros {
+    now.saturating_sub((since.0 as Micros).saturating_mul(SEC))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Severity;
+
+    #[test]
+    fn report_files_plain_or_gzip() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("lg-abuse-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{"servers":[],"from":1,"to":2,"offenders":[]}"#;
+        std::fs::write(dir.join("a.json"), json).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(json.as_bytes()).unwrap();
+        std::fs::write(dir.join("b.json.gz"), gz.finish().unwrap()).unwrap();
+        for f in ["a.json", "b.json.gz"] {
+            let r: Report = serde_json::from_str(&read_report_file(&dir.join(f)).unwrap()).unwrap();
+            assert_eq!((r.from, r.to), (1, 2), "{f}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ban(ts: &str, target: &str, category: &str, evidence: &[&str]) -> Action {
+        Action {
+            ts: time::parse_iso_prefix(ts).unwrap().0,
+            kind: ActionKind::Ban,
+            severity: Severity::High,
+            target: Some(target.parse().unwrap()),
+            until: None,
+            message: format!("ban {target} for 1h (offence #1): burst score fast=100 slow=100"),
+            evidence: evidence.iter().map(|e| e.to_string()).collect(),
+            superseded: vec![],
+            applied: true,
+            topic: None,
+            accounts: vec!["ejabberd:alice@example.org".into()],
+            user_note: None,
+            notice: None,
+            category: Some(category.into()),
+        }
+    }
+
+    #[test]
+    fn private_details_are_withheld() {
+        assert_eq!(sanitize("failed password for alice").unwrap(), "failed password login (account name withheld)");
+        assert_eq!(sanitize("failed password for invalid user oracle").unwrap(), "failed password login as non-existent user oracle");
+        assert_eq!(sanitize("invalid user oracle").unwrap(), "invalid user oracle");
+        assert!(!sanitize("login attempt on canary account postmaster").unwrap().contains("postmaster"));
+        assert!(!sanitize("LOGGED IN to canary account test").unwrap().contains("test"));
+        assert!(!sanitize("user root not allowed (not listed in AllowUsers)").unwrap().contains("root"));
+        assert!(!sanitize("nextcloud login failed for bob").unwrap().contains("bob"));
+        assert_eq!(sanitize("registered account eve@example.org").unwrap(), "registered an account");
+        assert_eq!(sanitize("auth failed: user x@example.org unknown").unwrap(), "auth failed: user [account] unknown");
+        assert_eq!(sanitize("peer vpn: 3x ssh_invalid_user (+60)"), None);
+        assert_eq!(sanitize("tripwire block TCP/23").unwrap(), "tripwire block TCP/23");
+        // network-ban lines start with the member address
+        assert_eq!(sanitize("192.0.2.9 failed password for alice").unwrap(), "192.0.2.9 failed password login (account name withheld)");
+        assert_eq!(sanitize("192.0.2.9 peer vpn: 3x ssh_invalid_user (+60)"), None);
+        assert!(!sanitize("2001:db8::1 nextcloud login failed for bob").unwrap().contains("bob"));
+    }
+
+    #[test]
+    fn groups_bans_and_formats_a_report() {
+        let bans = vec![
+            ban(
+                "2026-10-10 08:00:00",
+                "198.51.100.7",
+                "ssh",
+                &["10-10 07:59:58 invalid user oracle", "10-10 08:00:00 failed password for gateway"],
+            ),
+            ban("2026-10-11 09:00:00", "198.51.100.7", "tripwire", &["10-11 09:00:00 tripwire block TCP/3389"]),
+            ban("2026-10-11 10:00:00", "203.0.113.5", "tripwire", &["10-11 10:00:00 tripwire block TCP/23"]),
+            ban("2026-10-11 11:00:00", "192.0.2.0/24", "x", &["192.0.2.9", "192.0.2.10"]),
+            ban("2026-10-11 12:00:00", "192.0.2.9", "port scan", &["10-11 11:58:00 block TCP/8080", "10-11 11:59:00 block TCP/8081"]),
+            Action {
+                message: "ban 100.64.0.1 for 1h (from peer vpn): x".into(),
+                ..ban("2026-10-11 13:00:00", "198.18.0.1", "from peers", &[])
+            },
+        ];
+        let all = collect(&bans, &Filter { only: vec![], min_events: 1 });
+        assert_eq!(all.len(), 4, "peer bans are left out");
+        assert_eq!(all[0].net.to_string(), "198.51.100.7", "repeat offender first");
+        assert_eq!(all[0].bans, 2);
+        assert_eq!(all[0].evidence.len(), 3);
+        let net = all.iter().find(|o| !o.net.is_host()).unwrap();
+        assert_eq!(net.members.len(), 2);
+
+        let worth = collect(&bans, &Filter { only: vec![], min_events: 3 });
+        assert!(!worth.iter().any(|o| o.net.to_string() == "203.0.113.5"), "a single blocked packet isn't reported");
+        let only = collect(&bans, &Filter { only: vec!["192.0.2.0/24".parse().unwrap()], min_events: 1 });
+        assert_eq!(only.len(), 2);
+
+        let mut list = collect(&bans, &Filter { only: vec![], min_events: 1 });
+        list[0].contact = Some(Contact { abuse: vec!["abuse@isp.example".into()], network: "ISP-NET".into() });
+        let server = Server { host: "example.org".into(), addresses: vec!["192.0.2.1".parse().unwrap()] };
+        let report = Report { servers: vec![server], from: 0, to: bans[5].ts, offenders: list };
+        let text = render_text(&report);
+        assert!(text.contains("To: abuse@isp.example   (network: ISP-NET)"), "{text}");
+        assert!(text.contains("2026-10-10 07:59:58 UTC  invalid user oracle"), "{text}");
+        assert!(text.contains("TCP/3389 (RDP)"), "{text}");
+        assert!(text.contains("UTC  connection attempt to closed port TCP/3389 (RDP)"), "{text}");
+        assert_eq!(plain("192.0.2.9 block TCP/4444"), "192.0.2.9 connection attempt to closed port TCP/4444");
+        assert_eq!(plain("192.0.2.9 block TCP/8080"), "192.0.2.9 connection attempt to closed port TCP/8080 (Web HTTP alt)");
+
+        // a ban without a usable category is described from its evidence
+        let old = collect(
+            &[ban(
+                "2026-10-11 15:39:20",
+                "11.26.61.51",
+                "",
+                &["10-11 15:34:44 block TCP/46468", "10-11 15:39:20 port scan: 16 closed ports"],
+            )],
+            &Filter { only: vec![], min_events: 1 },
+        );
+        assert_eq!(describe(&old[0]), "port scanning (connection attempts to many closed ports)");
+        // a reinstated ban is no new incident, and "Seen" ends with the last activity
+        let twice = collect(
+            &[
+                ban(
+                    "2026-10-12 13:03:28",
+                    "11.4.32.8",
+                    "port scan",
+                    &["10-12 12:55:13 block TCP/9794", "10-12 13:03:28 port scan: 8 closed ports"],
+                ),
+                ban("2026-10-12 16:24:29", "11.4.32.8", "reinstated", &[]),
+            ],
+            &Filter { only: vec![], min_events: 1 },
+        );
+        assert_eq!(twice[0].bans, 1);
+        assert_eq!(time::fmt_ts(twice[0].last), "2026-10-12 13:03:28");
+        for secret in ["gateway", "alice", "fast=", "score", "peer"] {
+            assert!(!text.contains(secret), "{secret} leaked:\n{text}");
+        }
+    }
+
+    #[test]
+    fn merges_reports_of_two_servers() {
+        let a = vec![ban("2026-10-10 08:00:00", "198.51.100.7", "ssh", &["10-10 07:59:58 invalid user oracle"])];
+        let b = vec![
+            ban("2026-10-11 09:00:00", "198.51.100.7", "tripwire", &["10-11 09:00:00 tripwire block TCP/23"]),
+            ban("2026-10-11 10:00:00", "203.0.113.5", "tripwire", &["10-11 10:00:00 tripwire block TCP/3389"]),
+        ];
+        let f = Filter { only: vec![], min_events: 1 };
+        let report = |host: &str, addr: &str, bans: &[Action]| Report {
+            servers: vec![Server { host: host.into(), addresses: vec![addr.parse().unwrap()] }],
+            from: bans[0].ts,
+            to: bans[bans.len() - 1].ts,
+            offenders: collect(bans, &f),
+        };
+        // through JSON, as the files are exchanged between servers
+        let json = |r: Report| serde_json::from_str::<Report>(&serde_json::to_string(&r).unwrap()).unwrap();
+        let (m, skipped) = merge(vec![
+            json(report("xmpp.example", "192.0.2.1", &a)),
+            json(report("vpn", "192.0.2.2", &b)),
+            json(report("vpn", "192.0.2.2", &b)),
+        ]);
+        assert_eq!(skipped, [2], "the same server's report twice is skipped");
+        assert_eq!(m.servers.len(), 2);
+        assert_eq!(m.offenders.len(), 2);
+        let both = &m.offenders[0];
+        assert_eq!((both.net.to_string().as_str(), both.bans), ("198.51.100.7", 2));
+        assert_eq!(both.categories.len(), 2);
+        let text = render_text(&m);
+        assert!(text.contains("Abuse report from xmpp.example (192.0.2.1) and vpn (192.0.2.2)"), "{text}");
+        assert!(text.contains("2026-10-10 07:59:58 UTC  (to 192.0.2.1) invalid user oracle"), "{text}");
+        assert!(text.contains("2026-10-11 09:00:00 UTC  (to 192.0.2.2) connection attempt to closed port TCP/23 (Telnet)"), "{text}");
+    }
+
+    #[test]
+    fn evidence_from_december_in_a_january_ban() {
+        let jan = time::parse_iso_prefix("2027-01-01 00:00:10").unwrap().0;
+        let (t, text) = evidence_time("12-31 23:59:59 block TCP/23", jan).unwrap();
+        assert_eq!(time::fmt_ts(t), "2026-12-31 23:59:59");
+        assert_eq!(text, "block TCP/23");
+    }
+
+    #[test]
+    fn rdap_abuse_contact() {
+        let json = r#"{"handle":"NET-198-51-100-0-1","name":"EXAMPLE-NET","startAddress":"198.51.100.0","endAddress":"198.51.100.255",
+            "entities":[{"roles":["registrant"],"entities":[{"roles":["abuse"],
+            "vcardArray":["vcard",[["version",{},"text","4.0"],["fn",{},"text","Abuse"],["email",{},"text","Abuse@Example.net"]]]}]}]}"#;
+        let (c, range) = parse_rdap(json).unwrap();
+        assert_eq!(c.abuse, ["abuse@example.net"]);
+        assert_eq!(c.network, "EXAMPLE-NET, NET-198-51-100-0-1");
+        assert_eq!(range.unwrap().1.to_string(), "198.51.100.255");
+
+        // owner-written data: no line breaks or odd characters reach the report
+        let evil = r#"{"name":"X\nTo: someone@else.example","entities":[{"roles":["abuse"],
+            "vcardArray":["vcard",[["email",{},"text","a@b.example\nInjected text"],["email",{},"text","ok@isp.example"]]]}]}"#;
+        let (c, _) = parse_rdap(evil).unwrap();
+        assert_eq!(c.abuse, ["ok@isp.example"]);
+        assert!(!c.network.contains('\n'));
+        assert!(!plausible_range("0.0.0.0".parse().unwrap(), "255.255.255.255".parse().unwrap()));
+        assert!(plausible_range("198.51.100.0".parse().unwrap(), "198.51.100.255".parse().unwrap()));
+    }
+}

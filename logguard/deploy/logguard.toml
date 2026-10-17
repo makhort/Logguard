@@ -1,0 +1,375 @@
+# logguard configuration. Anything omitted uses the built-in default;
+# `logguard -c /etc/logguard/logguard.toml print-config` shows the full effective config.
+
+# "shadow": detect and log decisions only. Switch to "enforce" after reviewing a
+# week or two of decisions in `logguard tui` / /var/log/logguard/actions.jsonl.
+mode = "shadow"
+state_file = "/var/lib/logguard/state.json"
+socket = "/run/logguard/logguard.sock"
+actions_log = "/var/log/logguard/actions.jsonl"
+
+[sources]                 # which logs to analyse on this host
+ejabberd = true
+ssh = true
+ufw = true
+nextcloud = true          # Nextcloud AIO, see [nextcloud]
+oom = true                # alert when the kernel kills a process for lack of memory ("system" topic)
+# Alert when one of these fails (any unsuccessful end: non-zero exit, signal, timeout, ...) and
+# is not started again within service_restart_grace (by Restart= or by hand), or when systemd
+# gives up restarting it. Failures systemd recovers from on its own say nothing.
+services = ["logguard-xmpp-bot.service"]
+service_restart_grace = "2m"      # longer than the units' RestartSec
+
+[nextcloud]
+docker = "/usr/bin/docker"
+# Apache's error log (secret-file probes, path traversal), read via `docker logs -f`
+apache_container = "nextcloud-aio-apache"
+# failed logins (JSON lines). `occ log:file` shows the path inside the container
+# (/var/www/html/data/nextcloud.log); AIO mounts /var/www/html from the nextcloud_aio_nextcloud volume.
+log_file = "/var/lib/docker/volumes/nextcloud_aio_nextcloud/_data/data/nextcloud.log"
+
+[ports]
+# Local ports that are never scored and, in enforce mode, never blocked (even for banned addresses).
+whitelist = []
+# One UFW-blocked connection attempt to any of these = immediate ban. Only blocked traffic is
+# logged, so ports you serve can't trip. Keep it TCP: UDP senders are trivially spoofed.
+tripwire = [
+    "21/tcp", "23/tcp", "2323/tcp",                      # FTP, Telnet
+    "25/tcp", "465/tcp", "587/tcp",                      # SMTP, SMTPS, submission (no MX points here)
+    "110/tcp", "995/tcp", "143/tcp", "993/tcp",          # POP3(S), IMAP(S)
+    "135/tcp", "139/tcp", "445/tcp", "3389/tcp", "5985/tcp", "5986/tcp", # Windows RPC, NetBIOS, SMB, RDP, WinRM
+    "5900/tcp", "5901/tcp", "1723/tcp", "7547/tcp", "8291/tcp", # VNC, PPTP, TR-069, MikroTik Winbox
+    "389/tcp", "2375/tcp", "2376/tcp",                   # LDAP, Docker API
+    "1433/tcp", "1521/tcp", "3306/tcp", "5432/tcp", "27017/tcp", # MS SQL, Oracle, MySQL, PostgreSQL, MongoDB
+    "6379/tcp", "9200/tcp", "11211/tcp",                 # Redis, Elasticsearch, Memcached
+]
+# Names in the dashboard's port histogram (XMPP client ports and the cluster port are named
+# from [xmpp] and [cluster]).
+names = { 5269 = "XMPP server", 5280 = "ejabberd HTTP", 5281 = "XMPP Invites", 5443 = "ejabberd HTTP", "5478/udp" = "ejabberd STUN" }
+
+[canary]
+# Account-level tripwires: names attackers guess but nobody here uses. One login attempt
+# (or XMPP registration) on any of them = immediate ban; a *successful* login = critical alert.
+# Never list a real account. No need to create these accounts: ejabberd logs a failed login
+# for a non-existent account exactly like for a wrong password.
+xmpp = ["test", "info", "support", "contact", "root", "administrator", "webmaster", "postmaster",
+        "hostmaster", "user", "guest", "demo", "xmpp", "jabber", "office", "sales", "billing"]
+# sshd admits only the gateway user (key-only): every other name is a probe.
+ssh = ["*"]
+nextcloud = []            # NOT "admin": Nextcloud AIO's initial admin account is called admin
+except = ["admin", "0123456789abcdef0123456789abcdef"]   # real accounts: never canaries
+
+[silence]
+# Warn when a log source goes quiet ("no attacks" vs "not seeing logs"). Measured on a month of
+# this server's logs: UFW and ejabberd were never silent for 3h outside an outage, sshd often was
+# for a day. "0s" disables a source.
+enabled = true
+ufw = "2h"
+ejabberd = "6h"
+ssh = "2d"
+nextcloud = "0s"          # its logs only contain failures, so silence is normal
+# Lines arrive but none can be tied to a client address (e.g. ejabberd hide_sensitive_log_data).
+blind_after = "6h"
+blind_lines = 200
+
+# Kernel rate limits on new connections per source address (enforce mode, nftables only).
+# Active from the first packet, before scores react; also covers Docker-published ports,
+# which UFW's `limit` rules never see. Allowlisted addresses are exempt.
+# `logguard status` shows how many packets each rule dropped.
+[[ratelimit]]
+ports = ["5222/tcp", "5223/tcp"]     # XMPP clients: a phone reconnects a few times a minute at most
+rate = "30/minute"
+burst = 30
+[[ratelimit]]
+ports = ["3478/udp", "5349/tcp"]     # STUN/TURN(S): a call opens a handful of allocations
+rate = "60/minute"
+burst = 60
+# Nextcloud: browsers and sync clients open many parallel connections - keep it generous.
+# [[ratelimit]]
+# ports = ["443/tcp"]
+# rate = "300/minute"
+# burst = 300
+
+[allowlist]
+# Never banned, and the subnets containing them are never banned either.
+nets = [
+  "127.0.0.0/8",
+  "::1",
+  "11.25.48.86",     # VPN
+  "11.35.43.31",
+  "11.38.237.68",    # eu.prod.push.monal-im.org
+  "11.18.32.162",
+]
+# An address that logs in successfully (XMPP or SSH) gets a "protected" alert instead of a ban
+# for that service's noise and typos, for trust_ttl after its last login. It is still banned for
+# canary names, tripwire ports, other services and peers' reports; trust is not shared.
+trust_authenticated = true
+trust_ttl = "24h"
+
+[xmpp]
+c2s_ports = [5222, 5223]
+noauth_grace = "90s"
+
+[scoring]
+# Burst detection: e.g. 3 TLS handshake failures within a few minutes.
+fast_half_life = "10m"
+fast_threshold = 100
+# Low-and-slow detection: e.g. ~6 TLS failures spread over 4 hours.
+slow_half_life = "12h"
+slow_threshold = 200
+port_spread_ports = 3     # distinct XMPP ports touched within spread_window
+port_spread_bonus = 60
+spread_window = "10m"
+fw_scan_ports = 8         # distinct closed ports hit (UFW BLOCK) within spread_window
+fw_scan_bonus = 60
+compromise_score = 40     # login right after this much suspicious activity => critical alert
+
+[scoring.weights]         # points per event; unlisted signals keep their defaults
+xmpp_tls_fail = 40      # 3 strikes within ~5 min (34 would need them within ~25 s)
+xmpp_auth_fail = 25     # 5 strikes within ~5 min
+xmpp_no_auth = 10
+xmpp_conn = 2
+xmpp_s2s_bad = 25
+xmpp_http_miss = 4
+xmpp_token_fail = 5       # expired FAST token: nearly always a legitimate client
+xmpp_register = 15        # in-band account registration (mass sign-ups from one address)
+ssh_auth_fail = 25
+ssh_invalid_user = 40
+ssh_preauth = 8
+ssh_penalty = 25
+ssh_canary = 100          # login attempt on a [canary] name
+xmpp_canary = 100
+nc_canary = 100
+fw_block = 1
+fw_limit = 20
+fw_tripwire = 100         # one hit on a [ports] tripwire port = ban
+web_probe = 40            # Nextcloud: request for .env/config/../ refused (3 strikes)
+nc_auth_fail = 25         # Nextcloud: failed login
+
+[accounts]
+half_life = "1h"
+alert_failures = 20       # distributed guessing against one account
+min_ips = 3
+under_attack_multiplier = 2.0
+new_network_alerts = true
+learning_period = "7d"
+# These accounts log in through rotating VPN exits, so "new network" alerts are just noise for them.
+new_network_ignore = ["admin@example.org", "user5@example.org", "0123456789abcdef0123456789abcdef"]
+
+[subnets]
+enabled = true
+evaluate_every = "60s"
+suspect_score = 50
+v4_prefix = 24
+v6_prefix = 64
+min_bad_ips = 3           # /24 with 3+ individually bad addresses
+min_contributors = 5      # ...or 5+ addresses whose combined score reaches the sum below
+score_sum_threshold = 100
+wide_enabled = true
+v4_wide_prefix = 16
+wide_min_bad_ips = 12
+wide_min_subnets = 4
+
+[bans]
+ladder = ["1h", "6h", "1d", "7d", "30d"]
+forgive_after = "30d"
+
+[enforce]
+# auto: nftables, falling back to ufw (if installed), then iptables. Or one of nft, ufw, iptables.
+# iptables: logguard's chains in the raw table, next to your own (iptables-persistent) rules;
+# no rate limits or blocklist feeds (README, "Firewall backends").
+backend = "auto"
+nft = "/usr/sbin/nft"
+nft_table = "logguard"
+ufw = "/usr/sbin/ufw"
+iptables = "/usr/sbin/iptables"
+ip6tables = "/usr/sbin/ip6tables"
+iptables_chain = "logguard"
+
+[notify]
+# XMPP warnings via `ejabberdctl send_message`. Users get messages only in enforce mode
+# (unless users_in_shadow = true); admins always. Test with: logguard -c ... notify-test you@example.org
+enabled = true
+ejabberdctl = "/usr/sbin/ejabberdctl"
+# Messages go through ejabberd's REST API on a loopback-only listener (README, "XMPP
+# notifications"): the only way that is cheap and keeps line breaks, quotes and non-ASCII
+# intact. ejabberdctl over CTL_OVER_HTTP loses multi-line messages and garbles non-ASCII.
+api = "127.0.0.1:5285"
+# Authenticate as a dedicated account, so ejabberd's api_permissions can allow send_message
+# to it alone (README, "XMPP notifications"); without these, any local process can send as anyone.
+#api_user = "logguard@example.org"
+#api_password_file = "/etc/logguard/xmpp-api.password"   # root:root 0600
+#ctl_socket = "/opt/ejabberd/database/ejabberd@localhost/ctl_over_http.sock"   # fallback without api: ASCII only
+from = "example.org"          # the domain, not the bot: users get no notifications in the bot's chat
+message_type = "chat"
+admins = ["admin@example.org"]
+user_topics = ["account_attack", "brute_force", "compromise"]   # + "new_network" if you want login-location notices
+admin_topics = ["account_attack", "brute_force", "compromise", "registration", "false_positive", "protected", "system", "exposure", "integrity"]
+users_in_shadow = false
+cooldown = "6h"                  # per recipient, topic and account
+max_per_hour = 30               # to users in total; admins get the same again per topic
+# Language of the messages users receive: en (English), fr (French), de (German), pl (Polish), ru (Russian) or uk (Ukrainian).
+# Admin messages are always English.
+language = "en"
+# Messages to the admins go through the XMPP admin bot (logguard-xmpp-bot), which sends them OMEMO-
+# encrypted: logguard puts each in the bot's outbox. One the bot hasn't taken within
+# bot_grace (bot down, no trusted admin device) goes out the usual way above, unencrypted,
+# with a line saying why. Users' warnings always go the usual way. Test: notify-test --bot <admin>
+bot_outbox = "/opt/logguard-xmpp-bot/outbox"
+bot_user = "ejabberd"             # the bot's user: it gets the files (the outbox is sticky)
+bot_grace = "2m"
+bot_stuck_after = "1h"            # warn when the weekly abuse report waits longer than this
+# Optional: a copy of every message to the first admin for the Telegram bot (logguard-tg-bot), which
+# sends it to the admin's Telegram chat with XMPP account names replaced by pseudonyms
+# (logguard-tg-bot's README). Unset: nothing goes to Telegram. With admins = [] (and no bot_outbox),
+# admin messages go to Telegram only; users are still warned over XMPP. The weekly abuse
+# report goes to both bots' outboxes set here. Test: notify-test --telegram
+#tg_outbox = "/opt/logguard-tg-bot/outbox"
+#tg_user = "logguard-tg-bot"
+# Optional, the same for the mail bot (logguard-mail-bot): a copy of every message to the first admin,
+# mailed OpenPGP-encrypted (subject too) through the local Postfix or any SMTP server
+# (logguard-mail-bot's README). Next to tg_outbox or instead of it. Test: notify-test --mail
+#mail_outbox = "/opt/logguard-mail-bot/outbox"
+#mail_user = "logguard-mail-bot"
+
+[notify.languages]
+# Per-account language, by user name or full JID; accounts not listed get `language` above.
+# alice = "uk"
+# "bob@example.org" = "ru"
+
+[cluster]
+# Share bans, suspicion reports and trusted addresses with other logguard nodes over an
+# encrypted, authenticated TCP link (no VPN needed). All nodes use the same key; deploy.sh
+# generates deploy/cluster.key once and installs it as /etc/logguard/cluster.key.
+enabled = true
+node_id = "xmpp"
+listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
+peers = ["11.25.48.86:7946"]           # vpn; peers are never banned here
+key_file = "/etc/logguard/cluster.key"
+rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
+sync_interval = "10s"
+full_sync_every = "10m"
+share = ["bans", "unbans", "reports", "trust", "notices"]
+accept = ["bans", "unbans", "reports", "trust", "notices"]
+# Optional: a Telegram relay node (deploy/logguard-tg.toml, running logguard-tg-bot), so admin messages
+# reach Telegram without this server talking to Telegram. Add it to `peers` above, let it hand
+# over only notices and the abuse report's input (never bans or trust: the limit goes by its
+# address), and relay this node's own admin messages to it. 203.0.113.10 = its address.
+#peers = ["11.25.48.86:7946", "203.0.113.10:7946"]   # vpn, tg
+#peer_accept = { "203.0.113.10:7946" = ["notices", "files"] }
+#relay_notices = true
+# Bans learned from peers last at most this long here. The built-in default (1d) limits what a
+# compromised or mistaken node can do to the others; both nodes here are equally trusted, so
+# mirror the origin's full ban ladder (a peer's 7d ban is 7d here too).
+max_remote_ban = "30d"
+report_factor = 0.5                # peer-reported points count half
+min_report_points = 10
+max_hops = 3
+max_clock_skew = "5m"              # nodes need roughly correct clocks (systemd-timesyncd)
+# Files peers send once (`logguard cluster-send-report`: the weekly abuse report the XMPP
+# server merges and the bot delivers). "" refuses them.
+inbox = "/var/lib/logguard/inbox"
+
+[exposure]
+enabled = true
+interval = "60s"
+ufw = "/usr/sbin/ufw"
+ignore = []
+startup_grace = "15m"     # weekly reboot: containers start after logguard, don't report them as gone/new
+new_after_scans = 2
+gone_after_scans = 5
+
+[feeds]
+# Public blocklists in their own nftables sets (feed4/feed6), refreshed daily.
+# `logguard feeds clear` empties them in one step; enabled = false removes them on restart.
+enabled = true
+urls = [
+  "https://www.spamhaus.org/drop/drop.txt",                 # Spamhaus DROP (includes former EDROP)
+  "https://www.spamhaus.org/drop/dropv6.txt",
+  "https://iplists.firehol.org/files/firehol_level1.netset",  # FireHOL level1 (private ranges are filtered out)
+]
+refresh = "24h"
+cache_dir = "/var/lib/logguard/feeds"
+fetch = ["curl", "-fsSL", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"]   # falls back to wget
+max_entries = 100000
+min_prefix_v4 = 12        # one bad entry must not drop a whole /8
+min_prefix_v6 = 24
+max_growth = 2.0          # refuse a refresh covering >2x the last accepted list (keeps that one)
+
+[digest]
+# One summary message per day at `at` (UTC): bans by cause, top offenders, alerts,
+# exposure, cluster, feeds and certificate expiry.
+enabled = true
+at = "07:00"
+certs = ["example.org:5223", "example.org:5222/xmpp", "nextcloud.example.org:443"]   # host:port, or host:port/xmpp for STARTTLS
+# Certificates on disk: warns when a newer one exists than the one actually served
+# (renewed, but certfiles not updated / ejabberd not reloaded).
+cert_files = ["/opt/ejabberd/database/ejabberd@localhost/acme/live/*"]
+cert_warn_days = 21
+check_certs_every = "6h"
+openssl = "/usr/bin/openssl"
+
+[geo]
+# Readable places ("Germany / Hetzner Online GmbH (AS24940)") in new-login alerts, bans, the TUI,
+# `status` and the digest. Lookups happen in memory; only the databases are downloaded (weekly,
+# ~12 MB, no account): DB-IP's free lite databases, CC BY 4.0 - credit "IP locations: DB-IP.com".
+# A new /16 of a provider the account already used is no longer a "new network".
+enabled = true
+country_url = "https://download.db-ip.com/free/dbip-country-lite-{month}.csv.gz"
+asn_url = "https://download.db-ip.com/free/dbip-asn-lite-{month}.csv.gz"
+# Public-domain alternative for the network half (registry handles instead of company names):
+# asn_url = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
+dir = "/var/lib/logguard/geo"
+refresh = "7d"
+
+[cron]
+# New or changed scheduled tasks are a classic sign of a break-in. Watched: /etc/crontab,
+# /etc/cron.d/*, every user's crontab (what `crontab -l` shows), /etc/cron.{hourly,daily,
+# weekly,monthly,yearly}, enabled systemd timers, and the scripts crontab lines run
+# (e.g. /usr/local/bin/*.sh). Everything present during `learn` is accepted; after that
+# each change is reported once ("integrity" admin topic) and becomes the new normal.
+# Files installed by a package and unmodified (MD5 recorded by dpkg) are reported as warnings,
+# anything else as high. See what is watched:  logguard -c ... integrity
+enabled = true
+interval = "1m"
+learn = "1d"
+# crontabs = ["/etc/crontab", "/etc/anacrontab", "/etc/cron.d/*", "/var/spool/cron/crontabs/*", "/var/spool/cron/*"]
+# dirs = ["/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/etc/cron.yearly", "/etc/systemd/system/timers.target.wants"]
+scripts = true
+# Other files whose changes are reported (`*` within one path component, in any component):
+# SSH keys, sudoers, users, sshd settings, systemd units, preloaded libraries. Files of a
+# pattern added later are learned silently; files of a removed pattern are forgotten.
+# files = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/sudoers.d/*",
+#          "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/*", "/root/.ssh/authorized_keys",
+#          "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys2",
+#          "/etc/ld.so.preload", "/etc/rc.local", "/etc/profile.d/*",
+#          "/etc/systemd/system/*", "/etc/systemd/system/*.wants/*", "/etc/systemd/system/*.d/*.conf"]
+dpkg_db = "/var/lib/dpkg"       # read directly (no dpkg process); "" on hosts without dpkg
+
+[antivirus]
+# Reports infected files found by scheduled ClamAV scans (critical), scans that did not
+# finish (killed for memory, typically) and scans that stopped happening (stale_after).
+# install.sh enables logguard-avscan.timer (daily 02:30, scan paths in
+# /etc/default/logguard-avscan), which writes this log. Plain `clamscan --stdout` output
+# appended to a file works too, e.g. log = "/var/log/av_scan_result.log".
+enabled = true
+log = "/var/log/logguard/avscan.log"
+stale_after = "36h"
+
+[journal]
+journalctl = "/usr/bin/journalctl"
+# matches = [...]          # default: derived from [sources]
+initial_lookback = "1h"
+
+[resources]
+# Low disk space (warning below 10% free, high below 5%) and memory that stays short
+# (under 10% available for 15 min, or tasks stalled on memory 10% of the time), checked
+# every minute; each alert at most every 6 hours. /tmp is a tmpfs in RAM on this host.
+enabled = true
+interval = "60s"
+disks = ["/", "/tmp"]
+disk_warn_percent = 10
+disk_high_percent = 5
+mem_warn_percent = 10
+mem_sustain = "15m"
+psi_full_percent = 10

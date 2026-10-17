@@ -1,0 +1,52 @@
+[Unit]
+Description=Mail bot for logguard's admin messages (send-only, OpenPGP-encrypted)
+After=network-online.target
+Wants=network-online.target
+# the local Postfix, if that is the way out
+After=postfix.service
+
+[Service]
+Type=simple
+# Its own user: no access to logguard's, ejabberd's or Postfix's files. install.sh creates
+# it and sets the owners and modes of /opt/logguard-mail-bot.
+User=logguard-mail-bot
+Group=logguard-mail-bot
+WorkingDirectory=/opt/logguard-mail-bot
+EnvironmentFile=/opt/logguard-mail-bot/config.env
+ExecStart=/opt/logguard-mail-bot/logguard-mail-bot
+
+Restart=always
+RestartSec=5
+# 78: the mail server refused the login, a key is missing or unusable, or a bad setting.
+# Restarting would not help (and repeated failed logins can get this address banned there).
+RestartPreventExitStatus=78
+
+# Hardening: the bot reads its outbox and keys and talks SMTP to one server, nothing else.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/opt/logguard-mail-bot /var/log/logguard-mail-bot
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
