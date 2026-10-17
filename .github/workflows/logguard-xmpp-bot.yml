@@ -8,12 +8,12 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
     defaults:
       run:
         working-directory: logguard-xmpp-bot
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,7 +28,7 @@ jobs:
       - run: ./scripts/ci.sh
       # ci.sh skips these without the omemo-dr venv; this sets it up in target/ and runs them
       - run: ./scripts/omemo-oracle.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: logguard-xmpp-bot-x86_64-linux-musl
           path: logguard-xmpp-bot/target/x86_64-unknown-linux-musl/release/logguard-xmpp-bot
