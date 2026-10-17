@@ -110,8 +110,9 @@ elif [ -f "$UNIT" ]; then
 fi
 install -m 0755 logguard-mail-bot "$DIR/logguard-mail-bot"
 echo "Installed $("$DIR/logguard-mail-bot" --version)"
-# the directory this runs from is removed afterwards: keep this script for rollback
-install -o root -g root -m 0700 "$0" "$DIR/install.sh"
+# the directory this runs from is removed afterwards: keep this script for rollback. It is
+# here since the cd above, but $0 may name it from elsewhere (files/install.sh from a bundle).
+install -o root -g root -m 0700 "${0##*/}" "$DIR/install.sh"
 install -m 0644 logguard-mail-bot.service "$UNIT"
 install -m 0644 logguard-mail-bot.logrotate /etc/logrotate.d/logguard-mail-bot
 install -o root -g root -m 0644 config.env.example "$DIR/config.env.example"
