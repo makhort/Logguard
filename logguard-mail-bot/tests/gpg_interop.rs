@@ -102,10 +102,17 @@ fn round_trip(tag: &str, primary: &str, subkey: &str) -> String {
     format!("{}{}", String::from_utf8_lossy(&listing.stdout), String::from_utf8_lossy(&decrypted.stderr))
 }
 
+/// GnuPG 2.5 lists a SEIPD v1 packet as "version: 1" + "mdc: 2"; 2.4 and older (Debian 13,
+/// Ubuntu 24.04) as "length: ..." + "mdc_method: 2". AEAD (v2) shows neither.
+fn seipd_v1_with_mdc(packets: &str) -> bool {
+    packets.contains(":encrypted data packet:\n\tversion: 1\n\t    mdc: 2")
+        || (packets.contains(":encrypted data packet:\n\tlength: ") && packets.contains("\n\tmdc_method: 2\n"))
+}
+
 fn check_format(out: &str) {
     // a v3 PKESK, SEIPD v1 with MDC (what every client reads), AES-256, signed by the bot
     assert!(out.contains(":pubkey enc packet: version 3"), "{out}");
-    assert!(out.contains(":encrypted data packet:\n\tversion: 1\n\t    mdc: 2"), "SEIPD v1 with MDC: {out}");
+    assert!(seipd_v1_with_mdc(out), "SEIPD v1 with MDC: {out}");
     assert!(!out.to_lowercase().contains("aead"), "not AEAD (SEIPD v2): {out}");
     assert!(out.contains("AES256"), "AES-256: {out}");
     assert!(out.contains("[GNUPG:] GOODSIG ") && out.contains("logguard-mail-bot <alerts@example.org>"), "signed by the bot: {out}");
