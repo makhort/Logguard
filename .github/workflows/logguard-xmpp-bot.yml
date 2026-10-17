@@ -9,6 +9,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
+    timeout-minutes: 30         # a hung test fails the job instead of running for 6 h
     defaults:
       run:
         working-directory: logguard-xmpp-bot
@@ -26,7 +27,8 @@ jobs:
         with:
           tool: cargo-audit
       - run: ./scripts/ci.sh
-      # ci.sh skips these without the omemo-dr venv; this sets it up in target/ and runs them
+      # ci.sh runs these only with a working omemo-dr venv (a restored cache may hold a broken
+      # one); this sets it up or repairs it in target/, and runs them
       - run: ./scripts/omemo-oracle.sh
       - uses: actions/upload-artifact@v7
         with:

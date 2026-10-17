@@ -12,7 +12,7 @@ cargo clippy --all-targets --quiet -- -D warnings
 step "tests"
 cargo test --quiet
 step "OMEMO interoperability with omemo-dr"
-if [ -x target/omemo-oracle/bin/python ]; then
+if ./scripts/omemo-oracle.sh --check; then
     ./scripts/omemo-oracle.sh
 else
     echo "skipped: run ./scripts/omemo-oracle.sh once to set up the omemo-dr oracle"

@@ -9,6 +9,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
+    timeout-minutes: 30         # a hung test fails the job instead of running for 6 h
     defaults:
       run:
         working-directory: logguard
