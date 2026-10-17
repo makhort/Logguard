@@ -1,0 +1,31 @@
+name: logguard
+
+on:
+  push:
+    paths: ["logguard/**", ".github/workflows/logguard.yml"]
+  pull_request:
+    paths: ["logguard/**", ".github/workflows/logguard.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: logguard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: logguard
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: ./scripts/ci.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logguard-x86_64-linux-musl
+          path: logguard/target/x86_64-unknown-linux-musl/release/logguard

@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Rust build output
+logguard/target/
+logguard-xmpp-bot/target/
+logguard-tg-bot/target/
+
+# Secrets: never commit the cluster key
+logguard/deploy/cluster.key
+logguard/deploy/cluster.key.*
+*.key
+*.key.next
+*.key.prev
+
+# logguard-tg-bot's real settings hold the bot token; only config.env.example belongs here
+logguard-tg-bot/deploy/config.env
+logguard-mail-bot/target/
+
+# logguard-mail-bot's real settings hold the SMTP password; only config.env.example belongs here
+logguard-mail-bot/deploy/config.env

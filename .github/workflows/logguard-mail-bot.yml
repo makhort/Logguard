@@ -1,0 +1,33 @@
+name: logguard-mail-bot
+
+on:
+  push:
+    paths: ["logguard-mail-bot/**", ".github/workflows/logguard-mail-bot.yml"]
+  pull_request:
+    paths: ["logguard-mail-bot/**", ".github/workflows/logguard-mail-bot.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: logguard-mail-bot
+    steps:
+      - uses: actions/checkout@v4
+      # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: logguard-mail-bot
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # tests/gpg_interop.rs uses the runner's gpg
+      - run: ./scripts/ci.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logguard-mail-bot-x86_64-linux-musl
+          path: logguard-mail-bot/target/x86_64-unknown-linux-musl/release/logguard-mail-bot

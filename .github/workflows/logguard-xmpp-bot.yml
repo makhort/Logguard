@@ -1,0 +1,34 @@
+name: logguard-xmpp-bot
+
+on:
+  push:
+    paths: ["logguard-xmpp-bot/**", ".github/workflows/logguard-xmpp-bot.yml"]
+  pull_request:
+    paths: ["logguard-xmpp-bot/**", ".github/workflows/logguard-xmpp-bot.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: logguard-xmpp-bot
+    steps:
+      - uses: actions/checkout@v4
+      # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: logguard-xmpp-bot
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: ./scripts/ci.sh
+      # ci.sh skips these without the omemo-dr venv; this sets it up in target/ and runs them
+      - run: ./scripts/omemo-oracle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logguard-xmpp-bot-x86_64-linux-musl
+          path: logguard-xmpp-bot/target/x86_64-unknown-linux-musl/release/logguard-xmpp-bot
