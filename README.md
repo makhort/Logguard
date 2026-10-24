@@ -19,6 +19,10 @@ journal ─► logguard ─► nftables/ufw/iptables ◄────────
             └─► logguard-mail-bot ─► SMTP, PGP/MIME-encrypted
 ```
 
+How logguard compares with fail2ban, sshguard, CrowdSec, CSF, Wazuh and OSSEC, the host
+integrity and monitoring tools, and commercial products, with pros and cons per category and
+feature: [COMPARISON.md](COMPARISON.md).
+
 ## Crates
 
 Each directory is its own Cargo project with a README that covers setup, settings and design
@@ -61,8 +65,8 @@ the server and run `sudo ./install.sh` (the first run of each puts a config in p
 then you run it again). Each crate's README has a section "Install from a release bundle",
 with how to download and verify one.
 
-**Releases:** a version is a tag `<crate>-v<version>` (`logguard-v0.1.0`,
-`logguard-xmpp-bot-v0.1.0`, ...), with the version in that crate's `Cargo.toml`
+**Releases:** a version is a tag `<crate>-v<version>` (`logguard-v0.2.0`,
+`logguard-xmpp-bot-v0.2.0`, ...), with the version in that crate's `Cargo.toml`
 (`./scripts/bundle.sh --check-tag TAG` checks it). Pushing the tag runs that crate's workflow,
 which refuses a tag that doesn't match, tests, builds and installs the bundle as on every
 commit, then attaches it to the GitHub Release of the tag, with its `.sha256` and (in a public
