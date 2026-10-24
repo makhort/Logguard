@@ -5,7 +5,7 @@
 //! aren't in the logs, so those tabs stay hidden.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -148,16 +148,16 @@ fn read_log(path: &Path, unreadable: &mut u64) -> Result<Vec<Action>> {
     let reader: Box<dyn Read> =
         if path.extension().is_some_and(|e| e == "gz") { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
     let mut actions = Vec::new();
-    for line in BufReader::new(reader).lines() {
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
+    crate::record::for_each_action_line(reader, |line| {
         if line.trim().is_empty() {
-            continue;
+            return;
         }
-        match serde_json::from_str::<Action>(&line) {
+        match serde_json::from_str::<Action>(line) {
             Ok(a) => actions.push(a),
             Err(_) => *unreadable += 1,
         }
-    }
+    })
+    .with_context(|| format!("reading {}", path.display()))?;
     Ok(actions)
 }
 
@@ -374,6 +374,11 @@ fn build(mut files: Vec<Vec<Action>>, geo: Option<&GeoDb>) -> Snapshot {
         world,
         port_names: vec![],
         actions_log: Some(sum),
+        patches: None,
+        verify: None,
+        procwatch: None,
+        allow_hosts: vec![],
+        patterns: vec![],
     }
 }
 
@@ -481,11 +486,11 @@ mod tests {
                 2 * h
             )),
             line(&format!(
-                r#"{{"ts":{},"kind":"ban","severity":"high","target":"11.28.1.1","until":{},"message":"ban 11.28.1.1 [Finland / Hetzner Online GmbH (AS24940)] for 1h (offence #1): x","evidence":["10-12 10:01:00 block UDP/3389","10-12 10:01:01 block TCP/3389"],"applied":true,"category":"port scan"}}"#,
+                r#"{{"ts":{},"kind":"ban","severity":"high","target":"11.36.1.1","until":{},"message":"ban 11.36.1.1 [Finland / Hetzner Online GmbH (AS24940)] for 1h (offence #1): x","evidence":["10-12 10:01:00 block UDP/3389","10-12 10:01:01 block TCP/3389"],"applied":true,"category":"port scan"}}"#,
                 h + 2,
                 9 * h
             )),
-            line(&format!(r#"{{"ts":{},"kind":"unban","severity":"info","target":"11.28.1.1","message":"unban"}}"#, 2 * h)),
+            line(&format!(r#"{{"ts":{},"kind":"unban","severity":"info","target":"11.36.1.1","message":"unban"}}"#, 2 * h)),
             line(&format!(r#"{{"ts":{},"kind":"alert","severity":"warning","message":"something"}}"#, 2 * h + 5)),
             line(r#"{"ts":0,"kind":"alert","severity":"warning","message":"no time"}"#),
         ];
@@ -495,7 +500,7 @@ mod tests {
         assert_eq!(sum.categories, BTreeMap::from([("port scan".into(), 1), ("tripwire".into(), 1)]));
         assert_eq!(sum.bans_per_hour, vec![3]);
         assert_eq!((sum.from, sum.to), (h, 2 * h + 5), "an alert without a time doesn't start the period");
-        // at the end (2h+5): 1.0.0.1 expired at 2h, 11.28.1.1 was lifted, 5.9.1.1 lasts until 3h
+        // at the end (2h+5): 1.0.0.1 expired at 2h, 11.36.1.1 was lifted, 5.9.1.1 lasts until 3h
         let active: Vec<String> = s.bans.iter().map(|b| b.net.to_string()).collect();
         assert_eq!(active, ["5.9.1.1"]);
         assert_eq!((s.bans[0].offence, s.bans[0].reason.as_str()), (2, "burst score fast=100 [1x fw_tripwire]"));

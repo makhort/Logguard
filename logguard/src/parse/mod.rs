@@ -1,8 +1,10 @@
 //! Turns raw records into security events.
 
+pub mod custom;
 pub mod ejabberd;
 pub mod kernel;
 pub mod nextcloud;
+pub mod privilege;
 pub mod ssh;
 pub mod systemd;
 pub mod ufw;
@@ -15,19 +17,34 @@ use crate::time::Micros;
 pub struct Parsers {
     pub ejabberd: ejabberd::EjabberdParser,
     pub ssh: ssh::SshParser,
+    pub custom: custom::Patterns,
+    /// What each pattern for its sender made of the last `Source::Custom` line: for the
+    /// dashboard's per-pattern statistics.
+    pub pattern_seen: Vec<(String, custom::Outcome)>,
     sources: crate::config::SourcesCfg,
     ports: crate::config::PortsCfg,
     canary: crate::config::CanaryCfg,
+    /// Recent tripwire hits: the same blocked SYN may be logged by UFW and by logguard's own
+    /// nftables rule (`[ports] kernel_tripwires`), and must count once.
+    trips: std::collections::HashMap<(std::net::IpAddr, u16), Micros>,
 }
+
+/// Bound on remembered tripwire hits (spoofed SYNs can name any source).
+const MAX_TRIPS: usize = 4096;
+/// Two lines about the same SYN arrive within a moment of each other.
+const TRIP_TWIN: Micros = 2 * crate::time::SEC;
 
 impl Parsers {
     pub fn new(cfg: &Config) -> Self {
         Parsers {
             ejabberd: ejabberd::EjabberdParser::new(cfg.xmpp.c2s_ports.clone(), cfg.xmpp.noauth_grace.micros()),
             ssh: ssh::SshParser::default(),
+            custom: custom::Patterns::new(&cfg.patterns),
+            pattern_seen: Vec::new(),
             sources: cfg.sources.clone(),
             ports: cfg.ports.clone(),
             canary: cfg.canary.clone(),
+            trips: Default::default(),
         }
     }
 
@@ -41,9 +58,10 @@ impl Parsers {
             Source::Ssh => self.ssh.feed(rec, out),
             Source::Ufw => ufw::feed(rec, out),
             Source::Nextcloud => nextcloud::feed(rec, out),
-            // out-of-memory kills become operational alerts in the pipeline, not events
-            // service failures become operational alerts in the pipeline too
-            Source::Peer | Source::Kernel | Source::Systemd => {} // peer evidence arrives as cluster facts
+            Source::Custom => self.pattern_seen = self.custom.feed(rec, out).into_iter().map(|(name, o)| (name.to_string(), o)).collect(),
+            // out-of-memory kills, service failures and su/sudo become alerts in the pipeline;
+            // peer evidence arrives as cluster facts
+            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege => {}
         }
         self.drop_whitelisted(out, start);
         for e in &mut out[start..] {
@@ -52,6 +70,31 @@ impl Parsers {
                 e.detail = format!("tripwire {}", e.detail);
             }
             self.mark_canary(e);
+        }
+        self.drop_trip_twins(out, start);
+    }
+
+    /// Drops a tripwire hit logged a second time (by UFW and by logguard's own rule).
+    fn drop_trip_twins(&mut self, out: &mut Vec<Event>, start: usize) {
+        if !out[start..].iter().any(|e| e.signal == Signal::FwTripwire) {
+            return;
+        }
+        let fresh = out.split_off(start);
+        for e in fresh {
+            if let (Signal::FwTripwire, Some(port)) = (e.signal, e.port) {
+                let key = (e.ip, port);
+                if self.trips.get(&key).is_some_and(|t| (e.ts - t).abs() < TRIP_TWIN) {
+                    continue;
+                }
+                if self.trips.len() >= MAX_TRIPS {
+                    let ts = e.ts;
+                    self.trips.retain(|_, t| (ts - *t).abs() < TRIP_TWIN);
+                }
+                if self.trips.len() < MAX_TRIPS {
+                    self.trips.insert(key, e.ts);
+                }
+            }
+            out.push(e);
         }
     }
 
@@ -83,6 +126,7 @@ impl Parsers {
         let start = out.len();
         self.ejabberd.sweep(now, out);
         self.ssh.sweep(now);
+        self.trips.retain(|_, t| now - *t < TRIP_TWIN);
         self.drop_whitelisted(out, start);
     }
 
@@ -111,6 +155,7 @@ mod tests {
             pid: 0,
             msg: format!("[UFW BLOCK] IN=ens3 OUT= SRC=1.2.3.4 DST=5.6.7.8 PROTO={proto} SPT=1 DPT={dpt}"),
             cursor: None,
+            sender: None,
         };
         for (port, proto) in [(51820, "UDP"), (51821, "TCP"), (51820, "TCP"), (22, "TCP")] {
             p.feed(&ufw(port, proto), &mut out);
@@ -122,6 +167,7 @@ mod tests {
                 pid: 1,
                 msg: "2026-01-01 00:00:00.000 [info] (#PID<0.1.0>) Accepted connection 1.2.3.4:1 -> 5.6.7.8:5269".into(),
                 cursor: None,
+                sender: None,
             },
             &mut out,
         );
@@ -147,13 +193,14 @@ mod tests {
         .unwrap();
         let mut p = Parsers::new(&cfg);
         let mut out = vec![];
-        let ssh = |msg: &str| Record { ts: 0, source: Source::Ssh, pid: 0, msg: msg.into(), cursor: None };
+        let ssh = |msg: &str| Record { ts: 0, source: Source::Ssh, pid: 0, msg: msg.into(), cursor: None, sender: None };
         let xmpp = |msg: &str| Record {
             ts: 0,
             source: Source::Ejabberd,
             pid: 1,
             msg: format!("2026-10-11 10:00:00.000 [info] (tls|<0.5.0>) {msg}"),
             cursor: None,
+            sender: None,
         };
         p.feed(&ssh("Invalid user ubuntu from 1.2.3.4 port 5555"), &mut out);
         p.feed(&ssh("User root from 1.2.3.5 not allowed because not listed in AllowUsers"), &mut out);
@@ -284,7 +331,7 @@ mod tests {
             let line = &line[..cut];
             let mut out = Vec::new();
             for source in [Source::Ejabberd, Source::Ssh, Source::Ufw, Source::Nextcloud] {
-                let rec = Record { ts: round, source, pid: (next() % 3) as u32, msg: line.to_string(), cursor: None };
+                let rec = Record { ts: round, source, pid: (next() % 3) as u32, msg: line.to_string(), cursor: None, sender: None };
                 parsers.feed(&rec, &mut out);
             }
             let _ = crate::record::parse_syslog_line(line, &mut years);

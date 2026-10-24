@@ -4,4 +4,10 @@
 # (decryption, signing). logguard-mail-bot encrypts to the admins' public keys and signs, if at
 # all, with its own Ed25519 key (src/seal.rs, through rpgp); it holds no RSA private key, and
 # no fixed rsa version exists. Look again when rpgp moves to rsa 0.10 or the advisory changes.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0387 (crypto-bigint 0.5, through rpgp 0.21's elliptic-curve 0.13): timing
+# variability in arithmetic meant to be constant-time, used for the NIST and secp256k1 curves
+# and X448. The bot's own key is Ed25519 (`keygen`, curve25519-dalek), RSA recipients go
+# through num-bigint, Curve25519 ones through x25519-dalek; an ECDH recipient on another curve
+# only meets it with the one-time key of a single message. No rpgp release uses
+# crypto-bigint 0.7 yet: look again when one does (or if SIGNING_KEY is ever an ECDSA key).
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

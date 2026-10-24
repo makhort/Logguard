@@ -103,7 +103,7 @@ elif [ -n "$config" ]; then
     effective=$config
 else
     install -d -m 0755 /etc/logguard
-    install -m 0644 "$tpl" "$CONF"
+    install -m 0600 "$tpl" "$CONF"
     "$bin" --config "$CONF" print-config > /dev/null
     echo "New server: $CONF is the template ${tpl#configs/} now; nothing else is installed yet."
     echo "Edit it for this server: [allowlist] (your own addresses), [notify], [cluster] (node_id,"

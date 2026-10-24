@@ -137,6 +137,23 @@ async fn add_registers_with_a_generated_password() {
     assert_eq!(say(&mut b, ADMIN, "/remove bob").await.unwrap(), INVALID_USERNAME);
 }
 
+/// An account that exists is named however ejabberd let it be named (two letters, a `+`):
+/// the bot's own rule is only for the accounts /add creates.
+#[tokio::test]
+async fn existing_accounts_go_by_ejabberds_rules() {
+    let mut b = bot("short-names", &["an", "jean+paul"]);
+    assert_eq!(say(&mut b, ADMIN, "/allow an").await.unwrap(), "✓ User 'an' now has access to bot (language: EN).");
+    assert_eq!(say(&mut b, ADMIN, "/deny AN@example.org").await.unwrap(), "✓ User 'an' will not have access to bot.");
+    assert_eq!(say(&mut b, ADMIN, "/allow jean+paul").await.unwrap(), "✓ User 'jean+paul' now has access to bot (language: EN).");
+    assert_eq!(say(&mut b, ADMIN, "/remove an").await.unwrap(), "✓ User 'an' removed.");
+    assert_eq!(say(&mut b, ADMIN, "/allow an").await.unwrap(), INVALID_USERNAME, "gone");
+    assert_eq!(say(&mut b, ADMIN, "/add jo").await.unwrap(), INVALID_USERNAME, "a new account: the bot's rule");
+    // what ejabberd's names never hold, and so never reaches ejabberdctl
+    for bad in ["", "a\"b", "a'b", "a b", "a/b", "a:b", "a<b", "a&b", "a\nb"] {
+        assert_eq!(normalize_username(bad), None, "{bad:?}");
+    }
+}
+
 #[test]
 fn passwords_and_usernames() {
     let p = generate_password();
@@ -211,6 +228,12 @@ async fn five_abuse_reports_alert_the_admin_and_a_ban_clears_them() {
         }
     }
     assert_eq!(say(&mut b, "r1@example.org", "/abuse eve").await.unwrap(), "✗ You can report the same user only once.");
+    // a reason is kept on one line, and at most MAX_REASON characters of it
+    b.ctl.accounts.borrow_mut().insert("mallory".into());
+    let long = format!("/abuse mallory 'line one\nline two {}'", "x".repeat(1000));
+    assert_eq!(say(&mut b, "r1@example.org", &long).await.unwrap(), "✓ Your abuse report is accepted.");
+    let (_, _, reason) = b.state.reports_by("r1").into_iter().find(|(u, _, _)| *u == "mallory").unwrap();
+    assert!(reason.starts_with("line one line two x") && reason.chars().count() == MAX_REASON, "{reason:?}");
     assert_eq!(say(&mut b, "r1@example.org", "/abuse admin").await.unwrap(), INVALID_USERNAME);
     b.ctl.accounts.borrow_mut().insert("admin".into());
     assert_eq!(say(&mut b, "r1@example.org", "/abuse admin").await.unwrap(), "✗ 'admin' can not be reported.");

@@ -1288,6 +1288,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "logguard-xmpp-bot"
+version = "0.2.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "cbc",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "futures",
+ "hkdf",
+ "hmac",
+ "image",
+ "indexmap",
+ "libc",
+ "log",
+ "prost",
+ "rand 0.9.5",
+ "rustls-native-certs",
+ "sasl",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "shlex 1.3.0",
+ "tokio",
+ "tokio-rustls",
+ "tokio-xmpp",
+ "url",
+]
+
+[[package]]
+name = "logguard-xmpp-bot-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "logguard-xmpp-bot",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2669,50 +2713,6 @@ dependencies = [
  "sha3",
  "uuid",
  "xso",
-]
-
-[[package]]
-name = "logguard-xmpp-bot"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "anyhow",
- "base64",
- "cbc",
- "chrono",
- "chrono-tz",
- "clap",
- "curve25519-dalek",
- "ed25519-dalek",
- "futures",
- "hkdf",
- "hmac",
- "image",
- "indexmap",
- "libc",
- "log",
- "prost",
- "rand 0.9.5",
- "rustls-native-certs",
- "sasl",
- "serde",
- "serde_json",
- "sha1 0.10.7",
- "sha2 0.10.9",
- "shlex 1.3.0",
- "tokio",
- "tokio-rustls",
- "tokio-xmpp",
- "url",
-]
-
-[[package]]
-name = "logguard-xmpp-bot-fuzz"
-version = "0.0.0"
-dependencies = [
- "libfuzzer-sys",
- "logguard-xmpp-bot",
 ]
 
 [[package]]

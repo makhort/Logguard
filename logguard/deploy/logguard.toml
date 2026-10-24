@@ -14,6 +14,7 @@ ssh = true
 ufw = true
 nextcloud = true          # Nextcloud AIO, see [nextcloud]
 oom = true                # alert when the kernel kills a process for lack of memory ("system" topic)
+privilege = true          # su and sudo: failures (someone has an account and tries for root) as alerts
 # Alert when one of these fails (any unsuccessful end: non-zero exit, signal, timeout, ...) and
 # is not started again within service_restart_grace (by Restart= or by hand), or when systemd
 # gives up restarting it. Failures systemd recovers from on its own say nothing.
@@ -46,6 +47,17 @@ tripwire = [
 # Names in the dashboard's port histogram (XMPP client ports and the cluster port are named
 # from [xmpp] and [cluster]).
 names = { 5269 = "XMPP server", 5280 = "ejabberd HTTP", 5281 = "XMPP Invites", 5443 = "ejabberd HTTP", "5478/udp" = "ejabberd STUN" }
+# Tripwire hits from logguard's own nftables table (enforce mode, nftables): the first new TCP
+# connection per source every 10 minutes to a tripwire port nothing listens on is logged, at up
+# to this rate for the whole host. UFW's log keeps only about 3 lines a minute for everything.
+kernel_tripwires = true
+kernel_tripwire_rate = "60/minute"
+# Ports logguard listens on itself and closes at once: a completed TCP handshake can't come
+# from a forged address, so a hit bans for certain (tripwire_connect). With any set, a blocked
+# SYN to a tripwire port scores 50 instead of 100 unless [scoring.weights] says otherwise.
+# Open them in the firewall (ufw allow 2323/tcp) and take them out of `tripwire`.
+honeypot = []
+# honeypot = ["2323/tcp", "5900/tcp"]
 
 [canary]
 # Account-level tripwires: names attackers guess but nobody here uses. One login attempt
@@ -95,14 +107,18 @@ burst = 60
 nets = [
   "127.0.0.0/8",
   "::1",
-  "11.25.48.86",     # VPN
-  "11.35.43.31",
-  "11.38.237.68",    # eu.prod.push.monal-im.org
-  "11.18.32.162",
+  "11.33.48.86",
+  "11.43.43.31",
+  "11.46.237.68",
+  "11.26.32.162",
 ]
 # An address that logs in successfully (XMPP or SSH) gets a "protected" alert instead of a ban
-# for that service's noise and typos, for trust_ttl after its last login. It is still banned for
-# canary names, tripwire ports, other services and peers' reports; trust is not shared.
+# for that service's noise and typos, for trust_ttl after its last login, and blocked packets
+# (tripwire ports too: their source is easily forged) don't count against it. It is still banned
+# for canary names, other services and peers' reports; trust is not shared.
+# Host names whose addresses are allowlisted too (a home connection with a dynamic DNS name),
+# resolved every 10 minutes. Whoever controls the name's DNS controls this entry.
+hosts = []
 trust_authenticated = true
 trust_ttl = "24h"
 
@@ -142,7 +158,8 @@ xmpp_canary = 100
 nc_canary = 100
 fw_block = 1
 fw_limit = 20
-fw_tripwire = 100         # one hit on a [ports] tripwire port = ban
+fw_tripwire = 100         # one hit on a [ports] tripwire port = ban (with honeypots: remove, for 50)
+tripwire_connect = 100    # a completed handshake with a [ports] honeypot port
 web_probe = 40            # Nextcloud: request for .env/config/../ refused (3 strikes)
 nc_auth_fail = 25         # Nextcloud: failed login
 
@@ -155,6 +172,7 @@ new_network_alerts = true
 learning_period = "7d"
 # These accounts log in through rotating VPN exits, so "new network" alerts are just noise for them.
 new_network_ignore = ["admin@example.org", "user5@example.org", "0123456789abcdef0123456789abcdef"]
+new_key_alerts = true     # an SSH login with a key the account never used (after learning_period)
 
 [subnets]
 enabled = true
@@ -165,10 +183,11 @@ v6_prefix = 64
 min_bad_ips = 3           # /24 with 3+ individually bad addresses
 min_contributors = 5      # ...or 5+ addresses whose combined score reaches the sum below
 score_sum_threshold = 100
-wide_enabled = true
-v4_wide_prefix = 16
-wide_min_bad_ips = 12
-wide_min_subnets = 4
+wide_enabled = true       # a banned /24 grows to the narrowest network that also holds the
+v4_wide_prefix = 16       # next ban nearby (/23, /22, ...), up to this wide,
+wide_max_step = 2         # and at most this many bits at a time (/24 -> /22 -> /20 ...)
+v6_wide_prefix = 48       # IPv6: a banned /64 grows the same way up to a /48 ("64" = never),
+wide_max_step_v6 = 4      # 4 bits at a time (providers hand out /64, /60, /56, /48)
 
 [bans]
 ladder = ["1h", "6h", "1d", "7d", "30d"]
@@ -176,7 +195,7 @@ forgive_after = "30d"
 
 [enforce]
 # auto: nftables, falling back to ufw (if installed), then iptables. Or one of nft, ufw, iptables.
-# iptables: logguard's chains in the raw table, next to your own (iptables-persistent) rules;
+# iptables: logguard's chains in the mangle table, next to your own (iptables-persistent) rules;
 # no rate limits or blocklist feeds (README, "Firewall backends").
 backend = "auto"
 nft = "/usr/sbin/nft"
@@ -244,7 +263,7 @@ bot_stuck_after = "1h"            # warn when the weekly abuse report waits long
 enabled = true
 node_id = "xmpp"
 listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
-peers = ["11.25.48.86:7946"]           # vpn; peers are never banned here
+peers = ["11.33.48.86:7946"]           # vpn; peers are never banned here
 key_file = "/etc/logguard/cluster.key"
 rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
 sync_interval = "10s"
@@ -255,7 +274,7 @@ accept = ["bans", "unbans", "reports", "trust", "notices"]
 # reach Telegram without this server talking to Telegram. Add it to `peers` above, let it hand
 # over only notices and the abuse report's input (never bans or trust: the limit goes by its
 # address), and relay this node's own admin messages to it. 203.0.113.10 = its address.
-#peers = ["11.25.48.86:7946", "203.0.113.10:7946"]   # vpn, tg
+#peers = ["11.33.48.86:7946", "203.0.113.10:7946"]   # vpn, tg
 #peer_accept = { "203.0.113.10:7946" = ["notices", "files"] }
 #relay_notices = true
 # Bans learned from peers last at most this long here. The built-in default (1d) limits what a
@@ -290,11 +309,14 @@ urls = [
 ]
 refresh = "24h"
 cache_dir = "/var/lib/logguard/feeds"
-fetch = ["curl", "-fsSL", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"]   # falls back to wget
+fetch = ["curl", "-fsSL", "--proto-redir", "=https", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"]   # falls back to wget
 max_entries = 100000
 min_prefix_v4 = 12        # one bad entry must not drop a whole /8
 min_prefix_v6 = 24
 max_growth = 2.0          # refuse a refresh covering >2x the last accepted list (keeps that one)
+# Networks (ASNs) to block wholesale, their address blocks taken from the [geo] network
+# database (needs [geo] with asn_url): Spamhaus ASN-DROP lists hijacked and criminal networks.
+asn_urls = ["https://www.spamhaus.org/drop/asndrop.json"]
 
 [digest]
 # One summary message per day at `at` (UTC): bans by cause, top offenders, alerts,
@@ -337,12 +359,16 @@ learn = "1d"
 # dirs = ["/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/etc/cron.yearly", "/etc/systemd/system/timers.target.wants"]
 scripts = true
 # Other files whose changes are reported (`*` within one path component, in any component):
-# SSH keys, sudoers, users, sshd settings, systemd units, preloaded libraries. Files of a
-# pattern added later are learned silently; files of a removed pattern are forgotten.
+# SSH keys, sudoers, users, sshd settings, PAM, apt hooks, programs installed by hand,
+# systemd units, preloaded libraries. Files of a pattern added later are learned
+# silently; files of a removed pattern are forgotten.
 # files = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/sudoers.d/*",
 #          "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/*", "/root/.ssh/authorized_keys",
 #          "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys2",
-#          "/etc/ld.so.preload", "/etc/rc.local", "/etc/profile.d/*",
+#          "/etc/ssh/authorized_keys/*", "/etc/ld.so.preload", "/etc/ld.so.conf.d/*", "/etc/rc.local",
+#          "/etc/profile.d/*", "/etc/environment", "/etc/bash.bashrc", "/root/.bashrc", "/root/.profile",
+#          "/etc/pam.d/*", "/etc/apt/apt.conf.d/*", "/etc/update-motd.d/*", "/etc/modules-load.d/*",
+#          "/etc/modprobe.d/*", "/etc/udev/rules.d/*", "/etc/init.d/*", "/usr/local/bin/*", "/usr/local/sbin/*",
 #          "/etc/systemd/system/*", "/etc/systemd/system/*.wants/*", "/etc/systemd/system/*.d/*.conf"]
 dpkg_db = "/var/lib/dpkg"       # read directly (no dpkg process); "" on hosts without dpkg
 
@@ -360,6 +386,15 @@ stale_after = "36h"
 journalctl = "/usr/bin/journalctl"
 # matches = [...]          # default: derived from [sources]
 initial_lookback = "1h"
+# journalctl --verify every so often ("0s" = never): damaged journal files, or with the
+# verification key of Forward Secure Sealing (journalctl --setup-keys) entries changed after
+# they were sealed. Separately, a high alert says when journald no longer has the position
+# logguard read up to (journal files vacuumed or deleted while lines were unread).
+verify_every = "0s"
+# The verification key can seal entries too (every sealing key derives from it): on this
+# server it only catches an intruder who doesn't look for it, and journalctl shows it to
+# local users (ps) during each check unless /proc is mounted with hidepid=invisible.
+# verify_key_file = "/etc/logguard/journal-verify.key"   # root only, 0600
 
 [resources]
 # Low disk space (warning below 10% free, high below 5%) and memory that stays short
@@ -373,3 +408,43 @@ disk_high_percent = 5
 mem_warn_percent = 10
 mem_sustain = "15m"
 psi_full_percent = 10
+
+[patches]
+# In the daily digest and the dashboard: pending security updates (apt-get -s, a simulation,
+# run in a transient unit of its own with systemd-run, outside logguard's memory limit), a newer
+# kernel than the running one, /run/reboot-required, programs still running replaced libraries.
+enabled = true
+interval = "6h"
+apt = true
+
+[verify]
+# Weekly: package programs and libraries hashed against dpkg's checksums (like debsums; a
+# replaced binary is how a rootkit hides), and the set-uid/set-gid programs, learned on the
+# first pass. Reads at most max_rate_mb MB a second.
+enabled = true
+interval = "7d"
+dirs = ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec"]
+exclude = ["/usr/lib/firmware"]
+max_rate_mb = 20
+
+[procwatch]
+# Every minute from /proc: new outbound connections by program and remote port (learned for
+# `learn`, then each new pair is reported once; shells and network tools talking out, and the
+# ports miners and reverse shells use, are always high), and programs running from /tmp,
+# /dev/shm, memory only, or a deleted file outside the package directories.
+enabled = true
+interval = "60s"
+learn = "3d"
+ignore_processes = []
+ignore_ports = []
+
+# Log lines of your own (a service logguard has no parser for): a regex with the client
+# address in group `ip` (and the account in `user`), over a systemd unit's journal lines or a
+# log file. Try one with:  logguard -c ... test-pattern --pattern NAME FILE
+# [[patterns]]
+# name = "postfix_sasl"
+# unit = "postfix@-.service"        # journal lines of this unit (or: identifier + uid; or: file)
+# regex = 'warning: [^\[]*\[(?P<ip>[0-9A-Fa-f.:]+)\]: SASL \S+ authentication failed(: [^,]*, sasl_username=(?P<user>\S+))?'
+# kind = "failure"                  # failure (per account), probe, or success (a login)
+# weight = 25
+# port = 587

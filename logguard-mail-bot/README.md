@@ -122,9 +122,9 @@ Instead of `deploy.sh` (below), without a Rust toolchain: every version tag `log
 **Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
 
 ```bash
-gh release download logguard-mail-bot-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+gh release download logguard-mail-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
 sha256sum -c logguard-mail-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-mail-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-mail-bot-v0.1.0
+gh attestation verify logguard-mail-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-mail-bot-v0.2.0
 ```
 
 `gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-mail-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
@@ -238,5 +238,18 @@ refused at the start); with `SANITIZE=on`, a server address replaced by its node
 an address (`admin@::ffff:192.0.2.10` → `admin@xmpp`; fixed in logguard-tg-bot too). One was the
 oracle's: a pseudonym cut by the 200-character subject limit.
 
-**Not yet verified:** a real mail server, and opening the mails in Thunderbird, K-9 or
-FairEmail (GnuPG reads them).
+**Tested on a server (2026-10-20):** a Debian VPS deployed with `deploy.sh`, the unit running.
+`check`, `send-test`, logguard's `notify-test --mail` (picked up from the outbox and sent
+within seconds) and a digest (`digest --send`) through a provider (`SMTP_TLS=tls`, port 465, LOGIN) to a SimpleLogin alias
+forwarding to Proton Mail; GnuPG on a Mac decrypts the mails and shows the bot's signature as
+good. Proton re-armors the encrypted part and exports it quoted-printable with
+CRLF line ends, which turns every `=` in the armor (the base64 padding and the checksum line)
+into `=3D` and makes gpg report a CRC error or a malformed CRC. Undo that before decrypting a
+mail exported from Proton (only there: base64 itself never holds `=3D`, apart from a checksum
+that happens to start with `3D`):
+
+```bash
+sed 's/=3D/=/g' mail.eml | gpg --decrypt
+```
+
+**Not yet verified:** opening the mails in Thunderbird, K-9 or FairEmail.

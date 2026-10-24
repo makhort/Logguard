@@ -1,9 +1,9 @@
 //! The servers' own addresses and host names never reach Telegram: each becomes the
 //! server's node id, as logguard names it (`[xmpp]`, `[vpn]`, `[tg]`). logguard's messages
 //! carry them in certificate targets (`example.org:5223`), cluster warnings (`peer
-//! 11.17.39.236:7946 failing`), exposure alerts and log lines.
+//! 11.25.39.236:7946 failing`), exposure alerts and log lines.
 //!
-//! `SERVER_NAMES` lists them: `xmpp=11.17.39.236,2001:db8::1,example.org; vpn=11.25.48.86`.
+//! `SERVER_NAMES` lists them: `xmpp=11.25.39.236,2001:db8::1,example.org; vpn=11.33.48.86`.
 //! An address matches exactly (IPv4-mapped IPv6 too, with or without a port after it); a host
 //! name matches with its subdomains, which keep their first labels:
 //! `nextcloud.example.org:443` becomes `nextcloud.xmpp:443`. Attackers' addresses, the
@@ -216,7 +216,7 @@ mod tests {
     use super::*;
 
     fn names() -> ServerNames {
-        ServerNames::parse("xmpp=11.17.39.236, 2001:db8::7, example.org; vpn=11.25.48.86\n tg=[2001:db8::9],relay.example.net").unwrap()
+        ServerNames::parse("xmpp=11.25.39.236, 2001:db8::7, example.org; vpn=11.33.48.86\n tg=[2001:db8::9],relay.example.net").unwrap()
     }
 
     #[test]
@@ -224,15 +224,15 @@ mod tests {
         let n = names();
         let digest = "[xmpp] logguard daily digest\n\n\
             Certificates: example.org:5223 85d, example.org:5222/xmpp 85d, nextcloud.example.org:443 5d\n\
-            cluster peer 11.25.48.86:7946 failing: connect: timed out\n\
-            Exposed: 0.0.0.0:7946 logguard (from 11.25.48.86.)\n\
-            [High] ban 11.25.48.87 for 1h: scan of 11.17.39.236 and [2001:db8::7]:5223, ::ffff:11.17.39.236 too\n\
+            cluster peer 11.33.48.86:7946 failing: connect: timed out\n\
+            Exposed: 0.0.0.0:7946 logguard (from 11.33.48.86.)\n\
+            [High] ban 11.33.48.87 for 1h: scan of 11.25.39.236 and [2001:db8::7]:5223, ::ffff:11.25.39.236 too\n\
             log: GET https://nextcloud.example.org/login from 2001:db8::9 via relay.example.net\n\
-            hidden too: dead:11.17.39.236 ::ffff:11.17.39.236:7946 2001:db8::7:522333 peer:2001:db8::7 x11.17.39.236y 2001:db8::7: refused\n\
+            hidden too: dead:11.25.39.236 ::ffff:11.25.39.236:7946 2001:db8::7:522333 peer:2001:db8::7 x11.25.39.236y 2001:db8::7: refused\n\
             other addresses: 2001:db8::7:5223 2001:db8::70\n\
-            64:ff9b::11.17.39.236 2001:db8::7:ad:11.25.48.86\n\
-            2001:db8::7.example.org 1.11.17.39.236 11.17.39.236.5 a:11.17.39.236:11.25.48.86\n\
-            not ours: example.org.evil.example, notexample.org, 78.40.199.2366, 11.36.39.236, 10:00:01";
+            64:ff9b::11.25.39.236 2001:db8::7:ad:11.33.48.86\n\
+            2001:db8::7.example.org 1.11.25.39.236 11.25.39.236.5 a:11.25.39.236:11.33.48.86\n\
+            not ours: example.org.evil.example, notexample.org, 78.40.199.2366, 11.44.39.236, 10:00:01";
         let out = n.replace(digest);
         assert_eq!(
             out,
@@ -240,13 +240,13 @@ mod tests {
             Certificates: xmpp:5223 85d, xmpp:5222/xmpp 85d, nextcloud.xmpp:443 5d\n\
             cluster peer vpn:7946 failing: connect: timed out\n\
             Exposed: 0.0.0.0:7946 logguard (from vpn.)\n\
-            [High] ban 11.25.48.87 for 1h: scan of xmpp and [xmpp]:5223, xmpp too\n\
+            [High] ban 11.33.48.87 for 1h: scan of xmpp and [xmpp]:5223, xmpp too\n\
             log: GET https://nextcloud.xmpp/login from tg via tg\n\
             hidden too: dead:xmpp xmpp:7946 xmpp:522333 peer:xmpp xxmppy xmpp: refused\n\
             other addresses: 2001:db8::7:5223 2001:db8::70\n\
             xmpp vpn\n\
             xmpp.xmpp 1.xmpp xmpp.5 a:xmpp:vpn\n\
-            not ours: example.org.evil.example, notexample.org, 78.40.199.2366, 11.36.39.236, 10:00:01"
+            not ours: example.org.evil.example, notexample.org, 78.40.199.2366, 11.44.39.236, 10:00:01"
         );
         assert_eq!(ServerNames::default().replace(digest), digest, "nothing configured: unchanged");
     }
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn non_ascii_text_survives() {
-        let out = names().replace("Привіт → 11.17.39.236 ✓ example.org 😀");
+        let out = names().replace("Привіт → 11.25.39.236 ✓ example.org 😀");
         assert_eq!(out, "Привіт → xmpp ✓ xmpp 😀");
     }
 }

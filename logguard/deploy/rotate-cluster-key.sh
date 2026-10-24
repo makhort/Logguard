@@ -7,9 +7,9 @@
 #   ./deploy/rotate-cluster-key.sh switch xmpp vpn   # send with it; the old one becomes .prev
 #   ./deploy/rotate-cluster-key.sh finish xmpp vpn   # drop the old key
 #
-# Like deploy.sh, this only copies files (ssh host aliases, default: xmpp vpn) to
-# /tmp/logguard-rotate on each node; then, as root on each node (it restarts logguard):
-#   bash /tmp/logguard-rotate/rotate.sh <step>
+# Like deploy.sh, this only copies files (ssh host aliases, default: xmpp vpn) to a fresh
+# /tmp/logguard-rotate.XXXX on each node; then paste the printed command into a root shell
+# on each node (it checks the files, runs the step and restarts logguard).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -108,15 +108,28 @@ fi
 REMOTE
 sed -i.bak "s/@EXPECT@/$expect/" "$stage/rotate.sh" && rm "$stage/rotate.sh.bak"
 
+# The staging directory belongs to the SSH user, who could swap the script (run as root) or
+# the key between the copy and the root shell: root copies it into a private directory and
+# checks every file against these hashes, pasted into the root shell, as with deploy.sh.
+(cd "$stage" && shasum -a 256 -- * > SHA256SUMS)
+MANIFEST=$(shasum -a 256 "$stage/SHA256SUMS" | cut -d' ' -f1)
+
+cmds=()
 for h in "${hosts[@]}"; do
-    # private, freshly created: it holds the key, and root runs the script from it
-    ssh "$h" 'rm -rf /tmp/logguard-rotate && mkdir -m 700 /tmp/logguard-rotate'
-    scp -q "$stage"/* "$h":/tmp/logguard-rotate/
-    echo "Copied to $h:/tmp/logguard-rotate"
+    # private, freshly created: it holds the key. SFTP
+    # alone, as in deploy.sh: a hardened host's SSH user may run no other remote command.
+    remote=/tmp/logguard-rotate.$(openssl rand -hex 8)
+    {
+        echo "mkdir $remote"
+        echo "chmod 700 $remote"
+        for f in "$stage"/*; do echo "put \"$f\" $remote/"; done
+    } | sftp -q -o BatchMode=no -b - "$h" >/dev/null
+    echo "Copied to $h:$remote"
+    cmds+=("$h:" "d=\$(mktemp -d /root/logguard-rotate.XXXXXX) && cp -R $remote/. \"\$d\" && cd \"\$d\" && echo '$MANIFEST  SHA256SUMS' | sha256sum -c --quiet && sha256sum -c --quiet --strict SHA256SUMS && bash rotate.sh $step; cd /; rm -rf \"\$d\" $remote" "")
 done
 echo
-echo "Now, as root on each of: ${hosts[*]}"
-echo "    bash /tmp/logguard-rotate/rotate.sh $step"
+echo "Now paste into a root shell on each node:"
+printf '%s\n' "${cmds[@]}"
 echo "Each node should end with 'OK: the new key ($expect) is in place.'"
 case "$step" in
     start) echo "Then, once every node is done:  $0 switch ${hosts[*]}" ;;

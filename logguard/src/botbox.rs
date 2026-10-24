@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::notify::Notice;
@@ -37,6 +37,8 @@ const STALLED: Duration = Duration::from_secs(10 * 60);
 const GIVE_UP: Duration = Duration::from_secs(24 * 3600);
 /// A dot file still being written after this long is a leftover of a crash.
 const TMP_LEFTOVER: Duration = Duration::from_secs(60);
+/// Largest message read back from the outbox: alerts and the digest are a few KB.
+const MAX_MESSAGE: u64 = 1 << 20;
 
 pub const PREFIX: &str = "alert-";
 pub const SUFFIX: &str = ".msg";
@@ -102,6 +104,23 @@ pub fn parse(text: &str) -> Option<Notice> {
     Some(Notice { to: to.filter(|t| !t.is_empty())?, subject: subject.unwrap_or_default(), body: body.to_string() })
 }
 
+/// A message file's text, as logguard (root) reads one back. The bot's user writes in the
+/// outbox too: so only a regular file, never through a symlink (swapped in after the
+/// check), and at most `MAX_MESSAGE` (a huge one would exhaust the daemon's memory).
+fn read_message(path: &Path) -> Option<String> {
+    use std::io::Read;
+    const O_NOFOLLOW: i32 = if cfg!(target_os = "linux") { 0o400000 } else { 0x0100 };
+    const O_NONBLOCK: i32 = if cfg!(target_os = "linux") { 0o4000 } else { 0x0004 };
+    const O_NOCTTY: i32 = if cfg!(target_os = "linux") { 0o400 } else { 0x20000 };
+    let f = fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY).open(path).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    f.take(MAX_MESSAGE + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_MESSAGE).then_some(text)
+}
+
 /// The message name inside one of the dot names (`.alert-x.msg.sending` → `alert-x.msg`) and
 /// the state suffix, or the name itself with an empty state.
 fn split_state(name: &str) -> Option<(&str, &str)> {
@@ -117,6 +136,14 @@ pub fn user_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
     passwd.lines().find_map(|l| {
         let f: Vec<&str> = l.split(':').collect();
         (f.len() >= 4 && f[0] == user).then(|| Some((f[2].parse().ok()?, f[3].parse().ok()?))).flatten()
+    })
+}
+
+/// The name of the user with id `uid`, from /etc/passwd.
+pub fn user_name(passwd: &str, uid: u32) -> Option<String> {
+    passwd.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 3 && f[2].parse() == Ok(uid)).then(|| crate::event::clean(f[0], 32))
     })
 }
 
@@ -241,7 +268,7 @@ impl BotBox {
                     Err(e) => return Err(e),
                 }
             }
-            match fs::read_to_string(&claimed).ok().as_deref().and_then(parse) {
+            match read_message(&claimed).as_deref().and_then(parse) {
                 Some(notice) => out.fallback.push(Fallback { path: claimed, notice, why }),
                 None => {
                     eprintln!("logguard: {} is not an admin message, deleted", claimed.display());
@@ -307,6 +334,7 @@ mod tests {
         assert_eq!(user_ids(passwd, "ejabberd"), Some((998, 997)));
         assert_eq!(user_ids(passwd, "ejabber"), None);
         assert_eq!(user_ids(passwd, "broken"), None);
+        assert_eq!((user_name(passwd, 998).as_deref(), user_name(passwd, 5)), (Some("ejabberd"), None));
     }
 
     #[test]
@@ -367,9 +395,15 @@ mod tests {
         fs::write(d.join(".alert-1.msg.tmp"), "half").unwrap();
         fs::write(d.join("alert-2.msg"), "garbage").unwrap();
         fs::write(d.join(".abuse-report-2026-10-19.txt.tmp"), "being written").unwrap();
+        // a message too big to be one isn't read into memory: deleted
+        let big = format!("To: admin@example.org\nSubject: s\n\n{}", "x".repeat(MAX_MESSAGE as usize));
+        fs::write(d.join(".alert-3.msg.rejected"), big).unwrap();
         let s = b.sweep(now + Duration::from_secs(3 * 60)).unwrap();
         assert!(s.fallback.is_empty());
         assert_eq!(names(&d), [".abuse-report-2026-10-19.txt.tmp"], "only what isn't logguard's is left");
+        // nor is anything read through a symlink
+        std::os::unix::fs::symlink("/etc/hosts", d.join("link")).unwrap();
+        assert_eq!(read_message(&d.join("link")), None);
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -95,6 +95,8 @@ pub fn parse(text: &str) -> Vec<Scan> {
     let mut started = false; // anything seen for `cur`
     for line in text.lines() {
         let line = line.trim_end();
+        // The script indents the scanner's output: markers are only ever at the line start.
+        let content = line.trim_start();
         if let Some(rest) = line.strip_prefix("logguard-avscan start ") {
             let ts = parse_date(rest);
             if started && marked {
@@ -115,10 +117,10 @@ pub fn parse(text: &str) -> Vec<Scan> {
                 out.push(std::mem::take(&mut cur));
             }
             (marked, started) = (false, false);
-        } else if let Some(d) = line.strip_prefix("Start Date:") {
+        } else if let Some(d) = content.strip_prefix("Start Date:") {
             cur.start = cur.start.or(parse_date(d));
             started = true;
-        } else if let Some(d) = line.strip_prefix("End Date:") {
+        } else if let Some(d) = content.strip_prefix("End Date:") {
             // Only printed in the summary, so it proves the scan completed even when the
             // summary's head was cut off (by the read window, or a truncated log).
             cur.end = parse_date(d).unwrap_or(0);
@@ -127,19 +129,19 @@ pub fn parse(text: &str) -> Vec<Scan> {
                 out.push(std::mem::take(&mut cur));
                 started = false;
             }
-        } else if line.contains("----------- SCAN SUMMARY -----------") {
+        } else if content.contains("----------- SCAN SUMMARY -----------") {
             cur.completed = true;
             started = true;
-        } else if let Some(n) = line.strip_prefix("Infected files:") {
+        } else if let Some(n) = content.strip_prefix("Infected files:") {
             cur.infected_count = number(n).unwrap_or(0);
-        } else if let Some(n) = line.strip_prefix("Scanned files:") {
+        } else if let Some(n) = content.strip_prefix("Scanned files:") {
             cur.scanned_files = number(n);
-        } else if let Some(n) = line.strip_prefix("Total errors:") {
+        } else if let Some(n) = content.strip_prefix("Total errors:") {
             cur.errors = number(n).unwrap_or(0);
-        } else if line.contains("virus database is older than") || line.contains("This version of the ClamAV engine is outdated") {
-            cur.db_outdated |= line.contains("database");
+        } else if content.contains("virus database is older than") || content.contains("This version of the ClamAV engine is outdated") {
+            cur.db_outdated |= content.contains("database");
             started = true;
-        } else if let Some(hit) = line.strip_suffix(" FOUND").filter(|l| l.contains(": ")) {
+        } else if let Some(hit) = content.strip_suffix(" FOUND").filter(|l| l.contains(": ")) {
             if cur.infected.len() < MAX_LISTED {
                 cur.infected.push(hit.chars().filter(|c| !c.is_control()).take(500).collect());
             }
@@ -235,6 +237,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                 ),
                 evidence: vec![],
                 notify: true,
+                owner: None,
             });
         }
         if st.reported == 0 {
@@ -261,6 +264,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     ),
                     evidence: s.infected.clone(),
                     notify: true,
+                    owner: None,
                 });
             }
             if !s.ok() {
@@ -275,6 +279,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     message: format!("virus scan started {} did not finish ({why})", s.start.map_or(when.clone(), time::fmt_ts)),
                     evidence: vec![],
                     notify: true,
+                    owner: None,
                 });
             } else if s.infections() == 0 {
                 let files = s.scanned_files.map(|n| format!("{n} files, ")).unwrap_or_default();
@@ -287,6 +292,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     message: format!("virus scan finished {when}{took}: {files}nothing found{errors}"),
                     evidence: vec![],
                     notify: false,
+                    owner: None,
                 });
             }
             if s.db_outdated {
@@ -297,6 +303,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     message: "ClamAV's virus database is older than 7 days - is freshclam (clamav-freshclam.service) running?".into(),
                     evidence: vec![],
                     notify: true,
+                    owner: None,
                 });
             }
             st.reported = st.reported.max(s.end);
@@ -315,6 +322,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                 message: format!("cannot read the virus scan log {e}"),
                 evidence: vec![],
                 notify: true,
+                owner: None,
             });
         }
     }
@@ -336,7 +344,15 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
             None
         };
         if let Some(message) = message {
-            out.push(Finding { key: "av-stale".into(), every: day, severity: Severity::Warning, message, evidence: vec![], notify: true });
+            out.push(Finding {
+                key: "av-stale".into(),
+                every: day,
+                severity: Severity::Warning,
+                message,
+                evidence: vec![],
+                notify: true,
+                owner: None,
+            });
         }
     }
     out
@@ -450,6 +466,20 @@ logguard-avscan start 2026-10-13T02:30:01Z
         assert!(f.iter().any(|x| x.key == "av-future"), "{f:?}");
         assert!(f.iter().any(|x| x.severity == Severity::Critical), "the real summary still counts the infection: {f:?}");
         assert!(st.reported < now && st.completed < now);
+    }
+
+    /// The script indents the scanner's output: a file name forging an end marker dated in
+    /// the past (which would file the infections above it as old news) is just a line.
+    #[test]
+    fn indented_output_cannot_forge_markers() {
+        let text = "logguard-avscan start 2026-10-12T02:30:01Z\n  /tmp/a: Malware FOUND\n  /tmp/z\n  \
+                    logguard-avscan end 2020-01-01T00:00:00Z exit=0\n  logguard-avscan start 2020-01-01T00:00:00Z\n  \
+                    q: Eicar-Test-Signature FOUND\n  ----------- SCAN SUMMARY -----------\n  Infected files: 2\n  \
+                    End Date:   2026:10:12 02:31:17\nlogguard-avscan end 2026-10-12T02:31:17Z exit=1\n";
+        let scans = parse(text);
+        assert_eq!(scans.len(), 1, "{scans:?}");
+        assert_eq!(scans[0].infected, ["/tmp/a: Malware", "q: Eicar-Test-Signature"]);
+        assert_eq!((scans[0].start, scans[0].exit, scans[0].completed), (parse_date("2026-10-12T02:30:01Z"), Some(1), true));
     }
 
     #[test]

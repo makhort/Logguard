@@ -28,7 +28,7 @@ pub enum Backend {
     Nft,
     Ufw,
     /// iptables and ip6tables (legacy or nf_tables flavour; works next to
-    /// iptables-persistent): a chain of our own in the raw table's PREROUTING.
+    /// iptables-persistent): a chain of our own in the mangle table's PREROUTING.
     Iptables,
 }
 
@@ -68,6 +68,15 @@ pub struct Config {
     pub antivirus: crate::avscan::AvCfg,
     /// Low disk space and sustained memory shortage.
     pub resources: crate::resources::ResourcesCfg,
+    /// Pending updates, a newer kernel than the running one, services still running replaced
+    /// libraries: in the daily digest.
+    pub patches: crate::patches::PatchesCfg,
+    /// Package binaries checked against dpkg's checksums, and the set-uid programs (weekly).
+    pub verify: crate::verify::VerifyCfg,
+    /// New outbound connections and programs running from temporary or deleted files.
+    pub procwatch: crate::procwatch::ProcCfg,
+    /// Log lines of your own to score (`[[patterns]]`).
+    pub patterns: Vec<crate::parse::custom::PatternCfg>,
 }
 
 /// Which logs to analyse. Disable ejabberd on hosts without an XMPP server.
@@ -81,6 +90,9 @@ pub struct SourcesCfg {
     pub nextcloud: bool,
     /// Alert when the kernel kills a process for lack of memory (from the kernel log).
     pub oom: bool,
+    /// `su` and `sudo`: failed attempts (someone holds an account's key or password) and
+    /// switches after them, as alerts.
+    pub privilege: bool,
     /// systemd services to alert about when they fail (any unsuccessful end: a non-zero
     /// exit, a signal, a timeout, ...) and are not started again within
     /// `service_restart_grace`, or when systemd gives up restarting them. E.g.
@@ -93,7 +105,16 @@ pub struct SourcesCfg {
 
 impl Default for SourcesCfg {
     fn default() -> Self {
-        SourcesCfg { ejabberd: true, ssh: true, ufw: true, nextcloud: false, oom: true, services: vec![], service_restart_grace: Dur(120) }
+        SourcesCfg {
+            ejabberd: true,
+            ssh: true,
+            ufw: true,
+            nextcloud: false,
+            oom: true,
+            privilege: true,
+            services: vec![],
+            service_restart_grace: Dur(120),
+        }
     }
 }
 
@@ -107,6 +128,9 @@ impl SourcesCfg {
             Source::Nextcloud => self.nextcloud,
             Source::Kernel => self.oom,
             Source::Systemd => !self.services.is_empty(),
+            Source::Privilege => self.privilege,
+            // only lines a pattern of your own matches count (`parse::custom`)
+            Source::Custom => true,
         }
     }
 }
@@ -187,6 +211,18 @@ pub struct PortsCfg {
     /// names taken from the rest of the config (`[xmpp] c2s_ports`, the cluster port)
     /// and the built-in ones (Telnet, RDP, ...).
     pub names: BTreeMap<String, String>,
+    /// Log the first new TCP connection per source (every 10 minutes) to a tripwire port
+    /// nothing listens on from logguard's own nftables table, at up to
+    /// `kernel_tripwire_rate`, instead of relying on UFW's log, which keeps about 3 lines a
+    /// minute for the whole host. nftables backend in enforce mode only.
+    pub kernel_tripwires: bool,
+    /// `<n>/second`, `<n>/minute` or `<n>/hour`, for the whole host.
+    pub kernel_tripwire_rate: String,
+    /// Ports logguard listens on itself and closes every connection at once: a completed
+    /// handshake can't come from a forged address, so it scores `tripwire_connect` (default
+    /// 100). With any set, a blocked SYN to a tripwire port scores 50 by default
+    /// (`fw_tripwire`). TCP only; open them in the firewall (`ufw allow 2323/tcp`).
+    pub honeypot: Vec<PortSpec>,
 }
 
 /// Commonly attacked services neither server runs: remote access (FTP, Telnet, Windows RPC/SMB/
@@ -230,7 +266,14 @@ pub const DEFAULT_TRIPWIRE: [&str; 32] = [
 impl Default for PortsCfg {
     fn default() -> Self {
         let tripwire = DEFAULT_TRIPWIRE.iter().map(|p| p.parse().expect("valid default")).collect();
-        PortsCfg { whitelist: vec![], tripwire, names: BTreeMap::new() }
+        PortsCfg {
+            whitelist: vec![],
+            tripwire,
+            names: BTreeMap::new(),
+            kernel_tripwires: true,
+            kernel_tripwire_rate: "60/minute".into(),
+            honeypot: vec![],
+        }
     }
 }
 
@@ -283,7 +326,7 @@ impl CanaryCfg {
             Source::Ejabberd => &self.xmpp,
             Source::Ssh => &self.ssh,
             Source::Nextcloud => &self.nextcloud,
-            Source::Ufw | Source::Peer | Source::Kernel | Source::Systemd => return false,
+            Source::Ufw | Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Custom => return false,
         };
         !list.is_empty() && Self::listed(list, name, &self.except)
     }
@@ -339,7 +382,7 @@ impl SilenceCfg {
             Source::Ssh => self.ssh,
             Source::Ufw => self.ufw,
             Source::Nextcloud => self.nextcloud,
-            Source::Peer | Source::Kernel | Source::Systemd => Dur(0),
+            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Custom => Dur(0),
         }
     }
 }
@@ -365,11 +408,7 @@ fn default_burst() -> u32 {
 
 impl RateLimitCfg {
     pub fn validate(&self) -> Result<()> {
-        let ok = self
-            .rate
-            .split_once('/')
-            .is_some_and(|(n, unit)| n.parse::<u32>().is_ok_and(|n| n > 0) && matches!(unit, "second" | "minute" | "hour"));
-        if !ok {
+        if !crate::enforce::valid_rate(&self.rate) {
             bail!("[[ratelimit]] rate '{}' must look like 30/minute (second, minute or hour)", self.rate);
         }
         if self.ports.is_empty() {
@@ -410,6 +449,14 @@ pub struct JournalCfg {
     pub matches: Vec<String>,
     /// How far back to read when there is no saved cursor.
     pub initial_lookback: Dur,
+    /// Run `journalctl --verify` this often ("0s" = never) and raise a high alert when it
+    /// fails: damaged journal files, or with `verify_key` (Forward Secure Sealing, see
+    /// `journalctl --setup-keys`) entries changed after they were sealed.
+    pub verify_every: Dur,
+    /// File holding the verification key `journalctl --setup-keys` printed (root only). Every
+    /// sealing key derives from it, so whoever reads it can seal edited entries: on this
+    /// host it catches only an intruder who doesn't look for it (see the README).
+    pub verify_key_file: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -417,9 +464,13 @@ pub struct JournalCfg {
 pub struct AllowCfg {
     /// Addresses/networks that are never banned (your home, VPN, push servers...).
     pub nets: Vec<Net>,
+    /// Host names whose addresses are allowlisted too (a home connection with a dynamic DNS
+    /// name), resolved again every 10 minutes (every minute while one fails).
+    pub hosts: Vec<String>,
     /// An address that logged in successfully (XMPP, SSH) isn't banned for that service's
-    /// noise and typos for `trust_ttl` (each login renews it). It stays bannable for canary
-    /// names, tripwire ports, other services and peers' reports, and is never shared.
+    /// noise and typos for `trust_ttl` (each login renews it), nor for blocked packets on any
+    /// port (their source address is easily forged). It stays bannable for canary names,
+    /// other services and peers' reports, and is never shared.
     pub trust_authenticated: bool,
     pub trust_ttl: Dur,
 }
@@ -474,6 +525,9 @@ pub struct AccountCfg {
     pub learning_period: Dur,
     /// Accounts (JIDs or SSH user names) that roam across VPN exits; no new-network alerts for them.
     pub new_network_ignore: Vec<String>,
+    /// Alert when an SSH account logs in with a key it never used before (keys are learned
+    /// silently for `learning_period` after the first one is seen).
+    pub new_key_alerts: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -483,6 +537,7 @@ pub struct SubnetCfg {
     pub evaluate_every: Dur,
     /// An address counts as "bad" for aggregation if banned or its slow score is at least this.
     pub suspect_score: f64,
+    /// The first (narrowest) subnet ban.
     pub v4_prefix: u8,
     pub v6_prefix: u8,
     pub min_bad_ips: usize,
@@ -490,11 +545,23 @@ pub struct SubnetCfg {
     /// (each with slow score >= 5) together reach `score_sum_threshold`.
     pub min_contributors: usize,
     pub score_sum_threshold: f64,
-    /// Wider aggregation (e.g. /16) needs bad addresses spread over several narrow subnets.
+    /// An IPv4 subnet ban grows to the narrowest network that also holds the next banned
+    /// address or subnet nearby, up to `v4_wide_prefix`...
     pub wide_enabled: bool,
     pub v4_wide_prefix: u8,
-    pub wide_min_bad_ips: usize,
-    pub wide_min_subnets: usize,
+    /// ...by at most this many prefix bits at a time (2: four times the addresses, /24 ->
+    /// /22), so one ban far away can't turn a /24 into a /17.
+    pub wide_max_step: u8,
+    /// IPv6 subnet bans grow the same way, from `v6_prefix` up to this ("64", equal to
+    /// `v6_prefix`, = no growth)...
+    pub v6_wide_prefix: u8,
+    /// ...by at most this many bits at a time (4: providers hand out /64s, /60s, /56s, /48s).
+    pub wide_max_step_v6: u8,
+    /// Retired with the single /24 -> /16 step: still accepted so older files load, ignored.
+    #[serde(skip_serializing)]
+    pub wide_min_bad_ips: Option<usize>,
+    #[serde(skip_serializing)]
+    pub wide_min_subnets: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -515,7 +582,7 @@ pub struct EnforceCfg {
     pub ufw: PathBuf,
     pub iptables: PathBuf,
     pub ip6tables: PathBuf,
-    /// Name of logguard's chains in the raw table (`<name>` and `<name>-ban`).
+    /// Name of logguard's chains in the mangle table (`<name>` and `<name>-ban`).
     pub iptables_chain: String,
 }
 
@@ -549,20 +616,30 @@ impl Default for Config {
             cron: crate::cronwatch::CronCfg::default(),
             antivirus: crate::avscan::AvCfg::default(),
             resources: crate::resources::ResourcesCfg::default(),
+            patches: crate::patches::PatchesCfg::default(),
+            verify: crate::verify::VerifyCfg::default(),
+            procwatch: crate::procwatch::ProcCfg::default(),
+            patterns: vec![],
         }
     }
 }
 
 impl Default for JournalCfg {
     fn default() -> Self {
-        JournalCfg { journalctl: "/usr/bin/journalctl".into(), matches: vec![], initial_lookback: Dur(3600) }
+        JournalCfg {
+            journalctl: "/usr/bin/journalctl".into(),
+            matches: vec![],
+            initial_lookback: Dur(3600),
+            verify_every: Dur(0),
+            verify_key_file: PathBuf::new(),
+        }
     }
 }
 
 impl Default for AllowCfg {
     fn default() -> Self {
         let nets = ["127.0.0.0/8", "::1"].iter().map(|s| s.parse().expect("valid default")).collect();
-        AllowCfg { nets, trust_authenticated: true, trust_ttl: Dur(86_400) }
+        AllowCfg { nets, hosts: vec![], trust_authenticated: true, trust_ttl: Dur(86_400) }
     }
 }
 
@@ -598,6 +675,11 @@ impl Default for ScoringCfg {
             (XmppCanary, 100.0),
             (SshCanary, 100.0),
             (NcCanary, 100.0),
+            (TripwireConnect, 100.0),
+            // the patterns of your own set their points (`[[patterns]] weight`)
+            (CustomFailure, 0.0),
+            (CustomProbe, 0.0),
+            (CustomSuccess, 0.0),
         ]
         .into_iter()
         .collect();
@@ -628,6 +710,7 @@ impl Default for AccountCfg {
             new_network_alerts: true,
             learning_period: Dur(7 * 86_400),
             new_network_ignore: vec![],
+            new_key_alerts: true,
         }
     }
 }
@@ -645,8 +728,11 @@ impl Default for SubnetCfg {
             score_sum_threshold: 100.0,
             wide_enabled: true,
             v4_wide_prefix: 16,
-            wide_min_bad_ips: 12,
-            wide_min_subnets: 4,
+            wide_max_step: 2,
+            v6_wide_prefix: 48,
+            wide_max_step_v6: 4,
+            wide_min_bad_ips: None,
+            wide_min_subnets: None,
         }
     }
 }
@@ -685,6 +771,13 @@ impl Config {
     /// Parses TOML; weights given in `[scoring.weights]` override the defaults individually.
     pub fn from_toml(text: &str) -> Result<Config> {
         let mut cfg: Config = toml::from_str(text)?;
+        // With handshake-checked tripwires, a blocked SYN (whose source may be forged) is
+        // only half the evidence, unless the file says otherwise.
+        let raw: toml::Table = toml::from_str(text)?;
+        let set = raw.get("scoring").and_then(|s| s.get("weights")).and_then(|w| w.get(Signal::FwTripwire.name())).is_some();
+        if !cfg.ports.honeypot.is_empty() && !set {
+            cfg.scoring.weights.insert(Signal::FwTripwire, 50.0);
+        }
         for (signal, w) in ScoringCfg::default().weights {
             cfg.scoring.weights.entry(signal).or_insert(w);
         }
@@ -709,6 +802,16 @@ impl Config {
         }
         // systemd (PID 1) tags its messages about a unit with UNIT=
         m.extend(self.sources.services.iter().map(|s| format!("UNIT={s}")));
+        if self.sources.privilege {
+            m.extend(["su", "sudo"].map(|i| format!("SYSLOG_IDENTIFIER={i}")));
+        }
+        for p in &self.patterns {
+            if let Some(j) = p.journal_match() {
+                if !m.contains(&j) {
+                    m.push(j);
+                }
+            }
+        }
         m
     }
 
@@ -775,8 +878,39 @@ impl Config {
         if self.subnets.v4_wide_prefix >= self.subnets.v4_prefix {
             bail!("subnets.v4_wide_prefix must be shorter than v4_prefix");
         }
+        if self.subnets.wide_max_step == 0 {
+            bail!("subnets.wide_max_step must be at least 1");
+        }
         if !(16..=128).contains(&self.subnets.v6_prefix) {
             bail!("subnets.v6_prefix must be within 16..=128");
+        }
+        if !(16..=self.subnets.v6_prefix).contains(&self.subnets.v6_wide_prefix) {
+            bail!("subnets.v6_wide_prefix must be within 16 and v6_prefix ({})", self.subnets.v6_prefix);
+        }
+        if self.subnets.wide_max_step_v6 == 0 {
+            bail!("subnets.wide_max_step_v6 must be at least 1");
+        }
+        if let Some(h) = self.allowlist.hosts.iter().find(|h| !crate::net::valid_host_name(h)) {
+            bail!("[allowlist] hosts: '{h}' is not a host name (no port, no address)");
+        }
+        if !crate::enforce::valid_rate(&self.ports.kernel_tripwire_rate) {
+            bail!("[ports] kernel_tripwire_rate '{}' must look like 60/minute (second, minute or hour)", self.ports.kernel_tripwire_rate);
+        }
+        if let Some(h) = self.ports.honeypot.iter().find(|h| h.proto == Some(Proto::Udp)) {
+            bail!("[ports] honeypot: {h}: TCP only (a UDP sender's address is never checked)");
+        }
+        if let Some(h) = self.ports.honeypot.iter().find(|h| self.ports.whitelist.iter().any(|w| w.port == h.port)) {
+            bail!("[ports]: {h} is both whitelisted and a honeypot");
+        }
+        if self.feeds.enabled && !self.feeds.asn_urls.is_empty() && (!self.geo.enabled || self.geo.asn_url.is_empty()) {
+            bail!("[feeds] asn_urls needs the network database: [geo] enabled = true with an asn_url");
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for p in &self.patterns {
+            p.validate()?;
+            if !names.insert(p.name.as_str()) {
+                bail!("[[patterns]]: two patterns are named '{}'", p.name);
+            }
         }
         self.notify.validate()?;
         self.cluster.validate()?;
@@ -785,6 +919,8 @@ impl Config {
         for r in &self.ratelimit {
             r.validate()?;
         }
+        self.procwatch.validate()?;
+        self.verify.validate()?;
         if !self.enforce.nft_table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             bail!("enforce.nft_table must be alphanumeric");
         }
@@ -847,7 +983,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.journal_matches(),
-            vec!["SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session", "SYSLOG_IDENTIFIER=sshd-auth", "_TRANSPORT=kernel"]
+            vec![
+                "SYSLOG_IDENTIFIER=sshd",
+                "SYSLOG_IDENTIFIER=sshd-session",
+                "SYSLOG_IDENTIFIER=sshd-auth",
+                "_TRANSPORT=kernel",
+                "SYSLOG_IDENTIFIER=su",
+                "SYSLOG_IDENTIFIER=sudo"
+            ]
         );
         assert!(cfg.ports.whitelisted(Some(51820), Proto::Udp));
         assert!(!cfg.ports.whitelisted(Some(51820), Proto::Tcp));
@@ -861,7 +1004,24 @@ mod tests {
         assert!(Config::from_toml("[enforce]\niptables_chain = \"a b\"").is_err());
         assert!(Config::from_toml("[enforce]\niptables_chain = \"a-name-much-too-long-for-xt\"").is_err());
         assert!(Config::from_toml("[sources]\nejabberd = false\n[notify]\nenabled = true\nfrom = \"x.org\"").is_err());
-        assert_eq!(Config::default().journal_matches().len(), 5);
+        assert_eq!(Config::default().journal_matches().len(), 7);
+        // a pattern of your own adds its unit; one already followed isn't added twice
+        let p = Config::from_toml("[sources]\nprivilege = false\n[[patterns]]\nname = \"x\"\nunit = \"postfix@-.service\"\nregex = '(?P<ip>\\S+)'\n[[patterns]]\nname = \"y\"\nunit = \"postfix@-.service\"\nregex = 'a(?P<ip>\\S+)'").unwrap();
+        assert_eq!(p.journal_matches().last().map(String::as_str), Some("_SYSTEMD_UNIT=postfix@-.service"));
+        assert_eq!(p.journal_matches().len(), 6);
+        assert!(Config::from_toml("[[patterns]]\nname = \"x\"\nunit = \"a.service\"\nregex = '(?P<ip>\\S+)'\n[[patterns]]\nname = \"x\"\nunit = \"b.service\"\nregex = '(?P<ip>\\S+)'").is_err(), "names are unique");
+        // honeypots: a blocked SYN to a tripwire port is half the evidence then, unless set
+        assert_eq!(Config::from_toml("[ports]\nhoneypot = [2323]").unwrap().weight(Signal::FwTripwire), 50.0);
+        assert_eq!(
+            Config::from_toml("[ports]\nhoneypot = [2323]\n[scoring.weights]\nfw_tripwire = 80").unwrap().weight(Signal::FwTripwire),
+            80.0
+        );
+        assert_eq!(Config::default().weight(Signal::FwTripwire), 100.0);
+        assert!(Config::from_toml("[ports]\nhoneypot = [\"161/udp\"]").is_err());
+        assert!(Config::from_toml("[allowlist]\nhosts = [\"home.example.org:22\"]").is_err());
+        assert!(Config::from_toml("[ports]\nkernel_tripwire_rate = \"fast\"").is_err());
+        assert!(Config::from_toml("[subnets]\nv6_wide_prefix = 72").is_err());
+        assert!(Config::from_toml("[feeds]\nenabled = true\nasn_urls = [\"https://x/asn\"]").is_err(), "needs [geo]");
     }
 
     #[test]
@@ -870,7 +1030,7 @@ mod tests {
             r#"
             mode = "enforce"
             [allowlist]
-            nets = ["11.35.43.31", "11.25.48.86/32"]
+            nets = ["11.43.43.31", "11.33.48.86/32"]
             [scoring.weights]
             fw_block = 0.5
             "#,
@@ -882,5 +1042,13 @@ mod tests {
         assert_eq!(cfg.weight(Signal::FwBlock), 0.5);
         assert_eq!(cfg.weight(Signal::XmppTlsFail), 40.0, "unlisted weights keep their defaults");
         assert!(Config::from_toml("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn retired_subnet_options_still_load() {
+        let cfg = Config::from_toml("[subnets]\nwide_min_bad_ips = 12\nwide_min_subnets = 4\n").unwrap();
+        assert_eq!(cfg.subnets.wide_max_step, 2);
+        assert!(!toml::to_string(&cfg).unwrap().contains("wide_min"), "print-config leaves them out");
+        assert!(Config::from_toml("[subnets]\nwide_max_step = 0\n").is_err());
     }
 }

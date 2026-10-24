@@ -65,10 +65,10 @@ leaves the server.
 ## The servers appear by their node ids
 
 `SERVER_NAMES` lists each server's own addresses and host names under its node id (logguard's
-`[cluster] node_id`): `xmpp=11.17.39.236,example.org; vpn=11.25.48.86; tg=203.0.113.10`.
+`[cluster] node_id`): `xmpp=11.25.39.236,example.org; vpn=11.33.48.86; tg=203.0.113.10`.
 In alerts and digests, after the account names:
 
-- an address becomes the node id: `cluster peer 11.25.48.86:7946 failing` → `cluster peer
+- an address becomes the node id: `cluster peer 11.33.48.86:7946 failing` → `cluster peer
   vpn:7946 failing`. IPv4 matches as any run of digits and dots, wherever it is (`dead:…`,
   `::ffff:…:7946`); IPv6 as a run of hex digits and colons that is the address (brackets and
   IPv4-mapped too), or, when the run is no valid address, starts with it before a colon
@@ -168,9 +168,9 @@ Instead of `deploy.sh` (step 2 below), without a Rust toolchain: every version t
 **Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
 
 ```bash
-gh release download logguard-tg-bot-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+gh release download logguard-tg-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
 sha256sum -c logguard-tg-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-tg-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-tg-bot-v0.1.0
+gh attestation verify logguard-tg-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-tg-bot-v0.2.0
 ```
 
 `gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-tg-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).

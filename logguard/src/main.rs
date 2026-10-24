@@ -84,6 +84,17 @@ enum Cmd {
     },
     /// Lift a ban (address or network); also clears its score and offence history.
     Unban { net: String },
+    /// Ban an address or network for a while (shared with the cluster peers like a ban
+    /// logguard decided). Refused for protected addresses: this host, peers, allowlists.
+    Ban {
+        net: String,
+        /// How long, e.g. 12h, 7d (365d at most).
+        #[arg(long = "for", default_value = "1d", value_parser = |s: &str| s.parse::<logguard::time::Dur>())]
+        duration: logguard::time::Dur,
+        /// Why (shown in the TUI, logs and the peers' messages).
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Never ban an address/network for a while (lifts current bans inside it).
     Allow {
         net: String,
@@ -195,7 +206,31 @@ enum Cmd {
         all: bool,
     },
     /// Print the nftables ruleset logguard installs in enforce mode.
-    PrintNft,
+    PrintNft {
+        /// Without the kernel tripwire rules (loaded on their own; logguard runs without them
+        /// where they are rejected).
+        #[arg(long)]
+        no_tripwires: bool,
+    },
+    /// Announce a watched file's coming content, so the integrity watch logs the change
+    /// instead of alerting. Installers run it before they replace logguard's binaries and
+    /// units: `logguard expect-change /usr/local/bin/logguard=./logguard`.
+    ExpectChange {
+        /// `PATH=SOURCE` (PATH will get SOURCE's content), or `PATH` (its content as it is now).
+        #[arg(required = true)]
+        files: Vec<String>,
+    },
+    /// Run the patterns of your own ([[patterns]]) over log lines (journal JSON,
+    /// `journalctl` short output, or a log file's lines) and show what each finds.
+    TestPattern {
+        files: Vec<PathBuf>,
+        /// Only this pattern.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Print every matching line.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -214,7 +249,8 @@ fn parse_net(s: &str) -> Result<logguard::net::Net> {
 
 fn send_control(cfg: &Config, cmd: &str) -> Result<()> {
     let reply = daemon::control_command(&cfg.socket, cmd)?;
-    println!("{}", reply.trim_end());
+    // notes from peers' allowlist entries: nothing that acts on the terminal
+    println!("{}", logguard::event::plain_text(reply.trim_end()));
     if reply.starts_with("error:") {
         anyhow::bail!("command failed");
     }
@@ -299,7 +335,7 @@ fn real_main() -> Result<()> {
                 }
                 None => tui::DataSource::Socket(cfg.socket.clone()),
             };
-            tui::run(source)
+            tui::run(source, cfg.digest.cert_warn_days)
         }
         Cmd::NotifyTest { jid, bot, telegram, mail } => {
             let mut ncfg = cfg.notify.clone();
@@ -335,6 +371,9 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::Status { top } => {
+            // text from peers and other programs (ban reasons, node names, process names),
+            // shown on a terminal without anything that acts on it
+            let safe = |s: &str| logguard::event::clean(s, 1000);
             let snap: logguard::engine::Snapshot = serde_json::from_str(&daemon::fetch_snapshot(&cfg.socket)?)?;
             let now = snap.generated;
             println!("mode {:?}, snapshot at {}", snap.mode, logguard::time::fmt_ts(now));
@@ -345,7 +384,10 @@ fn real_main() -> Result<()> {
                     cfg.sources.enabled(**s)
                         && !matches!(
                             s,
-                            logguard::record::Source::Peer | logguard::record::Source::Kernel | logguard::record::Source::Systemd
+                            logguard::record::Source::Peer
+                                | logguard::record::Source::Kernel
+                                | logguard::record::Source::Systemd
+                                | logguard::record::Source::Privilege
                         )
                 })
                 .map(|(s, t)| format!("{} {} ago", s.name(), logguard::time::fmt_duration(now - t)))
@@ -358,7 +400,7 @@ fn real_main() -> Result<()> {
                     b.net.to_string(),
                     logguard::time::fmt_duration(b.until - now),
                     b.offence,
-                    b.reason
+                    safe(&b.reason)
                 );
             }
             if let Some(c) = &snap.cluster {
@@ -383,28 +425,36 @@ fn real_main() -> Result<()> {
                 );
                 for p in &c.peers {
                     let state = match (&p.last_error, p.last_ok) {
-                        (Some(e), _) => format!("FAILING: {e}"),
+                        (Some(e), _) => format!("FAILING: {}", safe(e)),
                         (None, Some(t)) => format!("ok, last delivery {}", logguard::time::fmt_ts(t)),
                         _ => "not contacted yet".into(),
                     };
                     println!("  -> {:<28} {state}", p.addr);
                 }
                 for (node, t) in &c.heard_from {
-                    println!("  <- {node:<28} last heard {}", logguard::time::fmt_ts(*t));
+                    println!("  <- {:<28} last heard {}", safe(node), logguard::time::fmt_ts(*t));
                 }
             }
             if let Some(r) = &snap.exposure {
-                println!(
-                    "\nexposed listeners (ufw {}):",
-                    match r.ufw_active {
-                        Some(true) => "active",
-                        Some(false) => "INACTIVE",
-                        None => "not found",
-                    }
-                );
-                for (name, l) in logguard::exposure::for_display(&r.listeners).iter().filter(|(_, l)| l.exposure.is_exposed() && !l.dynamic)
+                let fw = r.firewall();
+                println!("\nexposed listeners (firewall: {}):", r.firewall_summary());
+                if fw == logguard::exposure::Firewall::Absent && r.firewall_checked() {
+                    println!("  nothing filters incoming traffic: every listener on a public address is reachable");
+                }
+                for (name, l) in logguard::exposure::for_display(&r.listeners)
+                    .iter()
+                    .filter(|(_, l)| l.exposure.is_exposed() && !l.dynamic && !l.honeypot)
                 {
-                    println!("  {name:<44} {:<16} {}", l.process, l.exposure.describe());
+                    let rule = l.rule_text(fw).map(|r| format!(" [{r}]")).unwrap_or_default();
+                    println!("  {name:<44} {:<16} {}{rule}", safe(&l.process), r.describe(l));
+                }
+                let honeypots: Vec<String> = logguard::exposure::for_display(&r.listeners)
+                    .iter()
+                    .filter(|(_, l)| l.honeypot)
+                    .map(|(name, l)| format!("{name} ({})", r.describe(l)))
+                    .collect();
+                if !honeypots.is_empty() {
+                    println!("  honeypots: {}", honeypots.join(", "));
                 }
                 let dynamic = r.listeners.iter().filter(|l| l.dynamic).count();
                 if dynamic > 0 {
@@ -414,8 +464,29 @@ fn real_main() -> Result<()> {
                     println!("  dead ufw rule: {d} (nothing listens)");
                 }
             }
-            if snap.cron.is_some() || snap.av.is_some() {
+            if !snap.allow_hosts.is_empty() {
+                let list: Vec<String> = snap.allow_hosts.iter().map(|n| n.to_string()).collect();
+                println!("\n[allowlist] hosts resolve to: {}", list.join(", "));
+            }
+            if snap.cron.is_some() || snap.av.is_some() || snap.verify.is_some() || snap.procwatch.is_some() {
                 println!("\nhost integrity:");
+            }
+            if let Some(v) = &snap.verify {
+                println!(
+                    "  packages: last check {}, {} files match dpkg, {} differ; {} set-uid/set-gid programs",
+                    logguard::time::fmt_ts(v.last_run),
+                    v.checked,
+                    v.mismatched,
+                    v.suid
+                );
+            }
+            if let Some(p) = &snap.procwatch {
+                let state = if p.learning_until > now {
+                    format!("learning until {}", logguard::time::fmt_ts(p.learning_until))
+                } else {
+                    "watching".into()
+                };
+                println!("  processes: {state}; {} outbound (program, port) pairs known, {} connections now", p.pairs, p.outbound);
             }
             if let Some(c) = &snap.cron {
                 let state = if c.learning_until > now {
@@ -473,6 +544,12 @@ fn real_main() -> Result<()> {
                     println!("  cannot read: {e}");
                 }
             }
+            if let Some(p) = &snap.patches {
+                println!("\npatches (read {} ago): {}", logguard::time::fmt_duration(now - p.read), safe(&p.summary()));
+                for e in &p.errors {
+                    println!("  cannot read: {}", safe(e));
+                }
+            }
             if !cfg.ratelimit.is_empty() && snap.mode == config::Mode::Enforce {
                 println!("\nrate limits (new connections per source address):");
                 match enforce::rate_limit_drops(&cfg.enforce.nft, &cfg.enforce.nft_table) {
@@ -488,12 +565,47 @@ fn real_main() -> Result<()> {
             }
             println!("\nrecent alerts:");
             for a in snap.alerts.iter().take(10) {
-                println!("  {}", replay::format_action(a, false));
+                println!("  {}", safe(&replay::format_action(a, false)));
             }
             replay::print_summary(&snap, top);
             Ok(())
         }
         Cmd::Unban { net } => send_control(&cfg, &format!("unban {}", parse_net(&net)?)),
+        Cmd::Ban { net, duration, note } => {
+            let note = note.unwrap_or_default().replace(['\n', '\r'], " ");
+            send_control(&cfg, &format!("ban {} {} {note}", parse_net(&net)?, duration.0))
+        }
+        Cmd::ExpectChange { files } => {
+            let mut entries = Vec::new();
+            for f in &files {
+                let (dest, src) = f.split_once('=').unwrap_or((f, f));
+                anyhow::ensure!(dest.starts_with('/'), "{dest}: the watched path must be absolute");
+                let fp = logguard::cronwatch::fingerprint(std::path::Path::new(src)).with_context(|| format!("reading {src}"))?;
+                entries.push((dest.to_string(), fp));
+            }
+            let path = logguard::cronwatch::expected_path(&cfg.state_file);
+            logguard::cronwatch::record_expected(&path, &entries, logguard::time::now())
+                .with_context(|| format!("writing {}", path.display()))?;
+            Ok(())
+        }
+        Cmd::TestPattern { files, pattern, verbose } => {
+            let mut out = std::io::stdout().lock();
+            if files.is_empty() {
+                logguard::parse::custom::test(&cfg.patterns, pattern.as_deref(), std::io::stdin().lock(), verbose, &mut out)?;
+            }
+            for f in &files {
+                let file = std::fs::File::open(f).with_context(|| format!("reading {}", f.display()))?;
+                let reader: Box<dyn std::io::BufRead> = if f.extension().is_some_and(|e| e == "gz") {
+                    Box::new(std::io::BufReader::new(flate2::read::GzDecoder::new(file)))
+                } else {
+                    Box::new(std::io::BufReader::new(file))
+                };
+                use std::io::Write as _;
+                writeln!(out, "== {}", f.display())?;
+                logguard::parse::custom::test(&cfg.patterns, pattern.as_deref(), reader, verbose, &mut out)?;
+            }
+            Ok(())
+        }
         Cmd::Allow { net, duration, note } => {
             let note = note.unwrap_or_default().replace(['\n', '\r'], " ");
             send_control(&cfg, &format!("allow {} {} {note}", parse_net(&net)?, duration.0))
@@ -514,6 +626,14 @@ fn real_main() -> Result<()> {
                         logguard::time::fmt_ts(f.refreshed),
                         if f.applied { "active in nftables" } else { "NOT applied (shadow mode, ufw backend, or cleared)" }
                     );
+                    if f.asns > 0 {
+                        let how = if f.asn_pending {
+                            "not loaded yet: waiting for the [geo] network database".to_string()
+                        } else {
+                            format!("{} address blocks", f.asn_networks)
+                        };
+                        println!("  {} networks (ASNs) listed: {how}", f.asns);
+                    }
                     for s in &f.sources {
                         let state = match (&s.error, s.from_cache) {
                             (Some(e), true) => format!("failed, using cached copy: {e}"),
@@ -751,7 +871,7 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::ConfigDiff { .. } => unreachable!("handled before the config is loaded"),
-        Cmd::PrintNft => {
+        Cmd::PrintNft { no_tripwires } => {
             // Exactly what the daemon loads: the allowlist plus cluster peers and this host's
             // own addresses (so `install.sh`'s `nft -c` dry run checks the real thing).
             let mut allow = cfg.allowlist.nets.clone();
@@ -761,7 +881,14 @@ fn real_main() -> Result<()> {
                 }
             }
             allow.extend(logguard::net::local_addresses().into_iter().map(logguard::net::Net::host));
-            print!("{}", enforce::nft_setup_script(&cfg.enforce.nft_table, &allow, &cfg.ports.whitelist, &cfg.ratelimit));
+            let trip = cfg.ports.kernel_tripwires.then(|| enforce::Trip {
+                ports: enforce::trip_ports(&cfg, &enforce::served_tcp_ports()),
+                rate: cfg.ports.kernel_tripwire_rate.clone(),
+            });
+            print!("{}", enforce::nft_setup_script(&cfg.enforce.nft_table, &allow, &cfg.ports.whitelist, &cfg.ratelimit, trip.as_ref()));
+            if let Some(t) = trip.as_ref().filter(|_| !no_tripwires) {
+                print!("{}", enforce::nft_trip_rules_script(&cfg.enforce.nft_table, t));
+            }
             Ok(())
         }
     }
@@ -808,7 +935,12 @@ fn notify_test_bot(ncfg: &notify::NotifyCfg, n: &notify::Notice) -> Result<()> {
     let (sending, rejected, fallback) = (state("sending"), state("rejected"), state("fallback"));
     while start.elapsed() < grace {
         if rejected.exists() {
-            anyhow::bail!("the bot refused it: it writes to its own admin (ADMIN_JID) only; the daemon sends it unencrypted");
+            let then = if ncfg.admins.contains(&n.to) {
+                "the daemon sends it unencrypted"
+            } else {
+                "the daemon deletes it (it isn't one of [notify] admins)"
+            };
+            anyhow::bail!("the bot refused it: it writes to its own admin (ADMIN_JID) only; {then}");
         }
         if fallback.exists() {
             anyhow::bail!("the bot didn't take it in time; the daemon is sending it unencrypted");

@@ -10,6 +10,21 @@ use std::sync::Mutex;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+/// A log message as one line, without anything a terminal acts on: control characters
+/// (line breaks, escape sequences) as visible escapes. Messages quote others' text: message
+/// ids, device names, servers' replies.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 struct Logger {
     file: Option<Mutex<File>>,
 }
@@ -28,7 +43,7 @@ impl Log for Logger {
             Level::Warn => "WARNING",
             l => l.as_str(),
         };
-        let line = format!("{} - {level} - {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f"), r.args());
+        let line = format!("{} - {level} - {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f"), one_line(&r.args().to_string()));
         match &self.file {
             Some(f) => {
                 if let Ok(mut f) = f.lock() {
@@ -55,5 +70,14 @@ pub fn init(dir: &Path) {
     log::set_max_level(LevelFilter::Info);
     if let Some(e) = err {
         log::warn!("logging to stderr only: {}/bot.log: {e}", dir.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_lines_stay_one_line() {
+        assert_eq!(super::one_line("id 1\nINFO - forged\u{1b}[2J\tend"), "id 1\\nINFO - forged\\u{1b}[2J\\tend");
+        assert_eq!(super::one_line("plain → ✓"), "plain → ✓");
     }
 }

@@ -155,9 +155,17 @@ impl EjabberdParser {
             let ip = logged.or(conn.map(|c| c.0));
             let port = conn.map(|c| c.1);
             let jid = jid_after(text, "authentication for ");
+            // Only a connection seen opening on a client port proves where a login came from.
+            // One naming any other process (a web client over BOSH or WebSocket, or a line
+            // injected through a multi-line log message) counts for its account, not as trust.
             match ip {
-                Some(ip) => out
-                    .push(Event::new(ts, ip, Signal::XmppAuthOk).port(port).account(jid.as_deref()).detail("c2s authentication accepted")),
+                Some(ip) => out.push(
+                    Event::new(ts, ip, Signal::XmppAuthOk)
+                        .port(port)
+                        .account(jid.as_deref())
+                        .detail("c2s authentication accepted")
+                        .verified(conn.is_some()),
+                ),
                 None => self.unattributed += 1,
             }
         } else if text.starts_with("Failed c2s ") {
@@ -188,7 +196,7 @@ impl EjabberdParser {
                 }
             }
         } else if let Some(rest) = text.strip_prefix("The account ") {
-            // The account azerty@example.org was registered from IP address ::ffff:11.33.43.85
+            // The account azerty@example.org was registered from IP address ::ffff:11.41.43.85
             if let Some((jid, ip)) = rest.split_once(" was registered from IP address ") {
                 if let Some(ip) = parse_ip(ip.trim()) {
                     out.push(Event::new(ts, ip, Signal::XmppRegister).account(Some(jid)).detail(format!("registered account {jid}")));
@@ -299,7 +307,7 @@ mod tests {
     use crate::record::Source;
 
     fn rec(ts_s: i64, msg: &str) -> Record {
-        Record { ts: ts_s * time::SEC, source: Source::Ejabberd, pid: 1, msg: msg.to_string(), cursor: None }
+        Record { ts: ts_s * time::SEC, source: Source::Ejabberd, pid: 1, msg: msg.to_string(), cursor: None, sender: None }
     }
 
     fn parser() -> EjabberdParser {
@@ -310,22 +318,27 @@ mod tests {
     fn tls_failure_attributed_by_pid_not_by_previous_line() {
         let mut p = parser();
         let mut out = vec![];
-        p.feed(&rec(0, "2026-08-16 21:53:54.665 [info] (#PID<0.10.0>) Accepted connection [::ffff:11.42.40.218]:38436 -> [::ffff:11.17.39.236]:5223"), &mut out);
+        p.feed(&rec(0, "2026-08-16 21:53:54.665 [info] (#PID<0.10.0>) Accepted connection [::ffff:11.50.40.218]:38436 -> [::ffff:11.25.39.236]:5223"), &mut out);
         p.feed(
             &rec(
                 0,
-                "2026-08-16 21:53:54.666 [info] (#PID<0.11.0>) Accepted connection [::ffff:11.35.43.31]:1 -> [::ffff:11.17.39.236]:5223",
+                "2026-08-16 21:53:54.666 [info] (#PID<0.11.0>) Accepted connection [::ffff:11.43.43.31]:1 -> [::ffff:11.25.39.236]:5223",
             ),
             &mut out,
         );
         p.feed(&rec(1, "2026-08-16 21:53:54.700 [info] (tls|<0.10.0>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000102:SSL routines::unsupported protocol"), &mut out);
-        p.feed(&rec(1, "2026-08-16 21:53:55.000 [info] (tls|<0.11.0>) Accepted c2s SCRAM-SHA-512-PLUS authentication for user2@example.org by mnesia backend from ::ffff:11.35.43.31"), &mut out);
+        p.feed(&rec(1, "2026-08-16 21:53:55.000 [info] (tls|<0.11.0>) Accepted c2s SCRAM-SHA-512-PLUS authentication for user2@example.org by mnesia backend from ::ffff:11.43.43.31"), &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].signal, Signal::XmppTlsFail);
-        assert_eq!(out[0].ip.to_string(), "11.42.40.218");
+        assert_eq!(out[0].ip.to_string(), "11.50.40.218");
         assert_eq!(out[0].detail, "TLS failed: unsupported protocol");
         assert_eq!(out[1].signal, Signal::XmppAuthOk);
         assert_eq!(out[1].account.as_deref(), Some("user2@example.org"));
+        assert!(out[1].verified, "its connection was seen opening");
+        // a login naming a process no client connection was seen for: counted, not verified
+        let mut other = vec![];
+        p.feed(&rec(2, "2026-08-16 21:53:56.000 [info] (tls|<0.99.0>) Accepted c2s PLAIN authentication for x@example.org by mnesia backend from ::ffff:198.51.100.5"), &mut other);
+        assert_eq!((other[0].signal, other[0].verified), (Signal::XmppAuthOk, false));
         out.clear();
         p.sweep(200 * time::SEC, &mut out);
         assert!(out.is_empty(), "resolved connections must not count as silent");
@@ -335,15 +348,15 @@ mod tests {
     fn silent_client_connection_and_other_ports() {
         let mut p = parser();
         let mut out = vec![];
-        p.feed(&rec(0, "2026-08-21 22:17:26.048 [info] (#PID<0.2334.0>) Accepted connection [::ffff:11.34.253.221]:64606 -> [::ffff:11.17.39.236]:5222"), &mut out);
-        p.feed(&rec(0, "2026-08-21 22:17:27.481 [info] (#PID<0.2336.0>) Accepted connection [::ffff:11.34.253.221]:23136 -> [::ffff:11.17.39.236]:5269"), &mut out);
+        p.feed(&rec(0, "2026-08-21 22:17:26.048 [info] (#PID<0.2334.0>) Accepted connection [::ffff:11.42.253.221]:64606 -> [::ffff:11.25.39.236]:5222"), &mut out);
+        p.feed(&rec(0, "2026-08-21 22:17:27.481 [info] (#PID<0.2336.0>) Accepted connection [::ffff:11.42.253.221]:23136 -> [::ffff:11.25.39.236]:5269"), &mut out);
         p.feed(
-            &rec(0, "2026-08-16 21:36:25.361 [info] (#PID<0.28907.0>) Accepted connection 11.11.79.110:50735 -> 11.17.39.236:5349"),
+            &rec(0, "2026-08-16 21:36:25.361 [info] (#PID<0.28907.0>) Accepted connection 11.18.111.110:50735 -> 11.25.39.236:5349"),
             &mut out,
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].port, Some(5269));
-        assert_eq!(out[1].ip.to_string(), "11.11.79.110");
+        assert_eq!(out[1].ip.to_string(), "11.18.111.110");
         out.clear();
         p.sweep(30 * time::SEC, &mut out);
         assert!(out.is_empty());
@@ -358,10 +371,10 @@ mod tests {
         let mut p = parser();
         let mut out = vec![];
         p.feed(&rec(0, "2026-08-16 21:00:00.000 [info] (tls|<0.5.0>) Failed c2s PLAIN authentication for admin@example.org from ::ffff:9.9.9.9: Invalid username or password"), &mut out);
-        p.feed(&rec(0, "2026-08-16 21:35:11.121 [info] Closing inbound s2s connection ::ffff:11.15.26.161 -> example.org: Stream closed by local host: not well-formed (invalid token) (not-well-formed)"), &mut out);
+        p.feed(&rec(0, "2026-08-16 21:35:11.121 [info] Closing inbound s2s connection ::ffff:11.23.26.161 -> example.org: Stream closed by local host: not well-formed (invalid token) (not-well-formed)"), &mut out);
         p.feed(&rec(0, "2026-08-16 21:35:11.121 [info] Closing inbound s2s connection ::ffff:5.5.5.5 -> example.org: Connection failed: connection closed"), &mut out);
         p.feed(
-            &rec(0, "2026-08-22 08:56:37.094 [warning] Cannot serve /opt/ejabberd/upload/x/y.jpg to ::ffff:11.30.11.41: No such file"),
+            &rec(0, "2026-08-22 08:56:37.094 [warning] Cannot serve /opt/ejabberd/upload/x/y.jpg to ::ffff:11.38.11.41: No such file"),
             &mut out,
         );
         assert_eq!(out.len(), 3);
@@ -376,13 +389,13 @@ mod tests {
     fn month_sample_formats() {
         let mut p = parser();
         let mut out = vec![];
-        p.feed(&rec(0, "2026-09-18 15:05:55.227 [warning] (tls|<0.15027.0>) Failed c2s HT-SHA-256-EXPR authentication for user5@example.org from ::ffff:11.27.62.53: Invalid username or password"), &mut out);
+        p.feed(&rec(0, "2026-09-18 15:05:55.227 [warning] (tls|<0.15027.0>) Failed c2s HT-SHA-256-EXPR authentication for user5@example.org from ::ffff:11.35.62.53: Invalid username or password"), &mut out);
         p.feed(
-            &rec(0, "2026-09-13 22:36:29.090 [info] The account azerty@example.org was registered from IP address ::ffff:11.33.43.85"),
+            &rec(0, "2026-09-13 22:36:29.090 [info] The account azerty@example.org was registered from IP address ::ffff:11.41.43.85"),
             &mut out,
         );
         p.feed(
-            &rec(0, "2026-09-30 10:00:00.000 [info] (#PID<0.9.0>) Accepted connection hidden_by_ejabberd -> [::ffff:11.17.39.236]:5223"),
+            &rec(0, "2026-09-30 10:00:00.000 [info] (#PID<0.9.0>) Accepted connection hidden_by_ejabberd -> [::ffff:11.25.39.236]:5223"),
             &mut out,
         );
         p.feed(&rec(0, "2026-09-30 10:00:00.100 [info] (tls|<0.9.0>) Accepted c2s HT-SHA-256-EXPR authentication for a@b by mod_auth_fast backend from hidden_by_ejabberd"), &mut out);
@@ -400,8 +413,8 @@ mod tests {
         let mut out = vec![];
         p.feed(&rec(0, "2026-10-02 18:12:42.758 [debug] Storing certificate for example.org, conference.example.org and 2 more hosts in /opt/ejabberd/database/ejabberd@localhost/acme/live/f4156bc5a417a6ae18b62e365480e05a42159a2f"), &mut out);
         p.feed(&rec(0, "2026-10-10 01:43:43.687 [warning] Certificate in /opt/ejabberd/database/ejabberd@localhost/acme/live/879798eeaf32b7f23c095b37ac02e426393e2f4f (at line: 1) for conference.example.org, example.org and 3 more hosts will expire in a week"), &mut out);
-        p.feed(&rec(0, "2026-10-10 01:43:45.000 [error] Failed to request certificate for conference.example.org, example.org and 3 more hosts: Challenge failed for domain proxy.example.org: ACME server reported: 11.17.39.236: Fetching https://proxy.example.org/.well-known/acme-challenge/Gah: remote error: tls: internal error (error type: tls)"), &mut out);
-        p.feed(&rec(0, "2026-10-02 17:56:25.257 [error] Failed to request certificate for example.org: Challenge failed for domain conference.example.org: ACME server reported: 11.17.39.236: Fetching http://conference.example.org/.well-known/acme-challenge/4cl: Connection refused (error type: connection)"), &mut out);
+        p.feed(&rec(0, "2026-10-10 01:43:45.000 [error] Failed to request certificate for conference.example.org, example.org and 3 more hosts: Challenge failed for domain proxy.example.org: ACME server reported: 11.25.39.236: Fetching https://proxy.example.org/.well-known/acme-challenge/Gah: remote error: tls: internal error (error type: tls)"), &mut out);
+        p.feed(&rec(0, "2026-10-02 17:56:25.257 [error] Failed to request certificate for example.org: Challenge failed for domain conference.example.org: ACME server reported: 11.25.39.236: Fetching http://conference.example.org/.well-known/acme-challenge/4cl: Connection refused (error type: connection)"), &mut out);
         assert!(out.is_empty(), "no address events");
         assert_eq!(p.ops.len(), 4);
         assert_eq!(

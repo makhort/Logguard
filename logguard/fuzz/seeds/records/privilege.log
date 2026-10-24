@@ -1,0 +1,10 @@
+Oct 24 10:00:00 host su[77]: FAILED SU (to root) gateway on pts/0
+Oct 24 10:00:05 host su[78]: (to root) gateway on pts/0
+Oct 24 10:00:06 host su[78]: pam_unix(su-l:session): session opened for user root(uid=0) by gateway(uid=1000)
+Oct 24 10:01:00 host sudo[80]: pam_unix(sudo:auth): authentication failure; logname=eve uid=1001 euid=0 tty=/dev/pts/3 ruser=eve rhost=  user=eve
+Oct 24 10:01:09 host sudo[80]: eve : 3 incorrect password attempts ; TTY=pts/3 ; PWD=/tmp ; USER=root ; COMMAND=/bin/sh
+Oct 24 10:02:00 host sudo[81]: gateway : TTY=pts/0 ; PWD=/home/gateway ; USER=root ; COMMAND=/usr/bin/systemctl restart x
+Oct 24 10:03:00 host fuzz[90]: failed login [192.0.2.50] user=alice
+Oct 24 10:03:01 host fuzz[90]: accepted bob from 192.0.2.51
+Oct 24 10:03:02 host kernel: [LOGGUARD BLOCK] IN=eth0 OUT= MAC=aa SRC=198.51.100.9 DST=192.0.2.1 LEN=44 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 SYN URGP=0
+Oct 24 10:03:03 host sshd-session[91]: Accepted publickey for gw from 192.0.2.52 port 5555 ssh2: ED25519 SHA256:AbCdEf

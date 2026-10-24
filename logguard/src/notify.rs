@@ -693,7 +693,19 @@ fn sweep(cfg: &NotifyCfg, bot: &mut BotBox, copies: &mut [CopyBot], node: &OnceL
         Err(e) => return eprintln!("logguard: admin bot outbox {}: {e}", bot.dir.display()),
     };
     for f in found.fallback {
+        // The bot's user writes to the outbox too: whatever a file says, only admins get one.
+        if !cfg.admins.contains(&f.notice.to) {
+            eprintln!(
+                "logguard: {} is addressed to '{}', not one of [notify] admins: deleted, not sent",
+                f.path.display(),
+                crate::event::clean(&f.notice.to, 100)
+            );
+            let _ = std::fs::remove_file(&f.path);
+            bot.failing.remove(&f.path);
+            continue;
+        }
         let n = BotBox::plain(&f);
+        let n = Notice { subject: crate::event::plain_text(&n.subject), body: crate::event::plain_text(&n.body), ..n };
         // a failure is logged once, not on every retry
         let sent = if bot.failing.contains(&f.path) {
             send(cfg, &n).is_ok()
@@ -713,8 +725,9 @@ fn sweep(cfg: &NotifyCfg, bot: &mut BotBox, copies: &mut [CopyBot], node: &OnceL
             None => format!("logguard: {}", topic_name(Topic::System)),
         };
         let body = format!(
-            "{subject}\n\n[High] The admin bot has had {name} in its outbox for {} without sending it. \
+            "{subject}\n\n[High] The admin bot has had {} in its outbox for {} without sending it. \
              Check the bot's log: no trusted admin device, or the upload failing?",
+            crate::event::clean(&name, 120),
             crate::time::fmt_duration(age.as_secs() as i64 * SEC)
         );
         eprintln!("logguard: {name} waits in the admin bot's outbox");
@@ -1056,6 +1069,29 @@ mod tests {
         assert_eq!((parsed.mail_outbox, parsed.mail_user.as_str()), (None, "logguard-mail-bot"));
     }
 
+    /// What logguard takes back from the XMPP bot's outbox goes to admins only: the bot's
+    /// user can write files there too.
+    #[test]
+    fn fallbacks_go_to_admins_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logguard-notify-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outbox = dir.join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        let ctl = dir.join("ejabberdctl");
+        std::fs::write(&ctl, format!("#!/bin/sh\necho \"$4\" >> '{}'\n", dir.join("sent").display())).unwrap();
+        std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ncfg = NotifyCfg { ejabberdctl: ctl, bot_outbox: Some(outbox.clone()), ..cfg() };
+        let file = |name: &str, to: &str| std::fs::write(outbox.join(name), format!("To: {to}\nSubject: s\n\nb")).unwrap();
+        file(".alert-1.msg.rejected", "admin@example.org");
+        file(".alert-2.msg.rejected", "someone@elsewhere.example");
+        let mut bot = BotBox::new(outbox.clone(), None, Duration::from_secs(120), Duration::from_secs(3600));
+        sweep(&ncfg, &mut bot, &mut [], &OnceLock::new());
+        assert_eq!(std::fs::read_to_string(dir.join("sent")).unwrap(), "admin@example.org\n");
+        assert_eq!(std::fs::read_dir(&outbox).unwrap().count(), 0, "both taken out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn cfg() -> NotifyCfg {
         NotifyCfg { enabled: true, from: "example.org".into(), admins: vec!["admin@example.org".into()], ..Default::default() }
     }
@@ -1261,9 +1297,9 @@ mod tests {
             user_note: Some(body.into()),
             ..attack(ts_s, &[])
         };
-        assert_eq!(p.plan(&relayed(0, "[High] ban 11.13.45.233 for 1h")).len(), 1);
-        assert_eq!(p.plan(&relayed(10, "[High] ban 11.21.63.115 for 1h")).len(), 1, "another ban from the same server");
-        assert!(p.plan(&relayed(20, "[High] ban 11.21.63.115 for 1h")).is_empty(), "the same one again: cooldown");
+        assert_eq!(p.plan(&relayed(0, "[High] ban 11.21.45.233 for 1h")).len(), 1);
+        assert_eq!(p.plan(&relayed(10, "[High] ban 11.29.63.115 for 1h")).len(), 1, "another ban from the same server");
+        assert!(p.plan(&relayed(20, "[High] ban 11.29.63.115 for 1h")).is_empty(), "the same one again: cooldown");
     }
 
     #[test]
@@ -1318,7 +1354,7 @@ mod tests {
         ban.until = Some(6 * 3600 * SEC);
         ban.topic = Some(Topic::BruteForce);
         ban.notice = Some(i18n::UserNotice::BruteForce {
-            ip: "11.8.2.3".parse().unwrap(),
+            ip: "11.10.2.3".parse().unwrap(),
             attempts: [("ejabberd:alice@example.org".to_string(), 2), ("ejabberd:bob@example.org".to_string(), 5)].into_iter().collect(),
         });
         let n = p.plan(&ban);
@@ -1326,11 +1362,11 @@ mod tests {
         let bob = to("bob@example.org");
         assert_eq!(bob.subject, "⚠️ Уведомление о безопасности: подбор пароля заблокирован");
         assert!(bob.body.starts_with("Уведомление о безопасности для bob@example.org"), "{}", bob.body);
-        assert!(bob.body.contains("С адреса 11.8.2.3: 5 неудачных попыток входа"), "{}", bob.body);
+        assert!(bob.body.contains("С адреса 11.10.2.3: 5 неудачных попыток входа"), "{}", bob.body);
         assert!(bob.body.contains("Этот адрес заблокирован на 6 часов."), "{}", bob.body);
         assert!(!bob.body.contains("alice"), "never another user's account: {}", bob.body);
         let alice = to("alice@example.org");
-        assert!(alice.body.contains("2 failed login attempts on alice@example.org came from 11.8.2.3."), "{}", alice.body);
+        assert!(alice.body.contains("2 failed login attempts on alice@example.org came from 11.10.2.3."), "{}", alice.body);
         assert!(alice.body.contains("This address is blocked for 6 hours."), "{}", alice.body);
         assert!(to("admin@example.org").body.contains("\n\n[High]"), "admins: English as before");
     }

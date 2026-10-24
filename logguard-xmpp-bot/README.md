@@ -283,9 +283,9 @@ Without a Rust toolchain: every version tag `logguard-xmpp-bot-v<version>` gets 
 **Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
 
 ```bash
-gh release download logguard-xmpp-bot-v0.1.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
+gh release download logguard-xmpp-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
 sha256sum -c logguard-xmpp-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-xmpp-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-xmpp-bot-v0.1.0
+gh attestation verify logguard-xmpp-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-xmpp-bot-v0.2.0
 ```
 
 `gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-xmpp-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
@@ -306,17 +306,18 @@ It refuses to install while `config.env` still holds `REPLACE…` placeholders. 
 
 ```bash
 ./scripts/ci.sh            # fmt, clippy, tests, cargo audit, static Linux binary
-./deploy/deploy.sh         # ci.sh, then copies to xmpp:/tmp/logguard-xmpp-bot-deploy
+./deploy/deploy.sh         # ci.sh, then copies (over SFTP only) to a fresh xmpp:/tmp/logguard-xmpp-bot-deploy.XXXX
 ```
 
 The static Linux build needs `rustup target add x86_64-unknown-linux-musl` and
 `rustup component add llvm-tools` (see `.cargo/config.toml`).
 
-Then, in a root shell on the server:
+Then paste the command `deploy.sh` prints into a root shell on the server: it checks the
+files and runs `install.sh` (installs /opt/logguard-xmpp-bot/logguard-xmpp-bot and the unit,
+restarts). To go back to the previous binary and unit:
 
 ```bash
-bash /tmp/logguard-xmpp-bot-deploy/install.sh            # install /opt/logguard-xmpp-bot/logguard-xmpp-bot and the unit, restart
-bash /tmp/logguard-xmpp-bot-deploy/install.sh rollback   # back to the previous binary and unit
+bash /opt/logguard-xmpp-bot/install.sh rollback
 ```
 
 **Renamed from `xmppbot` (2026-10-17).** The bot was `xmppbot`, installed as

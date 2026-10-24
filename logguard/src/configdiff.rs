@@ -10,6 +10,12 @@ use toml::Value;
 use crate::config::Config;
 use crate::time::Dur;
 
+/// Options still accepted so older files load, but ignored, and what replaced them.
+const RETIRED: [(&str, &str); 2] = [
+    ("subnets.wide_min_bad_ips", "subnet bans now grow step by step, see subnets.wide_max_step"),
+    ("subnets.wide_min_subnets", "subnet bans now grow step by step, see subnets.wide_max_step"),
+];
+
 /// Dotted key (`scoring.weights.fw_block`) -> value. Arrays (including arrays of tables
 /// such as `[[ratelimit]]`) are single values; empty tables are kept as values.
 fn flatten(prefix: &str, v: &Value, out: &mut BTreeMap<String, Value>) {
@@ -124,6 +130,8 @@ pub fn diff(installed: &str, old_defaults: Option<&str>, opts: &DiffOpts) -> Res
         .map(|(p, v)| format!("{} = {}  (misspelled, or removed in this version)", p.join("."), show(v)))
         .collect();
     section("UNKNOWN options in your file - logguard refuses to start until they are fixed or removed:", unknown);
+    let retired: Vec<String> = RETIRED.iter().filter_map(|(k, why)| mine.get(*k).map(|v| format!("{k} = {}  ({why})", show(v)))).collect();
+    section("Options no longer used (ignored; you can remove them):", retired);
 
     if let Some(old) = &old {
         let new: Vec<String> = cur
@@ -199,6 +207,10 @@ mod tests {
             t["scoring"]["weights"].as_table_mut().unwrap().insert("ssh_auth_fail".into(), Value::Float(34.0));
             t["scoring"]["weights"].as_table_mut().unwrap().insert("xmpp_auth_fail".into(), Value::Float(34.0));
             t["bans"].as_table_mut().unwrap().insert("old_knob".into(), Value::Boolean(true));
+            let subnets = t["subnets"].as_table_mut().unwrap();
+            subnets.remove("wide_max_step");
+            subnets.insert("wide_min_bad_ips".into(), Value::Integer(12));
+            subnets.insert("wide_min_subnets".into(), Value::Integer(4));
             toml::to_string(&t).unwrap()
         };
         let installed = r#"
@@ -224,6 +236,18 @@ min_bad_ip = 3
         let r = diff("[scoring.weights]\nfw_blok = 5\n", Some(&old_defaults), &DiffOpts { all: false }).unwrap();
         assert!(r.contains("scoring.weights.fw_blok = 5  (misspelled"), "{r}");
         assert!(!r.contains("notify.api =") && !r.contains("alice") && !r.contains("abc.d"), "{r}");
+
+        // Retired options: still valid, reported as unused; not in the file, nothing to do.
+        let r = diff("[subnets]\nwide_min_bad_ips = 12\n", Some(&old_defaults), &DiffOpts { all: false }).unwrap();
+        assert!(
+            r.contains("Options no longer used (ignored; you can remove them):\n  subnets.wide_min_bad_ips = 12  (subnet bans now grow"),
+            "{r}"
+        );
+        assert!(
+            r.contains("Options removed in this version (not in your file, nothing to do):\n  bans.old_knob\n  subnets.wide_min_subnets\n"),
+            "{r}"
+        );
+        assert!(r.contains("subnets.wide_max_step = 2") && r.contains("Your file is valid"), "{r}");
 
         let r = diff("mode = \"enforce\"\n[canary]\nssh = [\"root\"]\n", None, &DiffOpts { all: true }).unwrap();
         assert!(r.contains("[scoring] ("), "{r}");

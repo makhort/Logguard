@@ -181,6 +181,17 @@ fn layout6_tg_bot_with_peers() {
     assert_eq!(c.reports("tg"), ["merged on the XMPP server\n"]);
     assert!(!merged.exists());
 
+    // a merged report that doesn't unpack (damaged, or beyond 64 MB) isn't handed on
+    let c = Case::new("6-damaged", &tg_node(CLUSTER));
+    let bad = c.dir.join("inbox/abuse-report-xmpp.txt.gz");
+    std::fs::write(&bad, b"not gzip").unwrap();
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    assert!(out.contains("damaged or larger"), "{out}");
+    let r = c.reports("tg");
+    assert!(r.len() == 1 && r[0].starts_with("abuse-report --merge"), "merged here instead: {r:?}");
+    assert!(!bad.exists());
+
     // no merging peer (a VPN server only): merges here after the wait
     let c = Case::new("6-alone", &tg_node(CLUSTER));
     let vpn = c.peer_file("abuse-vpn.json.gz", "{}");

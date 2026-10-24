@@ -113,6 +113,11 @@ echo "Installed $("$DIR/logguard-mail-bot" --version)"
 # the directory this runs from is removed afterwards: keep this script for rollback. It is
 # here since the cd above, but $0 may name it from elsewhere (files/install.sh from a bundle).
 install -o root -g root -m 0700 "${0##*/}" "$DIR/install.sh"
+# logguard's integrity watch covers the unit: announce its new content (logged, not alerted).
+if [ -x /usr/local/bin/logguard ] && [ -f /etc/logguard/logguard.toml ]; then
+    /usr/local/bin/logguard --config /etc/logguard/logguard.toml expect-change "$UNIT=logguard-mail-bot.service" \
+        "/etc/systemd/system/multi-user.target.wants/logguard-mail-bot.service=logguard-mail-bot.service" 2> /dev/null || true
+fi
 install -m 0644 logguard-mail-bot.service "$UNIT"
 install -m 0644 logguard-mail-bot.logrotate /etc/logrotate.d/logguard-mail-bot
 install -o root -g root -m 0644 config.env.example "$DIR/config.env.example"

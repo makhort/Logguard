@@ -424,30 +424,30 @@ mod tests {
         assert!(note(&attack, Lang::Uk, None).contains("близько 21 невдалої спроби входу з 5 різних адрес"));
         assert!(note(&attack, Lang::Fr, None).starts_with("Votre compte"));
         let bf = UserNotice::BruteForce {
-            ip: "11.8.2.3".parse().unwrap(),
+            ip: "11.10.2.3".parse().unwrap(),
             attempts: [("ejabberd:alice@x.org".to_string(), 1), ("ejabberd:bob@x.org".to_string(), 3)].into_iter().collect(),
         };
         assert_eq!(
             note(&bf, Lang::Ru, Some("ejabberd:bob@x.org")),
-            "С адреса 11.8.2.3: 3 неудачные попытки входа в учётную запись bob@x.org."
+            "С адреса 11.10.2.3: 3 неудачные попытки входа в учётную запись bob@x.org."
         );
         assert_eq!(
             note(&bf, Lang::Fr, Some("ejabberd:alice@x.org")),
-            "1 tentative de connexion échouée sur alice@x.org provenait de 11.8.2.3."
+            "1 tentative de connexion échouée sur alice@x.org provenait de 11.10.2.3."
         );
         assert!(!note(&bf, Lang::En, Some("ejabberd:bob@x.org")).contains("alice"), "other users' accounts are never revealed");
         assert_eq!(note(&bf, Lang::En, None).matches("came from").count(), 2, "the admin/log version lists all");
         assert_eq!(subject(Topic::Compromise, Lang::Uk), "⚠️ Повідомлення про безпеку: підозрілий вхід");
-        assert_eq!(note(&bf, Lang::De, Some("ejabberd:bob@x.org")), "Von 11.8.2.3 kamen 3 fehlgeschlagene Anmeldeversuche für bob@x.org.");
+        assert_eq!(note(&bf, Lang::De, Some("ejabberd:bob@x.org")), "Von 11.10.2.3 kamen 3 fehlgeschlagene Anmeldeversuche für bob@x.org.");
         assert_eq!(
             note(&bf, Lang::De, Some("ejabberd:alice@x.org")),
-            "Von 11.8.2.3 kam 1 fehlgeschlagener Anmeldeversuch für alice@x.org."
+            "Von 11.10.2.3 kam 1 fehlgeschlagener Anmeldeversuch für alice@x.org."
         );
         assert_eq!(subject(Topic::AccountAttack, Lang::De), "⚠️ Sicherheitshinweis: Konto wird angegriffen");
-        assert_eq!(note(&bf, Lang::Pl, Some("ejabberd:bob@x.org")), "Z adresu 11.8.2.3: 3 nieudane próby logowania na konto bob@x.org.");
+        assert_eq!(note(&bf, Lang::Pl, Some("ejabberd:bob@x.org")), "Z adresu 11.10.2.3: 3 nieudane próby logowania na konto bob@x.org.");
         assert_eq!(
             note(&bf, Lang::Pl, Some("ejabberd:alice@x.org")),
-            "Z adresu 11.8.2.3: 1 nieudana próba logowania na konto alice@x.org."
+            "Z adresu 11.10.2.3: 1 nieudana próba logowania na konto alice@x.org."
         );
         assert!(note(&attack, Lang::Pl, None).contains("około 21 nieudanych prób logowania z 5 różnych adresów"));
         let one = UserNotice::AccountAttack { failures: 1, addresses: 1 };

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::net::Net;
 use crate::time::Dur;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,7 +40,10 @@ impl Default for GeoCfg {
             asn_url: "https://download.db-ip.com/free/dbip-asn-lite-{month}.csv.gz".into(),
             dir: "/var/lib/logguard/geo".into(),
             refresh: Dur(7 * 86_400),
-            fetch: ["curl", "-fsSL", "--max-time", "300", "--retry", "2", "--max-filesize", "200000000"].map(String::from).to_vec(),
+            // a redirect may not leave https
+            fetch: ["curl", "-fsSL", "--proto-redir", "=https", "--max-time", "300", "--retry", "2", "--max-filesize", "200000000"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -101,6 +105,13 @@ impl<K: Ord + Copy, V: PartialEq + Copy> Ranges<K, V> {
         let i = self.v.partition_point(|r| r.0 <= k).checked_sub(1)?;
         let r = self.v[i];
         (k <= r.1).then_some(r.2)
+    }
+
+    /// The values of the ranges overlapping `lo..=hi` (ranges don't overlap each other, so
+    /// their ends are sorted too).
+    fn within(&self, lo: K, hi: K) -> impl Iterator<Item = V> + '_ {
+        let i = self.v.partition_point(|r| r.1 < lo);
+        self.v[i..].iter().take_while(move |r| r.0 <= hi).map(|r| r.2)
     }
 }
 
@@ -199,13 +210,25 @@ impl GeoDb {
 
     /// Reads one database (CSV or iptoasn TSV); returns the number of ranges kept.
     pub fn read(&mut self, r: impl BufRead, is_country: bool) -> Result<usize> {
+        self.read_within(r, is_country, MAX_RANGES, MAX_ORGS)
+    }
+
+    fn read_within(&mut self, r: impl BufRead, is_country: bool, max_ranges: usize, max_orgs: usize) -> Result<usize> {
         let mut org_ids: std::collections::HashMap<String, u32> =
             self.orgs.iter().enumerate().map(|(i, o)| (o.clone(), i as u32)).collect();
         let mut lines = 0usize;
+        let mut too_big = false;
         for_each_line(r, |line| {
+            if too_big {
+                return;
+            }
             let f: Vec<String> = if line.contains('\t') { line.split('\t').map(String::from).collect() } else { split_csv(line) };
             let Some(k) = f.get(1).and_then(|end| key(&f[0], end)) else { return };
             lines += 1;
+            if lines > max_ranges || self.orgs.len() > max_orgs {
+                too_big = true;
+                return;
+            }
             if is_country {
                 // DB-IP: start,end,CC (iptoasn ip2country: start,end,CC)
                 let Some(c) = f.get(2).and_then(|c| cc(c)) else { return };
@@ -237,6 +260,9 @@ impl GeoDb {
                 }
             }
         })?;
+        if too_big {
+            bail!("more than {max_ranges} ranges or {max_orgs} network names: not a geo database (it would not fit in memory)");
+        }
         if lines == 0 {
             bail!("no address ranges found (not a DB-IP CSV or iptoasn TSV file?)");
         }
@@ -280,12 +306,74 @@ impl GeoDb {
         };
         k.map(|v| v.1)
     }
+
+    /// The networks (as CIDRs) the network database gives these ASNs.
+    pub fn networks_of(&self, asns: &std::collections::BTreeSet<u32>) -> Vec<Net> {
+        let mut out = Vec::new();
+        for (lo, hi, v) in &self.as4.v {
+            if asns.contains(&v.1) {
+                for (a, p) in cidrs(u128::from(*lo), u128::from(*hi), 32) {
+                    out.push(Net::new(IpAddr::V4((a as u32).into()), p));
+                }
+            }
+        }
+        for (lo, hi, v) in &self.as6.v {
+            if asns.contains(&v.1) {
+                // kept per /64: the upper 64 bits
+                for (a, p) in cidrs(u128::from(*lo), u128::from(*hi), 64) {
+                    out.push(Net::new(IpAddr::V6((a << 64).into()), p));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the addresses of `net` the network database knows all belong to one network
+    /// (ASN): a ban on it then can't reach another provider's customers. True without that
+    /// database.
+    pub fn one_network(&self, net: &Net) -> bool {
+        fn same(mut asns: impl Iterator<Item = u32>) -> bool {
+            let first = asns.next();
+            asns.all(|a| Some(a) == first)
+        }
+        match net.addr {
+            IpAddr::V4(a) => {
+                let lo = u32::from(a);
+                same(self.as4.within(lo, lo | u32::MAX.checked_shr(u32::from(net.prefix)).unwrap_or(0)).map(|v| v.1))
+            }
+            IpAddr::V6(a) => {
+                let lo = (u128::from(a) >> 64) as u64;
+                same(self.as6.within(lo, lo | u64::MAX.checked_shr(u32::from(net.prefix)).unwrap_or(0)).map(|v| v.1))
+            }
+        }
+    }
+}
+
+/// The CIDR blocks covering `lo..=hi` in a `bits`-bit address space: (start, prefix length).
+fn cidrs(mut lo: u128, hi: u128, bits: u32) -> Vec<(u128, u8)> {
+    let mut out = Vec::new();
+    while lo <= hi {
+        let align = if lo == 0 { bits } else { lo.trailing_zeros().min(bits) };
+        let span = hi - lo + 1;
+        let fits = 127 - span.leading_zeros().min(127); // floor(log2(span)), span >= 1
+        let size = align.min(fits);
+        out.push((lo, (bits - size) as u8));
+        match lo.checked_add(1u128 << size) {
+            Some(next) => lo = next,
+            None => break,
+        }
+    }
+    out
 }
 
 /// Database lines are short and DB-IP's files have ~1-2 million of them: anything far
 /// beyond is a broken or hostile download, which must not exhaust the service's memory.
 const MAX_LINE: usize = 4096;
 const MAX_LINES: usize = 10_000_000;
+/// What is kept of one database is bounded too, within the service's memory limit: DB-IP's
+/// lite databases hold about 0.5-0.7 million ranges each, and ~80,000 network names.
+const MAX_RANGES: usize = 2_000_000;
+const MAX_ORGS: usize = 300_000;
 
 /// Calls `f` for each line, bounded in line length and count.
 fn for_each_line(mut r: impl BufRead, mut f: impl FnMut(&str)) -> Result<()> {
@@ -304,9 +392,17 @@ fn for_each_line(mut r: impl BufRead, mut f: impl FnMut(&str)) -> Result<()> {
     bail!("more than {MAX_LINES} lines: not a geo database")
 }
 
-/// Number of usable ranges in a database, as `GeoDb::read` would load them.
+/// Number of usable ranges in a database, as `GeoDb::read` would load them; an error for
+/// one too big to load (more than `max_ranges` ranges or `max_orgs` network names).
 fn count_ranges(r: impl BufRead, is_country: bool) -> Result<usize> {
+    count_ranges_within(r, is_country, MAX_RANGES, MAX_ORGS)
+}
+
+fn count_ranges_within(r: impl BufRead, is_country: bool, max_ranges: usize, max_orgs: usize) -> Result<usize> {
+    use std::hash::{Hash, Hasher};
     let mut n = 0;
+    // names by hash: a few MB at most, and nothing kept of a hostile file's text
+    let mut orgs = std::collections::HashSet::new();
     for_each_line(r, |line| {
         let f: Vec<String> = if line.contains('\t') { line.split('\t').map(String::from).collect() } else { split_csv(line) };
         let ok = f.get(1).and_then(|end| key(&f[0], end)).is_some()
@@ -315,8 +411,20 @@ fn count_ranges(r: impl BufRead, is_country: bool) -> Result<usize> {
             } else {
                 f.get(2).and_then(|a| a.trim().parse::<u32>().ok()).is_some_and(|a| a > 0)
             };
+        if ok && !is_country && orgs.len() <= max_orgs {
+            let org = if f.len() >= 5 { tidy_org(&f[4]) } else { f.get(3).map_or("", |s| s.trim()) };
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            org.hash(&mut h);
+            orgs.insert(h.finish());
+        }
         n += usize::from(ok);
     })?;
+    if n > max_ranges || orgs.len() > max_orgs {
+        bail!(
+            "{n} ranges and {} network names, more than {max_ranges} and {max_orgs}: not a geo database (it would not fit in memory)",
+            orgs.len()
+        );
+    }
     Ok(n)
 }
 
@@ -443,6 +551,18 @@ YE Yemen|YT Mayotte|ZA South Africa|ZM Zambia|ZW Zimbabwe";
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn ranges_as_cidrs() {
+        let c = |lo: u128, hi: u128, bits| super::cidrs(lo, hi, bits);
+        assert_eq!(c(0, u128::from(u32::MAX), 32), vec![(0, 0)]);
+        // 10.0.0.0 - 10.0.2.255: a /23 and a /24
+        let ten = 10u128 << 24;
+        assert_eq!(c(ten, ten + 767, 32), vec![(ten, 23), (ten + 512, 24)]);
+        assert_eq!(c(5, 5, 32), vec![(5, 32)]);
+        assert_eq!(c(1, 6, 32), vec![(1, 32), (2, 31), (4, 31), (6, 32)]);
+        assert_eq!(c(u128::from(u64::MAX) - 1, u128::from(u64::MAX), 64), vec![(u128::from(u64::MAX) - 1, 63)]);
+    }
+
     use super::*;
 
     #[test]
@@ -451,14 +571,22 @@ pub(crate) mod tests {
         assert!(count_ranges(long.as_bytes(), true).unwrap_err().to_string().contains("line longer"));
         let ok = "1.0.0.0,1.0.0.255,AU\r\n1.0.1.0,1.0.1.255,CN\n";
         assert_eq!(count_ranges(ok.as_bytes(), true).unwrap(), 2);
+        // more ranges or network names than fit in memory: refused when downloaded and when loaded
+        let asn: String = (0..20u32).map(|i| format!("1.0.{i}.0,1.0.{i}.255,{},\"Org {i}\"\n", 64500 + i)).collect();
+        assert_eq!(count_ranges_within(asn.as_bytes(), false, 20, 20).unwrap(), 20);
+        assert!(count_ranges_within(asn.as_bytes(), false, 19, 20).unwrap_err().to_string().contains("not fit in memory"));
+        assert!(count_ranges_within(asn.as_bytes(), false, 20, 19).unwrap_err().to_string().contains("not fit in memory"));
+        assert!(GeoDb::default().read_within(asn.as_bytes(), false, 19, 20).is_err());
+        assert!(GeoDb::default().read_within(asn.as_bytes(), false, 20, 10).is_err());
+        assert!(GeoDb::default().read_within(asn.as_bytes(), false, 20, 20).is_ok());
     }
 
     pub(crate) fn sample() -> GeoDb {
         let mut db = GeoDb::default();
         let country = "0.0.0.0,0.255.255.255,ZZ\n1.0.0.0,1.0.0.255,AU\n5.9.0.0,5.9.127.255,DE\n5.9.128.0,5.9.255.255,DE\n\
-                       11.28.0.0,11.28.255.255,FI\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
+                       11.36.0.0,11.36.255.255,FI\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
         let asn = "1.0.0.0,1.0.0.255,13335,\"Cloudflare, Inc.\"\n5.9.0.0,5.9.255.255,24940,\"Hetzner Online GmbH\"\n\
-                   11.28.0.0,11.28.255.255,24940,\"Hetzner Online GmbH\"\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
+                   11.36.0.0,11.36.255.255,24940,\"Hetzner Online GmbH\"\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
         assert_eq!(db.read(country.as_bytes(), true).unwrap(), 4, "ZZ dropped, adjacent DE blocks merged");
         assert_eq!(db.read(asn.as_bytes(), false).unwrap(), 4);
         db
@@ -469,12 +597,35 @@ pub(crate) mod tests {
         let db = sample();
         let l = |ip: &str| db.label(ip.parse().unwrap());
         assert_eq!(l("5.9.200.1").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
-        assert_eq!(l("11.28.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
+        assert_eq!(l("11.36.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.0.1").as_deref(), Some("Australia / Cloudflare, Inc. (AS13335)"));
         assert_eq!(l("3fff:100:1:2::3").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.1.1"), None);
         assert_eq!(l("0.1.2.3"), None);
-        assert_eq!(db.asn("11.28.3.4".parse().unwrap()), Some(24940));
+        assert_eq!(db.asn("11.36.3.4".parse().unwrap()), Some(24940));
+    }
+
+    #[test]
+    fn one_network() {
+        let mut db = GeoDb::default();
+        let asn = "11.18.88.0,11.18.89.255,64501,\"Other\"\n11.18.90.0,11.18.91.127,64500,\"Provider\"\n\
+                   11.18.91.128,11.18.95.255,64500,\"Provider (DE)\"\n3fff:100::,3fff:100:0:ffff:ffff:ffff:ffff:ffff,24940,\"H\"\n\
+                   3fff:100:1::,3fff:100:1:ffff:ffff:ffff:ffff:ffff,64502,\"V\"\n";
+        db.read(asn.as_bytes(), false).unwrap();
+        let one = |n: &str| db.one_network(&n.parse().unwrap());
+        assert!(one("11.18.90.0/23") && one("11.18.92.0/22"), "one ASN over several ranges");
+        assert!(!one("11.18.88.0/22") && !one("11.18.0.0/16"), "two providers");
+        assert!(one("11.18.89.7") && one("11.19.0.0/16"), "unknown addresses don't count");
+        assert!(one("3fff:100::/48") && one("3fff:100:0:5::/64") && !one("3fff:100::/47"));
+        assert!(GeoDb::default().one_network(&"11.18.0.0/16".parse().unwrap()), "no network database");
+    }
+
+    #[test]
+    fn networks_of_asns() {
+        let db = sample();
+        let nets: Vec<String> = db.networks_of(&[24940].into_iter().collect()).iter().map(|n| n.to_string()).collect();
+        assert_eq!(nets, ["5.9.0.0/16", "11.36.0.0/16", "3fff:100::/32"]);
+        assert!(db.networks_of(&[64999].into_iter().collect()).is_empty());
     }
 
     #[test]

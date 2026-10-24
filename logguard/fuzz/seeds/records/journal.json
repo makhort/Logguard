@@ -1,5 +1,5 @@
 {"__CURSOR":"s=abc","__REALTIME_TIMESTAMP":"1786000000000000","SYSLOG_IDENTIFIER":"sshd-session","_EXE":"/usr/lib/openssh/sshd-session","_PID":"77","_UID":"0","MESSAGE":"Invalid user admin from 198.51.100.40 port 5555"}
-{"__CURSOR":"s=abd","__REALTIME_TIMESTAMP":"1786000001000000","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"[UFW BLOCK] IN=eth0 SRC=198.51.100.41 DST=192.0.2.1 PROTO=TCP SPT=1 DPT=3389"}
+{"__CURSOR":"s=abd","__REALTIME_TIMESTAMP":"1786000001000000","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"[UFW BLOCK] IN=eth0 OUT= SRC=198.51.100.41 DST=192.0.2.1 PROTO=TCP SPT=1 DPT=3389"}
 {"__CURSOR":"s=abe","__REALTIME_TIMESTAMP":"1786000002000000","SYSLOG_IDENTIFIER":"systemd","_PID":"1","UNIT":"logguard-xmpp-bot.service","MESSAGE":"logguard-xmpp-bot.service: Main process exited, code=exited, status=78/CONFIG"}
 {"__CURSOR":"s=abf","__REALTIME_TIMESTAMP":"1786000003000000","SYSLOG_IDENTIFIER":"systemd","_PID":"1","UNIT":"logguard-xmpp-bot.service","MESSAGE":"logguard-xmpp-bot.service: Failed with result 'exit-code'."}
 {"SYSLOG_IDENTIFIER":"sshd","MESSAGE":[73,110,118,97,108,105,100]}

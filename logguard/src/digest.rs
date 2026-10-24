@@ -278,6 +278,29 @@ pub fn check_cert(openssl: &PathBuf, target: &str) -> CertStatus {
     st
 }
 
+/// Waits before endpoints that gave no certificate are checked again: a service still
+/// starting after a reboot (or being restarted) is no certificate problem.
+pub const CERT_RETRY_WAITS: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(240)];
+
+/// Checks the live endpoints that gave no certificate again after each of `waits`, until
+/// they give one or the waits run out. `wait` returns false to give up (shutdown).
+pub fn recheck_failed(
+    certs: &mut [CertStatus],
+    waits: &[Duration],
+    mut wait: impl FnMut(Duration) -> bool,
+    mut check: impl FnMut(&str) -> CertStatus,
+) {
+    let failed = |c: &CertStatus| !c.file && c.not_after.is_none() && c.error.is_some();
+    for w in waits {
+        if !certs.iter().any(failed) || !wait(*w) {
+            return;
+        }
+        for c in certs.iter_mut().filter(|c| failed(c)) {
+            *c = check(&c.target);
+        }
+    }
+}
+
 fn read_x509(openssl: &PathBuf, file: Option<&std::path::Path>, pem: Option<&[u8]>, st: &mut CertStatus) {
     let mut x509 = Command::new(openssl);
     x509.args(["x509", "-noout", "-startdate", "-enddate", "-text"]);
@@ -356,15 +379,28 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
         }
     }
     if let Some(r) = &s.exposure {
+        if r.firewall() == crate::exposure::Firewall::Absent && r.firewall_checked() && r.listeners.iter().any(|l| l.exposure.is_exposed())
+        {
+            attention.push("no firewall filters incoming traffic: every listener on a public address is reachable".into());
+        }
         for dead in &r.dead_rules {
             attention.push(format!("dead ufw rule {dead} (nothing listens)"));
         }
+    }
+    if let Some(p) = &s.patches {
+        attention.extend(p.concerns());
     }
     attention.extend(d.attention.iter().rev().take(15).cloned());
 
     let total_bans: u32 = d.bans_by_category.values().sum();
     b += &format!("Period {} → {} UTC ({})\n", &fmt_ts(d.since)[..16], &fmt_ts(now)[..16], fmt_duration(now - d.since));
-    b += &format!("Mode: {:?}. Active bans now: {}.\n", s.mode, s.bans.len());
+    let cover = crate::engine::subnet_coverage(&s.bans);
+    let subnets = match cover.widest_v4 {
+        _ if cover.subnets == 0 => String::new(),
+        Some(w) => format!(" ({} subnets: {} IPv4 addresses, widest /{w})", cover.subnets, cover.v4_addresses),
+        None => format!(" ({} subnets)", cover.subnets),
+    };
+    b += &format!("Mode: {:?}. Active bans now: {}{subnets}.\n", s.mode, s.bans.len());
 
     b += "\n⚠ Needs attention:\n";
     if attention.is_empty() {
@@ -397,15 +433,26 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
     let ev: u64 = d.events.values().sum();
     let mut top_ev: Vec<(&crate::event::Signal, &u64)> = d.events.iter().collect();
     top_ev.sort_by_key(|e| std::cmp::Reverse(*e.1));
-    b += &format!("Events: {ev} ({})\n", top_ev.iter().take(5).map(|(s, n)| format!("{} {n}", s.name())).collect::<Vec<_>>().join(", "));
+    let top: Vec<String> = top_ev.iter().take(5).map(|(s, n)| format!("{} {n}", s.name())).collect();
+    b += &if top.is_empty() { format!("Events: {ev}\n") } else { format!("Events: {ev} ({})\n", top.join(", ")) };
 
     if let Some(r) = &s.exposure {
         // "443 docker-proxy" once, whatever sockets (IPv4, IPv6, TCP, UDP) serve it
-        let mut exposed: Vec<String> =
-            r.listeners.iter().filter(|l| l.exposure.is_exposed() && !l.dynamic).map(|l| format!("{} {}", l.key.port, l.process)).collect();
+        let mut exposed: Vec<String> = r
+            .listeners
+            .iter()
+            .filter(|l| l.exposure.is_exposed() && !l.dynamic && !l.honeypot)
+            .map(|l| format!("{} {}", l.key.port, l.process))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         exposed.retain(|e| seen.insert(e.clone()));
         b += &format!("\nExposed: {}\n", if exposed.is_empty() { "nothing".into() } else { exposed.join(", ") });
+        let mut traps: Vec<u16> = r.listeners.iter().filter(|l| l.honeypot).map(|l| l.key.port).collect();
+        traps.sort_unstable();
+        traps.dedup();
+        if !traps.is_empty() {
+            b += &format!("Honeypots: {}\n", traps.iter().map(u16::to_string).collect::<Vec<_>>().join(", "));
+        }
     }
     if s.certs.iter().any(|c| !c.file) {
         let certs: Vec<String> = s
@@ -429,6 +476,18 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
     if !s.allowed.is_empty() {
         b += &format!("Operator allowlist: {} entries\n", s.allowed.len());
     }
+    if let Some(p) = &s.patches {
+        b += &format!("Patches: {}\n", p.summary());
+    }
+    if let Some(v) = &s.verify {
+        b += &format!(
+            "Packages: checked {} ({} files, {} differ from dpkg), {} set-uid/set-gid programs\n",
+            &fmt_ts(v.last_run)[..10],
+            v.checked,
+            v.mismatched,
+            v.suid
+        );
+    }
 
     let flag = if attention.is_empty() { "" } else { "⚠ " };
     (format!("{flag}logguard daily digest"), b)
@@ -437,6 +496,37 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints_without_a_certificate_are_checked_again() {
+        let ok = |t: &str| CertStatus { target: t.into(), not_after: Some(1), ..Default::default() };
+        let down = |t: &str| CertStatus { target: t.into(), error: Some("no certificate received".into()), ..Default::default() };
+        let mut certs = vec![ok("a:443"), down("b:5222/xmpp"), CertStatus { file: true, ..down("/etc/c.pem") }];
+        let (mut waited, mut checked) = (0, vec![]);
+        recheck_failed(
+            &mut certs,
+            &CERT_RETRY_WAITS,
+            |_| {
+                waited += 1;
+                true
+            },
+            |t| {
+                checked.push(t.to_string());
+                if checked.len() < 2 {
+                    down(t)
+                } else {
+                    ok(t)
+                }
+            },
+        );
+        assert_eq!(checked, ["b:5222/xmpp", "b:5222/xmpp"], "only the failed live endpoint, until it answers");
+        assert_eq!(waited, 2);
+        assert!(certs[1].not_after.is_some() && certs[2].error.is_some());
+        // shutting down: no more checks
+        let mut certs = vec![down("b:443")];
+        recheck_failed(&mut certs, &CERT_RETRY_WAITS, |_| false, |_| unreachable!());
+        assert!(certs[0].error.is_some());
+    }
 
     #[test]
     fn openssl_date_and_schedule() {
@@ -513,5 +603,31 @@ mod tests {
         assert_eq!(long.expiry_concern(t("Nov", "10", "00:00:00"), 21), Some(Severity::Warning));
         assert_eq!(long.expiry_concern(t("Nov", "25", "00:00:00"), 21), Some(Severity::High));
         assert_eq!(parse_openssl_date("notBefore=Oct  9 15:04:34 2026 GMT\nnotAfter=Oct 16 07:04:33 2026 GMT", "notBefore="), c.not_before);
+    }
+
+    #[test]
+    fn patches_need_attention() {
+        let mut s = crate::engine::Engine::new(std::sync::Arc::new(crate::config::Config::default()), 0).snapshot(0, 10);
+        s.patches = Some(crate::patches::PatchReport {
+            upgradable: Some(4),
+            security_count: 1,
+            security: vec!["openssl".into()],
+            ..Default::default()
+        });
+        let (subject, body) = render(&DigestData::default(), &s, 21);
+        assert!(subject.starts_with("⚠ "), "{subject}");
+        assert!(body.contains("• 1 security updates pending (openssl): apt upgrade"), "{body}");
+        assert!(body.contains("\nPatches: 1 security updates pending"), "{body}");
+    }
+
+    #[test]
+    fn events_line_lists_the_top_signals_only_when_there_are_some() {
+        let s = crate::engine::Engine::new(std::sync::Arc::new(crate::config::Config::default()), 0).snapshot(0, 10);
+        let mut d = DigestData::default();
+        let (_, body) = render(&d, &s, 21);
+        assert!(body.contains("\nEvents: 0\n"), "{body}");
+        d.events.insert(crate::event::Signal::XmppAuthFail, 3);
+        let (_, body) = render(&d, &s, 21);
+        assert!(body.contains(&format!("\nEvents: 3 ({} 3)\n", crate::event::Signal::XmppAuthFail.name())), "{body}");
     }
 }

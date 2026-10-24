@@ -75,9 +75,30 @@ impl Default for CronCfg {
                 "/root/.ssh/authorized_keys2",
                 "/home/*/.ssh/authorized_keys",
                 "/home/*/.ssh/authorized_keys2",
+                // the keys of hardened hosts (`AuthorizedKeysFile /etc/ssh/authorized_keys/%u`)
+                "/etc/ssh/authorized_keys/*",
                 "/etc/ld.so.preload",
+                "/etc/ld.so.conf.d/*",
                 "/etc/rc.local",
                 "/etc/profile.d/*",
+                "/etc/environment",
+                "/etc/bash.bashrc",
+                "/root/.bashrc",
+                "/root/.profile",
+                // PAM decides who logs in; a module or line added there lets anyone in
+                "/etc/pam.d/*",
+                // apt runs `DPkg::Post-Invoke` hooks as root at every package change
+                "/etc/apt/apt.conf.d/*",
+                // run as root at every login
+                "/etc/update-motd.d/*",
+                // module loading and device rules run commands as root
+                "/etc/modules-load.d/*",
+                "/etc/modprobe.d/*",
+                "/etc/udev/rules.d/*",
+                "/etc/init.d/*",
+                // programs installed by hand (the SSH gateway's shell, logguard itself)
+                "/usr/local/bin/*",
+                "/usr/local/sbin/*",
                 "/etc/systemd/system/*",
                 "/etc/systemd/system/*.wants/*",
                 "/etc/systemd/system/*.d/*.conf",
@@ -128,6 +149,22 @@ pub struct CronReport {
     pub file_patterns: BTreeMap<String, String>,
     pub patterns: Vec<String>,
     pub errors: Vec<String>,
+    /// Path -> fingerprint an installer announced (`logguard expect-change`): a change to
+    /// exactly that content is logged, not alerted.
+    pub expected: BTreeMap<String, String>,
+    /// Path -> the local user who could change it (see [`changed_by`]); paths only root can
+    /// change are left out. Paths gone since the previous scan keep their last value.
+    pub owners: BTreeMap<String, u32>,
+}
+
+/// The first user other than root who owns `path` (the link itself, or what it names) or
+/// a directory above it: that user can change what the path holds. None when only root can.
+pub fn changed_by(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let mine = |m: std::io::Result<std::fs::Metadata>| m.ok().map(|m| m.uid()).filter(|u| *u != 0);
+    mine(std::fs::symlink_metadata(path))
+        .or_else(|| mine(std::fs::metadata(path)))
+        .or_else(|| path.ancestors().skip(1).find_map(|d| mine(std::fs::symlink_metadata(d))))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +247,9 @@ const INTERPRETERS: [&str; 10] = ["sh", "bash", "dash", "zsh", "python", "python
 /// Run the command that follows; their options (and option values that are numbers) are skipped.
 const WRAPPERS: [&str; 9] = ["nice", "ionice", "nohup", "exec", "chronic", "time", "setsid", "stdbuf", "command"];
 /// Package-managed locations: their files change with every upgrade and dpkg vouches for them.
-const SYSTEM_DIRS: [&str; 8] = ["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/lib/", "/usr/share/", "/usr/libexec/"];
+/// And the kernel's: devices and pseudo-files are no scripts, and are never opened.
+const SYSTEM_DIRS: [&str; 11] =
+    ["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/lib/", "/usr/share/", "/usr/libexec/", "/dev/", "/proc/", "/sys/"];
 
 /// The program one simple command runs, looking through wrappers: `sudo -u x /opt/a.sh`,
 /// `flock -n /run/lock /opt/a.sh`, `timeout 1h /opt/a.sh`, `env A=1 /opt/a.sh`,
@@ -323,14 +362,79 @@ const MAX_HASHED: u64 = 16 << 20;
 const MAX_LINES: usize = 500;
 const MAX_LINE_LEN: usize = 1000;
 
-/// Opens a regular file without blocking: script paths come from crontab lines, which
-/// any user can write, and opening a FIFO (or `/dev/tty`) would hang the scan.
-fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+/// How long an announced change stays expected: long enough for an install that is
+/// started, interrupted and finished later, short enough that an old announcement can't
+/// cover a file that is put back years on.
+pub const EXPECT_TTL: Micros = 7 * 86_400 * time::SEC;
+const MAX_EXPECTED: usize = 1000;
+
+/// The announced changes, next to the state file (root-only, like the state itself).
+pub fn expected_path(state_file: &Path) -> PathBuf {
+    state_file.with_file_name("expected-changes")
+}
+
+/// Announced changes younger than [`EXPECT_TTL`]: path -> fingerprint. One per line,
+/// `<micros> <sha256> <path>`; a missing or unreadable file is no announcement.
+pub fn load_expected(path: &Path, now: Micros) -> BTreeMap<String, String> {
+    let text = read_small(path).unwrap_or_default();
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let mut f = line.splitn(3, ' ');
+        let (Some(ts), Some(fp), Some(p)) = (f.next().and_then(|t| t.parse::<Micros>().ok()), f.next(), f.next()) else { continue };
+        if now - ts < EXPECT_TTL && ts <= now + 60 * time::SEC && fp.len() == 64 && p.starts_with('/') {
+            out.insert(p.to_string(), fp.to_string());
+        }
+    }
+    out
+}
+
+/// Adds announcements (path, fingerprint) to the file: replaces older ones for the same
+/// paths and drops expired ones, then writes the file anew (mode 0600).
+pub fn record_expected(path: &Path, new: &[(String, String)], now: Micros) -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    if let Some((p, _)) = new.iter().find(|(p, _)| !p.starts_with('/') || p.contains(['\n', '\r'])) {
+        return Err(std::io::Error::other(format!("not an absolute one-line path: {p:?}")));
+    }
+    let text = read_small(path).unwrap_or_default();
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let mut f = l.splitn(3, ' ');
+            let ts = f.next().and_then(|t| t.parse::<Micros>().ok());
+            let p = f.nth(1);
+            ts.is_some_and(|t| now - t < EXPECT_TTL) && p.is_some_and(|p| !new.iter().any(|(n, _)| n == p))
+        })
+        .collect();
+    let added: Vec<String> = new.iter().map(|(p, fp)| format!("{now} {fp} {p}")).collect();
+    lines.extend(added.iter().map(String::as_str));
+    let keep = lines.len().saturating_sub(MAX_EXPECTED);
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    for l in &lines[keep..] {
+        writeln!(f, "{l}")?;
+    }
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Opens a regular file, and nothing else: script paths come from crontab lines, which any
+/// user can write. Opening a FIFO would hang the scan, and opening a device can do
+/// something (start a watchdog, or make a terminal the daemon's controlling one, whose
+/// hangup would stop it). So the path is checked first, and opened without blocking, as no
+/// controlling terminal, and only if it is still the same file.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     const O_NONBLOCK: i32 = if cfg!(target_os = "linux") { 0o4000 } else { 0x0004 };
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(path)?;
-    if !f.metadata()?.is_file() {
+    const O_NOCTTY: i32 = if cfg!(target_os = "linux") { 0o400 } else { 0x20000 };
+    let before = std::fs::metadata(path)?;
+    if !before.is_file() {
         return Err(std::io::Error::other("not a regular file"));
+    }
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK | O_NOCTTY).open(path)?;
+    let m = f.metadata()?;
+    if !m.is_file() || (m.dev(), m.ino()) != (before.dev(), before.ino()) {
+        return Err(std::io::Error::other("replaced while being opened"));
     }
     Ok(f)
 }
@@ -343,12 +447,28 @@ fn stamp(m: &std::fs::Metadata) -> Stamp {
     (m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec())
 }
 
-/// SHA-256 of a file's content (the first 16 MB of bigger ones, plus its size).
-fn fingerprint(path: &Path) -> std::io::Result<String> {
+/// Bytes hashed of a file root owns: all of a large program (a change past its first 16 MB
+/// must show too). Only root writes those, so nobody else can make the watch hash them again
+/// and again; a user's own file (a script their crontab runs) is hashed up to `MAX_HASHED`.
+const MAX_HASHED_ROOT: u64 = 1 << 30;
+
+fn hashed_bytes(uid: u32) -> u64 {
+    if uid == 0 {
+        MAX_HASHED_ROOT
+    } else {
+        MAX_HASHED
+    }
+}
+
+/// SHA-256 of a file's content (the start of bigger ones, plus their size: see
+/// [`hashed_bytes`]).
+pub fn fingerprint(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
     let f = open_regular(path)?;
-    let len = f.metadata()?.len();
+    let meta = f.metadata()?;
+    let (len, max) = (meta.len(), hashed_bytes(meta.uid()));
     let mut h = Sha256::new();
-    let mut r = f.take(MAX_HASHED);
+    let mut r = f.take(max);
     let mut buf = vec![0u8; 64 << 10];
     loop {
         let n = r.read(&mut buf)?;
@@ -357,7 +477,7 @@ fn fingerprint(path: &Path) -> std::io::Result<String> {
         }
         h.update(&buf[..n]);
     }
-    if len > MAX_HASHED {
+    if len > max {
         h.update(len.to_le_bytes());
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
@@ -418,6 +538,8 @@ fn symlink_value(path: &Path) -> Option<String> {
 pub struct Scanner {
     known: HashMap<String, (String, Origin)>,
     hashes: HashMap<String, (Stamp, String)>,
+    /// The previous scan's `CronReport::owners`, for what is gone since.
+    owners: BTreeMap<String, u32>,
 }
 
 impl Scanner {
@@ -545,6 +667,12 @@ impl Scanner {
             r.origins.insert(p.clone(), o.clone());
             self.known.insert(p.clone(), (files[&p].clone(), o));
         }
+        let paths: BTreeSet<&str> = r.items.keys().map(Key::path).collect();
+        let present: BTreeMap<String, u32> = paths.iter().filter_map(|p| changed_by(Path::new(p)).map(|u| (p.to_string(), u))).collect();
+        // what is gone since the last scan was its user's to remove
+        let gone = std::mem::replace(&mut self.owners, present.clone()).into_iter().filter(|(p, _)| !paths.contains(p.as_str()));
+        r.owners = present;
+        r.owners.extend(gone);
         r
     }
 }
@@ -554,7 +682,7 @@ impl Scanner {
 /// `dpkg-query -S` / `dpkg --verify` instead would load every package's file list and hash
 /// every file of the owning packages, all charged to logguard's memory limit.
 /// Symlinks (enabled timers) are judged by the unit file they point to. Unknown = local.
-fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origin> {
+pub(crate) fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origin> {
     use std::io::BufRead;
     // Path as dpkg may know it -> path as watched. On merged-/usr systems dpkg may list a
     // file under /lib rather than /usr/lib.
@@ -632,7 +760,7 @@ fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origin> {
         .collect()
 }
 
-fn md5_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn md5_file(path: &Path) -> std::io::Result<String> {
     use md5::{Digest as _, Md5};
     let mut r = open_regular(path)?;
     let mut h = Md5::new();
@@ -705,6 +833,9 @@ pub struct Finding {
     pub evidence: Vec<String>,
     /// Notify admins (false: only logged).
     pub notify: bool,
+    /// The local user (not root) whose own file or process this is about, who could have made
+    /// the change: their alerts share an hourly budget (see `Engine::findings`).
+    pub owner: Option<u32>,
 }
 
 fn quote(s: &str) -> String {
@@ -733,6 +864,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             message: format!("cron watch cannot read {e}"),
             evidence: vec![],
             notify: true,
+            owner: None,
         });
     }
     let Some(b) = baseline.as_mut() else {
@@ -763,6 +895,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             ),
             evidence: vec![],
             notify: true,
+            owner: None,
         });
         return out;
     };
@@ -808,6 +941,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             ),
             evidence: vec![],
             notify: false,
+            owner: None,
         });
     } else if learned_files > 0 {
         out.push(Finding {
@@ -820,6 +954,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             ),
             evidence: vec![],
             notify: true,
+            owner: None,
         });
     }
     b.patterns = r.patterns.iter().cloned().collect();
@@ -862,14 +997,24 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
         };
         let mut evidence: Vec<String> = lines.iter().filter(|(c, _)| *c == '+').map(|(_, l)| format!("+ {}", quote(l))).collect();
         evidence.extend(lines.iter().filter(|(c, _)| *c == '-').map(|(_, l)| format!("- {}", quote(l))));
-        if learning {
+        // An installer announced this very content (logguard's own binaries and units at
+        // every deploy): logged, not news.
+        let announced = match file_change {
+            Some(('+' | '~', k @ (Key::File(_) | Key::Task(_) | Key::Script(_)))) => {
+                r.items.get(k).is_some_and(|fp| r.expected.get(&path) == Some(fp))
+            }
+            _ => false,
+        };
+        if learning || announced {
+            let why = if learning { "cron watch (learning, accepted)" } else { "integrity (announced by an installer, accepted)" };
             out.push(Finding {
                 key: format!("cron-learning:{path}:{now}"),
                 every: 0,
                 severity: Severity::Info,
-                message: format!("cron watch (learning, accepted): {message}"),
+                message: format!("{why}: {message}"),
                 evidence,
                 notify: false,
+                owner: None,
             });
             continue;
         }
@@ -888,6 +1033,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             message: format!("{what}: {message}{advice}"),
             evidence,
             notify: true,
+            owner: r.owners.get(&path).copied(),
         });
     }
     if !learning && !b.armed {
@@ -907,6 +1053,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             ),
             evidence: vec![],
             notify: true,
+            owner: None,
         });
     }
     out
@@ -1003,6 +1150,48 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Warning);
         assert!(f[0].message.contains("1 task line removed"));
+    }
+
+    #[test]
+    fn announced_changes_are_logged_not_alerted() {
+        let h = 3600 * time::SEC;
+        let bin = "/usr/local/bin/logguard";
+        let rep = |t: Micros, fp: &str, expected: &[(&str, &str)]| {
+            let mut r = report(t, &[(Key::File(bin.into()), fp)]);
+            r.patterns = vec!["/usr/local/bin/*".into()];
+            r.file_patterns.insert(bin.into(), "/usr/local/bin/*".into());
+            r.expected = expected.iter().map(|(p, f)| (p.to_string(), f.to_string())).collect();
+            r
+        };
+        let mut b = None;
+        judge(&mut b, &rep(h, "aa", &[]), Dur(0));
+        // the installer announced exactly this content
+        let f = judge(&mut b, &rep(2 * h, "bb", &[(bin, "bb")]), Dur(0));
+        assert!(f.len() == 1 && !f[0].notify && f[0].severity == Severity::Info, "{f:?}");
+        assert!(f[0].message.contains("announced by an installer") && f[0].message.contains(bin), "{}", f[0].message);
+        // other content than announced: the usual alert
+        let f = judge(&mut b, &rep(3 * h, "cc", &[(bin, "bb")]), Dur(0));
+        assert!(f.len() == 1 && f[0].notify && f[0].severity == Severity::High, "{f:?}");
+    }
+
+    #[test]
+    fn announcements_are_kept_for_a_while() {
+        let dir = std::env::temp_dir().join(format!("logguard-expect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = expected_path(&dir.join("state.json"));
+        let (fa, fb) = ("a".repeat(64), "b".repeat(64));
+        let day = 86_400 * time::SEC;
+        record_expected(&path, &[("/usr/local/bin/x".into(), fa.clone()), ("/etc/y z".into(), fa.clone())], day).unwrap();
+        record_expected(&path, &[("/usr/local/bin/x".into(), fb.clone())], 2 * day).unwrap();
+        let e = load_expected(&path, 2 * day);
+        assert_eq!(e.len(), 2);
+        assert_eq!(e["/usr/local/bin/x"], fb, "a newer announcement replaces the older");
+        assert_eq!(e["/etc/y z"], fa, "paths may hold spaces");
+        assert_eq!(load_expected(&path, day + EXPECT_TTL).len(), 1, "expired after EXPECT_TTL");
+        assert!(record_expected(&path, &[("relative".into(), fa.clone())], day).is_err());
+        assert!(record_expected(&path, &[("/a\nb".into(), fa)], day).is_err());
+        assert!(load_expected(&dir.join("missing"), day).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1144,9 +1333,66 @@ mod tests {
         let r4 = s.scan(&cfg);
         let fp = fifo.display().to_string();
         assert_eq!(r4.items[&Key::Script(fp)], "unreadable: not a regular file");
+        // devices are never opened: not as scripts, nor through a link to one
+        assert!(scripts_in("/dev/pts/7").is_empty() && scripts_in("bash /proc/self/fd/0").is_empty());
+        let link = dir.join("to-a-device");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert_eq!(open_regular(&link).unwrap_err().to_string(), "not a regular file");
         let big_lines: Vec<_> = r4.items.keys().filter(|k| matches!(k, Key::Line(p, _) if p.ends_with("/big"))).collect();
         assert_eq!(big_lines.len(), 1, "{big_lines:?}");
         assert!(matches!(big_lines[0], Key::Line(_, l) if l.starts_with("(601 task lines, sha256 ")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A change is a local user's to make when they own the file, the link to it, or a
+    /// directory above it; and stays theirs once the file is gone.
+    #[test]
+    fn whose_change_it_could_be() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("logguard-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let mine = (me != 0).then_some(me);
+        let script = dir.join("job.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(changed_by(&script), mine);
+        assert_eq!(changed_by(&dir.join("not-there-yet")), mine, "the directory is the user's");
+        assert_eq!(changed_by(Path::new("/bin/sh")), None, "only root changes the system's programs");
+
+        let crontab = dir.join("crontab");
+        std::fs::write(&crontab, format!("* * * * * {}\n", script.display())).unwrap();
+        let cfg = CronCfg { crontabs: vec![crontab.display().to_string()], dirs: vec![], files: vec![], ..Default::default() };
+        let mut s = Scanner::default();
+        let r = s.scan(&cfg);
+        let (cp, sp) = (crontab.display().to_string(), script.display().to_string());
+        assert_eq!((r.owners.get(&cp).copied(), r.owners.get(&sp).copied()), (mine, mine));
+        std::fs::remove_file(&crontab).unwrap();
+        assert_eq!(s.scan(&cfg).owners.get(&cp).copied(), mine, "a removed crontab is still its user's");
+        assert_eq!(s.scan(&cfg).owners.get(&cp), None, "for one scan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program root owns is hashed whole (a change deep in a large one must show); anyone
+    /// else's file only to its first 16 MB, as its owner can make it huge and touch it often.
+    #[test]
+    fn how_much_of_a_file_is_hashed() {
+        use std::io::{Seek, Write};
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((hashed_bytes(0), hashed_bytes(1000)), (MAX_HASHED_ROOT, MAX_HASHED));
+        let dir = std::env::temp_dir().join(format!("logguard-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_HASHED + (1 << 20)).unwrap();
+        let before = fingerprint(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(MAX_HASHED + 4096)).unwrap();
+        f.write_all(b"patched").unwrap();
+        drop(f);
+        let after = fingerprint(&path).unwrap();
+        let owner = std::fs::metadata(&path).unwrap().uid();
+        assert_eq!(before == after, owner != 0, "owner uid {owner}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

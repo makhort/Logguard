@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::cluster::{ClusterCfg, Fact, FactBody};
 use crate::config::{Config, Mode};
 use crate::event::{Event, Signal};
-use crate::exposure::{ExposureReport, ListenerKey};
+use crate::exposure::{ExposureReport, Firewall, ListenerKey};
 use crate::i18n::UserNotice;
 use crate::net::Net;
 use crate::record::Source;
@@ -35,6 +35,11 @@ const MAX_ACCOUNTS: usize = 50_000;
 /// Addresses remembered per attacked account: enough to see a distributed attack, bounded
 /// so a large botnet can't make every failure scan a huge list.
 const MAX_ACCOUNT_IPS: usize = 1000;
+/// Alert rate-limit entries kept besides the system ones (see `Engine::gc`).
+const MAX_ALERT_GATE: usize = 50_000;
+/// Integrity alerts about one local user's own files and processes sent per hour (see
+/// `Engine::findings`).
+const USER_ALERTS_PER_HOUR: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -166,6 +171,27 @@ pub struct Ban {
     /// overlapping elements, so they are set aside and reinstated when this one ends.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inner: Vec<Ban>,
+}
+
+/// What the subnet bans among some bans cover, to show how far they reach.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SubnetCoverage {
+    pub subnets: usize,
+    /// IPv4 addresses in them (an IPv6 /64 alone holds 2^64).
+    pub v4_addresses: u64,
+    pub widest_v4: Option<u8>,
+}
+
+pub fn subnet_coverage(bans: &[Ban]) -> SubnetCoverage {
+    let mut c = SubnetCoverage::default();
+    for n in bans.iter().map(|b| b.net).filter(|n| !n.is_host()) {
+        c.subnets += 1;
+        if n.is_v4() {
+            c.v4_addresses += 1u64 << (32 - u32::from(n.prefix.min(32)));
+            c.widest_v4 = Some(c.widest_v4.map_or(n.prefix, |w| w.min(n.prefix)));
+        }
+    }
+    c
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -301,15 +327,23 @@ pub struct IpState {
 /// Digest category of a ban, from the dominant signal.
 fn category_of(s: Signal) -> &'static str {
     match s {
-        Signal::FwTripwire => "tripwire",
+        Signal::FwTripwire | Signal::TripwireConnect => "tripwire",
         s if s.is_canary() => "canary",
         Signal::FwBlock | Signal::FwLimit => "port scan",
         Signal::PeerReport => "cluster evidence",
         s if s.source() == Source::Ssh => "ssh",
         s if s.source() == Source::Ejabberd => "xmpp",
         s if s.source() == Source::Nextcloud => "web",
+        s if s.source() == Source::Custom => "custom",
         _ => "other",
     }
+}
+
+/// Whether these offences are all blocked packets, whose source address is easily forged
+/// (a peer's report is not, nor a completed handshake with a honeypot listener).
+fn firewall_only(offences: impl Iterator<Item = Signal>) -> bool {
+    let mut any = false;
+    offences.inspect(|_| any = true).all(|s| s.source() == Source::Ufw && s != Signal::TripwireConnect) && any
 }
 
 /// Private, loopback, link-local, CGNAT, multicast and unspecified addresses: local
@@ -390,9 +424,32 @@ struct AccountState {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MinuteBucket {
     pub minute: Micros,
-    pub events: [u32; 5],
+    /// Events per source (`Source as usize`).
+    pub events: Vec<u32>,
     pub bans: u32,
 }
+
+impl MinuteBucket {
+    fn count(&mut self, source: Source) {
+        let i = source as usize;
+        if self.events.len() <= i {
+            self.events.resize(i + 1, 0);
+        }
+        self.events[i] = self.events[i].saturating_add(1);
+    }
+}
+
+/// The SSH keys an account has logged in with.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SshKeys {
+    /// When the first was seen: keys are learned silently for `learning_period` after it.
+    pub since: Micros,
+    pub keys: BTreeSet<String>,
+}
+
+/// Keys remembered per account, and accounts with keys.
+const MAX_KEYS: usize = 32;
+const MAX_KEY_ACCOUNTS: usize = 1000;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stats {
@@ -497,6 +554,21 @@ pub struct Snapshot {
     /// Set when the snapshot was built from a decision log (`tui --actions`), not the daemon.
     #[serde(default)]
     pub actions_log: Option<crate::actions_view::LogSummary>,
+    /// The latest patch status, when `[patches]` is enabled.
+    #[serde(default)]
+    pub patches: Option<crate::patches::PatchReport>,
+    /// The last package and set-uid check (`[verify]`).
+    #[serde(default)]
+    pub verify: Option<crate::verify::VerifyView>,
+    /// Outbound connections learned (`[procwatch]`).
+    #[serde(default)]
+    pub procwatch: Option<crate::procwatch::ProcView>,
+    /// Addresses the `[allowlist] hosts` names resolve to now.
+    #[serde(default)]
+    pub allow_hosts: Vec<Net>,
+    /// The `[[patterns]]` entries and what each found.
+    #[serde(default)]
+    pub patterns: Vec<crate::parse::custom::PatternView>,
 }
 
 /// Where the trouble comes from, for the Countries and Map tabs.
@@ -562,6 +634,8 @@ const COUNTRY_ISPS: usize = 50;
 /// Distinct ports counted per country: forged UDP can name any port from any country,
 /// so this bounds the memory (about 75,000 counters at most); only the top 40 are shown.
 const COUNTRY_PORTS: usize = 300;
+/// Busiest addresses per pattern in a snapshot.
+const PATTERN_TOP_IPS: usize = 20;
 
 /// Persisted across restarts.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -589,6 +663,9 @@ pub struct PersistedState {
     /// Exposed listeners accepted as normal (learned on the first scan).
     #[serde(default)]
     pub exposure_baseline: Option<Vec<(ListenerKey, String)>>,
+    /// The firewall that baseline was learned under (None: by a version reading only ufw).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_firewall: Option<crate::exposure::Firewall>,
     #[serde(default)]
     pub allowed: Vec<OperAllow>,
     #[serde(default)]
@@ -609,6 +686,18 @@ pub struct PersistedState {
     /// Probed-port counters of the Countries tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<PortCounts>,
+    /// SSH keys per account (`ssh:alice`), for new-key alerts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ssh_keys: BTreeMap<String, SshKeys>,
+    /// Package and set-uid check results accepted (None until the first pass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyBaseline>,
+    /// Outbound connections learned (None until the first scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procwatch: Option<crate::procwatch::ProcBaseline>,
+    /// What each `[[patterns]]` entry found, for the Patterns tab.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<crate::parse::custom::PatternStats>,
 }
 
 /// The state file's bytes: gzip-compressed JSON (`zcat state.json | jq` to read it).
@@ -649,6 +738,8 @@ pub struct Engine {
     alerts: VecDeque<Action>,
     /// None until the first exposure scan has been learned.
     exposure_baseline: Option<BTreeMap<ListenerKey, (String, u32)>>,
+    /// The firewall the baseline was learned under.
+    exposure_firewall: Option<crate::exposure::Firewall>,
     exposure_pending: BTreeMap<ListenerKey, u32>,
     /// Consecutive scans each ufw rule has had nothing listening behind it.
     dead_pending: BTreeMap<String, u32>,
@@ -687,6 +778,23 @@ pub struct Engine {
     port_hits_cc: HashMap<[u8; 2], HashMap<u16, u64>>,
     /// When the port counters were last halved (daily).
     ports_halved: Micros,
+    /// Addresses `[allowlist] hosts` resolve to: allowlisted like `[allowlist] nets`.
+    allow_hosts: Vec<Net>,
+    /// Each SSH account's latest login (address, time), named in su/sudo alerts.
+    last_ssh: HashMap<String, (IpAddr, Micros)>,
+    ssh_keys: HashMap<String, SshKeys>,
+    /// Failed su/sudo attempts per user: (count, first, last).
+    priv_fails: HashMap<String, (u32, Micros, Micros)>,
+    /// When integrity alerts about each local user's own things were sent, the last hour.
+    user_alerts: HashMap<u32, VecDeque<Micros>>,
+    /// Set by the daemon after each `[patches]` reading.
+    pub patches: Option<crate::patches::PatchReport>,
+    verify: Option<crate::verify::VerifyBaseline>,
+    verify_view: Option<crate::verify::VerifyView>,
+    procwatch: Option<crate::procwatch::ProcBaseline>,
+    proc_view: Option<crate::procwatch::ProcView>,
+    /// One per `[[patterns]]` entry, in the configuration's order.
+    pattern_stats: Vec<crate::parse::custom::PatternStats>,
 }
 
 /// Per-source liveness, for "this log went quiet" alerts.
@@ -701,7 +809,7 @@ struct SilenceState {
 
 impl Engine {
     pub fn new(cfg: Arc<Config>, now: Micros) -> Self {
-        Engine {
+        let mut e = Engine {
             cfg,
             now,
             started: now,
@@ -717,6 +825,7 @@ impl Engine {
             recent: VecDeque::new(),
             alerts: VecDeque::new(),
             exposure_baseline: None,
+            exposure_firewall: None,
             exposure_pending: BTreeMap::new(),
             dead_pending: BTreeMap::new(),
             exposure_last: None,
@@ -743,6 +852,40 @@ impl Engine {
             port_hits: HashMap::new(),
             port_hits_cc: HashMap::new(),
             ports_halved: now,
+            allow_hosts: vec![],
+            last_ssh: HashMap::new(),
+            ssh_keys: HashMap::new(),
+            priv_fails: HashMap::new(),
+            user_alerts: HashMap::new(),
+            patches: None,
+            verify: None,
+            verify_view: None,
+            procwatch: None,
+            proc_view: None,
+            pattern_stats: Vec::new(),
+        };
+        e.set_pattern_stats(Vec::new());
+        e
+    }
+
+    /// Statistics for each configured pattern: the saved ones by name, new ones empty; those
+    /// of patterns no longer configured are dropped.
+    fn set_pattern_stats(&mut self, mut saved: Vec<crate::parse::custom::PatternStats>) {
+        self.pattern_stats = self
+            .cfg
+            .patterns
+            .iter()
+            .map(|p| match saved.iter().position(|s| s.name == p.name) {
+                Some(i) => saved.swap_remove(i),
+                None => crate::parse::custom::PatternStats::new(&p.name),
+            })
+            .collect();
+    }
+
+    /// Counts a line from pattern `name`'s sender, and what the pattern made of it.
+    pub fn count_pattern(&mut self, name: &str, ts: Micros, outcome: crate::parse::custom::Outcome, line: &str) {
+        if let Some(st) = self.pattern_stats.iter_mut().find(|s| s.name == name) {
+            st.count(ts, outcome, line);
         }
     }
 
@@ -752,11 +895,24 @@ impl Engine {
         accounts.into_iter().filter(|a| self.account_first_seen.contains_key(a)).collect()
     }
 
-    /// Networks wider than anything logguard bans itself (default /16, IPv6 /32): a peer
-    /// sending one is broken or compromised, and a /1 ban or allowlist entry would be a disaster.
+    /// Allowlist entries wider than anything logguard bans itself (default /16, IPv6 /32): a
+    /// peer sending one is broken or compromised, and a /1 entry would be a disaster.
     fn too_wide(&self, net: &Net) -> bool {
         let sc = &self.cfg.subnets;
         net.prefix < if net.is_v4() { sc.v4_wide_prefix.min(16) } else { sc.v6_prefix.min(32) }
+    }
+
+    /// Bans wider than this node's own: `v4_wide_prefix` (`v4_prefix` without growth), IPv6
+    /// `v6_prefix`. Bans kept narrow here stay narrow whatever the peers decide.
+    fn wider_than_own_bans(&self, net: &Net) -> bool {
+        let sc = &self.cfg.subnets;
+        net.prefix
+            < match (net.is_v4(), sc.wide_enabled) {
+                (true, true) => sc.v4_wide_prefix,
+                (true, false) => sc.v4_prefix,
+                (false, true) => sc.v6_wide_prefix,
+                (false, false) => sc.v6_prefix,
+            }
     }
 
     /// "Germany / Hetzner Online GmbH (AS24940)", if a geo database is loaded and knows the address.
@@ -888,11 +1044,15 @@ impl Engine {
     }
 
     /// Host-integrity findings become alerts on the wall clock; those not meant for the
-    /// admins (routine results, changes accepted while learning) are only logged.
+    /// admins (routine results, changes accepted while learning) are only logged. So are those
+    /// about a local user's own crontab, scripts, files and processes beyond
+    /// `USER_ALERTS_PER_HOUR` an hour (one more alert says so): any account can change those
+    /// every minute, and must not use up the hour's messages about the host's integrity.
     fn findings(&mut self, findings: Vec<crate::cronwatch::Finding>, wall: Micros) -> Vec<Action> {
         let engine_time = self.now;
         self.now = self.now.max(wall);
         let mut out = Vec::new();
+        let mut held: BTreeMap<u32, Severity> = BTreeMap::new();
         for f in findings {
             if f.every > 0 {
                 if self.alert_gate.get(&f.key).is_some_and(|t| self.now - t < f.every) {
@@ -900,17 +1060,27 @@ impl Engine {
                 }
                 self.alert_gate.insert(f.key, self.now);
             }
+            let mut message = f.message;
+            let mut notify = f.notify;
+            if let Some(uid) = f.owner.filter(|_| notify) {
+                if !self.user_alert_allowed(uid) {
+                    notify = false;
+                    message += &format!(" [only logged: uid {uid} had its {USER_ALERTS_PER_HOUR} alerts this hour]");
+                    let worst = held.entry(uid).or_insert(f.severity);
+                    *worst = (*worst).max(f.severity);
+                }
+            }
             let a = Action {
                 ts: self.now,
                 kind: ActionKind::Alert,
                 severity: f.severity,
                 target: None,
                 until: None,
-                message: f.message,
+                message,
                 evidence: f.evidence,
                 superseded: vec![],
                 applied: false,
-                topic: f.notify.then_some(Topic::Integrity),
+                topic: notify.then_some(Topic::Integrity),
                 accounts: vec![],
                 user_note: None,
                 notice: None,
@@ -918,8 +1088,46 @@ impl Engine {
             };
             self.push_action(a, &mut out);
         }
+        for (uid, severity) in held {
+            let who = std::fs::read_to_string("/etc/passwd")
+                .ok()
+                .and_then(|p| crate::botbox::user_name(&p, uid))
+                .map_or(format!("uid {uid}"), |n| format!("{n} (uid {uid})"));
+            self.alert_about(
+                format!("user-flood:{uid}"),
+                3600 * crate::time::SEC,
+                severity,
+                None,
+                format!(
+                    "integrity: more than {USER_ALERTS_PER_HOUR} alerts this hour about the own crontab, scripts, files or processes \
+                     of {who}: the rest of this hour's are only logged (logguard tui, Alerts tab; the actions log)"
+                ),
+                Some(Topic::Integrity),
+                vec![],
+                None,
+                &mut out,
+            );
+        }
         self.now = engine_time;
         out
+    }
+
+    /// Whether one more integrity alert about local user `uid`'s own things may go to the
+    /// admins this hour (and counts it if so).
+    fn user_alert_allowed(&mut self, uid: u32) -> bool {
+        let (now, hour) = (self.now, 3600 * crate::time::SEC);
+        if self.user_alerts.len() >= 1000 && !self.user_alerts.contains_key(&uid) {
+            self.user_alerts.retain(|_, sent| sent.back().is_some_and(|t| now - t < hour));
+        }
+        let sent = self.user_alerts.entry(uid).or_default();
+        while sent.front().is_some_and(|t| now - t >= hour) {
+            sent.pop_front();
+        }
+        if sent.len() >= USER_ALERTS_PER_HOUR {
+            return false;
+        }
+        sent.push_back(now);
+        true
     }
 
     /// Raises an operational alert (not tied to an address), rate-limited per key.
@@ -945,11 +1153,19 @@ impl Engine {
     }
 
     /// Whether a trusted `ip`'s offences all come from services it logged in to: a login
-    /// excuses that service's typos and reconnects, never canary names, tripwire ports,
-    /// other services or peers' reports.
+    /// excuses that service's typos and reconnects, never canary names, other services or
+    /// peers' reports. Blocked packets (tripwire ports included) are excused by any recent
+    /// login: one forged SYN carries any source address.
     fn trust_covers(&self, ip: IpAddr, st: &IpState) -> bool {
         let mut offences = st.counts.iter().filter(|(s, n)| *n > 0 && !s.is_success()).peekable();
-        offences.peek().is_some() && offences.all(|(s, _)| !s.is_canary() && s != Signal::FwTripwire && self.trusted_for(ip, s.source()))
+        offences.peek().is_some()
+            && offences.all(|(s, _)| {
+                if s.source() == Source::Ufw {
+                    self.is_trusted(ip)
+                } else {
+                    !s.is_canary() && self.trusted_for(ip, s.source())
+                }
+            })
     }
 
     /// Why an address must never be banned, whatever it did, if it must not (trust from a
@@ -965,6 +1181,8 @@ impl Engine {
             Some("operator allowlist")
         } else if self.allowlisted(ip) {
             Some("allowlisted")
+        } else if self.allow_hosts.iter().any(|n| n.contains(ip)) {
+            Some("allowlisted host name")
         } else {
             None
         }
@@ -984,6 +1202,7 @@ impl Engine {
         self.cfg.allowlist.nets.iter().any(|n| n.overlaps(net))
             || self.peer_nets.iter().any(|n| n.overlaps(net))
             || self.own_nets.iter().any(|n| n.overlaps(net))
+            || self.allow_hosts.iter().any(|n| n.overlaps(net))
             || self.allowed.values().any(|a| a.until > self.now && a.net.overlaps(net))
             // a user's login keeps their neighbours' subnet from being banned wholesale, but
             // never shields the address itself (host bans are decided by `shield`)
@@ -1091,7 +1310,8 @@ impl Engine {
         self.push_action(a, out);
     }
 
-    fn ban(&mut self, net: Net, reason: String, evidence: Vec<String>, category: &str, out: &mut Vec<Action>) {
+    /// `forgeable`: the evidence is firewall logs only (see [`FactBody::Ban`]).
+    fn ban(&mut self, net: Net, reason: String, evidence: Vec<String>, category: &str, forgeable: bool, out: &mut Vec<Action>) {
         let now = self.now;
         let ladder = &self.cfg.bans.ladder;
         let forgive = self.cfg.bans.forgive_after.micros();
@@ -1105,7 +1325,7 @@ impl Engine {
         let offence = off.count;
         let until = now + dur.micros();
         if let Some(ob) = self.outbox.as_mut() {
-            ob.push(FactBody::Ban { net, until, reason: reason.clone() });
+            ob.push(FactBody::Ban { net, until, reason: reason.clone(), forgeable });
         }
         let place = self.place(net.addr).map(|p| format!(" [{p}]")).unwrap_or_default();
         let message = format!("ban {net}{place} for {dur} (offence #{offence}): {reason}");
@@ -1193,9 +1413,8 @@ impl Engine {
         let src = ev.signal.source();
         self.silence.last_event.insert(src, self.now);
         self.silence.lines_since_event.insert(src, 0);
-        let src_idx = ev.signal.source() as usize;
         if let Some(b) = self.stats.bucket(ev.ts) {
-            b.events[src_idx] += 1;
+            b.count(src);
         }
         if self.ips.len() >= self.cfg.scoring.max_tracked_ips {
             self.gc(true);
@@ -1206,10 +1425,15 @@ impl Engine {
             return out;
         }
 
-        // a login to this service excuses its background noise; one to another service doesn't
-        let protected = self.hard_protection(ev.ip).is_some() || self.trusted_for(ev.ip, ev.signal.source());
+        // A login to this service excuses its background noise; one to another service doesn't.
+        // Blocked packets are excused by any recent login: their source address is forged with
+        // a single SYN, or is a carrier NAT the user shares.
+        let protected = self.hard_protection(ev.ip).is_some()
+            || self.trusted_for(ev.ip, ev.signal.source())
+            || (ev.signal.source() == Source::Ufw && self.is_trusted(ev.ip));
         let cfg = Arc::clone(&self.cfg);
-        let mut points = cfg.weight(ev.signal);
+        // a pattern of your own sets its own points
+        let mut points = ev.points.unwrap_or_else(|| cfg.weight(ev.signal));
         if is_non_global(ev.ip) {
             return out;
         }
@@ -1233,6 +1457,7 @@ impl Engine {
                     | Signal::SshPreauth
                     | Signal::FwBlock
                     | Signal::FwTripwire
+                    | Signal::TripwireConnect
             )
         {
             // Background noise from your own devices is expected; only real failures count.
@@ -1310,7 +1535,10 @@ impl Engine {
             }
         }
         st.add(points + bonus);
-        st.report_points += points + bonus;
+        // What protection excuses here isn't for peers to ban on either.
+        if !protected {
+            st.report_points += points + bonus;
+        }
         if points + bonus > 0.0 {
             *self.digest.points.entry(ev.ip).or_default() += points + bonus;
         }
@@ -1341,7 +1569,8 @@ impl Engine {
                 let mut c: Vec<(Signal, u64)> = st.counts.iter().filter(|(s, _)| !s.is_success() && *s != Signal::PeerReport).collect();
                 c.sort_by_key(|x| std::cmp::Reverse(x.1));
                 let signals = c.iter().take(3).map(|(s, n)| format!("{n}x {}", s.name())).collect::<Vec<_>>().join(", ");
-                reports.push(FactBody::Report { ip: *ip, points: (st.report_points * 10.0).round() / 10.0, signals });
+                let forgeable = firewall_only(c.iter().map(|(s, _)| *s));
+                reports.push(FactBody::Report { ip: *ip, points: (st.report_points * 10.0).round() / 10.0, signals, forgeable });
                 st.report_points = 0.0;
             }
         }
@@ -1358,12 +1587,14 @@ impl Engine {
         self.now = now;
         let origin = &fact.origin;
         match &fact.body {
-            FactBody::Ban { net, until, reason } => {
-                if self.too_wide(net) {
+            FactBody::Ban { net, until, reason, forgeable } => {
+                if self.wider_than_own_bans(net) {
                     return out;
                 }
                 let until = (*until).min(now + ccfg.max_remote_ban.micros());
-                let protected = self.net_protected(net) || (net.is_host() && self.hard_protection(net.addr).is_some());
+                // (a forged packet there must not lock out someone who logged in here)
+                let protected = self.net_protected(net)
+                    || (net.is_host() && (self.hard_protection(net.addr).is_some() || (*forgeable && self.is_trusted(net.addr))));
                 if until <= now || protected || self.covering_ban(net).is_some() {
                     return out;
                 }
@@ -1383,18 +1614,18 @@ impl Engine {
             FactBody::Unban { net, reason } => {
                 self.unban(*net, &format!("lifted by peer {origin}: {reason}"), Severity::Info, &mut out);
             }
-            FactBody::Report { ip, points, signals } => {
+            FactBody::Report { ip, points, signals, forgeable } => {
                 // NaN is rejected too; one report can't add more than a ban's worth.
                 // (`min` would turn NaN into the threshold, so check first)
                 let points = points * ccfg.report_factor;
-                if points.is_nan() || points <= 0.0 || self.hard_protection(*ip).is_some() {
+                if points.is_nan() || points <= 0.0 || self.hard_protection(*ip).is_some() || (*forgeable && self.is_trusted(*ip)) {
                     return out;
                 }
                 let points = points.min(self.cfg.scoring.fast_threshold);
                 let cfg = Arc::clone(&self.cfg);
                 *self.stats.events.entry(Signal::PeerReport).or_default() += 1;
                 if let Some(b) = self.stats.bucket(now) {
-                    b.events[Source::Peer as usize] += 1;
+                    b.count(Source::Peer);
                 }
                 let st = self.ips.entry(*ip).or_insert_with(|| Box::new(IpState { first_seen: now, updated: now, ..Default::default() }));
                 st.advance(now, &cfg);
@@ -1552,6 +1783,219 @@ impl Engine {
         self.allowed.values().cloned().collect()
     }
 
+    /// `logguard ban`: bans `net` until `until`, shared with the peers like a ban decided here.
+    /// Refused for protected addresses (this host, peers, allowlists) and networks wider than
+    /// logguard bans itself.
+    pub fn operator_ban(&mut self, net: Net, until: Micros, note: String) -> Result<Vec<Action>, String> {
+        let mut out = Vec::new();
+        let now = self.now;
+        if self.wider_than_own_bans(&net) {
+            return Err(format!("{net} is wider than logguard's own bans: use a blocklist feed ([feeds]) for that"));
+        }
+        let why = if net.is_host() {
+            self.hard_protection(net.addr)
+        } else {
+            self.net_protected(&net).then_some("protected: an allowlisted, peer, own or recently logged-in address is inside")
+        };
+        if let Some(why) = why {
+            return Err(format!("{net} is {why}; not banned (an operator allowlist entry: `logguard disallow` it first)"));
+        }
+        if let Some(b) = self.covering_ban(&net).filter(|b| b.net != net) {
+            return Err(format!("{net} is inside the ban on {} already", b.net));
+        }
+        // nftables keeps an element's timeout when it is added again: lift the old ban first
+        if self.bans.contains_key(&net) {
+            self.unban(net, "replaced by an operator ban", Severity::Info, &mut out);
+        }
+        let forgive = self.cfg.bans.forgive_after.micros();
+        let off = self.offenders.entry(net).or_default();
+        if now - off.last_ban > forgive {
+            off.count = 0;
+        }
+        off.count += 1;
+        off.last_ban = now;
+        let offence = off.count;
+        let reason = format!("operator: {note}");
+        if let Some(ob) = self.outbox.as_mut() {
+            ob.push(FactBody::Ban { net, until, reason: reason.clone(), forgeable: false });
+        }
+        let place = self.place(net.addr).map(|p| format!(" [{p}]")).unwrap_or_default();
+        let message = format!("ban {net}{place} for {} (operator): {note}", crate::time::fmt_duration(until - now));
+        self.insert_ban(net, until, offence, reason, None, message, vec![], "operator", &mut out);
+        Ok(out)
+    }
+
+    /// The addresses `[allowlist] hosts` resolve to now. A newly allowlisted address's ban is
+    /// lifted and its score forgotten, as for `logguard allow`.
+    pub fn set_allow_hosts(&mut self, nets: Vec<Net>) -> Vec<Action> {
+        let mut out = Vec::new();
+        let added: Vec<Net> = nets.iter().filter(|n| !self.allow_hosts.contains(n)).copied().collect();
+        self.allow_hosts = nets;
+        for n in added {
+            let lifted: Vec<Net> = self.bans.keys().filter(|b| n.contains_net(b)).copied().collect();
+            for b in lifted {
+                self.unban(b, "allowlisted host name", Severity::Info, &mut out);
+            }
+            self.forget(&n);
+        }
+        out
+    }
+
+    /// A public-key SSH login: a key the account never used before is reported, after the
+    /// account's keys were learned for `learning_period`.
+    fn check_ssh_key(&mut self, who: &str, key: &str, ev: &Event, out: &mut Vec<Action>) {
+        let now = self.now;
+        if !self.ssh_keys.contains_key(who) && self.ssh_keys.len() >= MAX_KEY_ACCOUNTS {
+            return;
+        }
+        let learn = self.cfg.accounts.learning_period.micros();
+        let known = self.ssh_keys.entry(who.to_string()).or_insert_with(|| SshKeys { since: now, keys: BTreeSet::new() });
+        if known.keys.contains(key) {
+            return;
+        }
+        let learning = now - known.since < learn;
+        if known.keys.len() < MAX_KEYS {
+            known.keys.insert(key.to_string());
+            self.changes += 1;
+        }
+        if learning {
+            return;
+        }
+        let n = self.ssh_keys.get(who).map_or(0, |k| k.keys.len());
+        self.alert_about(
+            format!("newkey:{who}:{key}"),
+            86_400 * crate::time::SEC,
+            Severity::High,
+            Some(Net::host(ev.ip)),
+            format!(
+                "{who} logged in from {} with an SSH key it never used before ({key}; {n} keys known now) - if nobody here added \
+                 one, its authorized_keys may have been changed",
+                self.ip_place(ev.ip)
+            ),
+            Some(Topic::Compromise),
+            vec![who.to_string()],
+            None,
+            out,
+        );
+    }
+
+    /// An `su` or `sudo` line: a failure is high (someone has the account and tries for the
+    /// target), a success right after failures a warning, any other success only logged.
+    /// Failures count, and alert, per user, whatever the target: any local user can try every
+    /// account there is (or a made-up one, see `parse::privilege`), and must not be able to
+    /// use up the hourly messages about compromises that way.
+    pub fn on_privilege(&mut self, sw: &crate::parse::privilege::Switch, ts: Micros) -> Vec<Action> {
+        let mut out = Vec::new();
+        self.now = self.now.max(ts);
+        let now = self.now;
+        let window = 30 * MIN;
+        let key = sw.user.clone();
+        let from = match self.last_ssh.get(&sw.user) {
+            Some((ip, t)) => format!(" ({}'s last SSH login: {}, {} ago)", sw.user, self.ip_place(*ip), crate::time::fmt_duration(now - t)),
+            None => String::new(),
+        };
+        let tty = if sw.tty.is_empty() { String::new() } else { format!(" on {}", sw.tty) };
+        let what = sw.what.as_deref().map(|w| format!(" ({w})")).unwrap_or_default();
+        let (tool, user, target) = (sw.tool, &sw.user, &sw.target);
+        if !sw.ok {
+            if self.priv_fails.len() >= 1000 {
+                self.priv_fails.retain(|_, f| now - f.2 < window);
+            }
+            let f = self.priv_fails.entry(key.clone()).or_insert((0, now, now));
+            if now - f.2 >= window {
+                *f = (0, now, now);
+            }
+            f.0 += 1;
+            f.2 = now;
+            let times = if f.0 > 1 { format!(", {} failures in {}", f.0, crate::time::fmt_duration(now - f.1)) } else { String::new() };
+            self.alert_about(
+                format!("priv-fail:{key}"),
+                10 * MIN,
+                Severity::High,
+                None,
+                format!(
+                    "{tool} to {target} failed for {user}{tty}{what}{times}{from} - if it wasn't you, someone has {user}'s login \
+                     and is trying for {target}"
+                ),
+                Some(Topic::Compromise),
+                vec![],
+                None,
+                &mut out,
+            );
+            return out;
+        }
+        match self.priv_fails.remove(&key).filter(|f| now - f.2 < window) {
+            Some((n, _, _)) => self.alert_about(
+                format!("priv-after:{key}"),
+                MIN,
+                Severity::Warning,
+                None,
+                format!("{tool} to {target} by {user}{tty} succeeded after {n} failed attempts{from}"),
+                Some(Topic::Compromise),
+                vec![],
+                None,
+                &mut out,
+            ),
+            // the admin's own way in: on record (dashboard, actions log), not a message
+            None => self.alert_about(
+                format!("priv-ok:{key}"),
+                0,
+                Severity::Info,
+                None,
+                format!("{tool} to {target} by {user}{tty}{what}{from}"),
+                None,
+                vec![],
+                None,
+                &mut out,
+            ),
+        }
+        out
+    }
+
+    /// The latest `[patches]` reading (shown in the digest and the dashboard).
+    pub fn on_patches(&mut self, r: crate::patches::PatchReport) {
+        self.patches = Some(r);
+    }
+
+    /// When the last package and set-uid check finished (0: never), for scheduling the next.
+    pub fn verify_last_run(&self) -> Micros {
+        self.verify.as_ref().map_or(0, |b| b.last_run)
+    }
+
+    /// A package and set-uid check (see `verify`).
+    pub fn on_verify(&mut self, r: &crate::verify::VerifyReport) -> Vec<Action> {
+        let findings = crate::verify::judge(&mut self.verify, r);
+        self.verify_view = Some(crate::verify::VerifyView {
+            last_run: r.finished,
+            checked: r.checked,
+            mismatched: r.mismatched.len(),
+            suid: r.suid.len(),
+        });
+        self.changes += 1;
+        self.findings(findings, r.finished)
+    }
+
+    /// A process watch scan (see `procwatch`).
+    pub fn on_procwatch(&mut self, r: &crate::procwatch::ProcReport) -> Vec<Action> {
+        let geo = self.geo.clone();
+        let place = move |ip: IpAddr| geo.as_ref().and_then(|g| g.label(ip));
+        let state = |b: &Option<crate::procwatch::ProcBaseline>| b.as_ref().map(|b| (b.pairs.len(), b.armed));
+        let before = state(&self.procwatch);
+        let findings = crate::procwatch::judge(&mut self.procwatch, r, &self.cfg.procwatch, &place);
+        if state(&self.procwatch) != before {
+            self.changes += 1;
+        }
+        if r.available {
+            self.proc_view = self.procwatch.as_ref().map(|b| crate::procwatch::ProcView {
+                scanned: r.scanned,
+                learning_until: b.learning_until,
+                pairs: b.pairs.len(),
+                outbound: r.outbound.len(),
+            });
+        }
+        self.findings(findings, r.scanned)
+    }
+
     /// Closes the current digest period and starts a new one.
     pub fn digest_take(&mut self, now: Micros) -> DigestData {
         self.now = self.now.max(now);
@@ -1660,19 +2104,25 @@ impl Engine {
         }
 
         if let Some(ban) = self.banned_by(ev.ip).cloned() {
-            // In enforce mode a banned host can't get here; in shadow mode this is a would-be false positive.
+            // In shadow mode this is a would-be false positive: lifted, here and at the peers.
+            // In enforce mode a banned address can't connect (unless through a whitelisted port,
+            // or a ban the firewall didn't take), and a line saying it logged in may be forged:
+            // the ban stays and the operator decides.
+            let lift = ban.net.is_host() && ev.verified && cfg.mode == crate::config::Mode::Shadow;
+            let what =
+                if lift { "likely false positive, lifting ban" } else { "ban kept: `logguard unban` it if this is a false positive" };
             self.alert_about(
                 format!("fp:{}", ev.ip),
                 MIN,
                 Severity::Warning,
                 Some(ban.net),
-                format!("{who} authenticated from banned address {} (ban: {}) - likely false positive, lifting ban", ev.ip, ban.reason),
+                format!("{who} authenticated from banned address {} (ban: {}) - {what}", ev.ip, ban.reason),
                 Some(Topic::FalsePositive),
                 vec![who.clone()],
                 None,
                 out,
             );
-            if ban.net.is_host() {
+            if lift {
                 self.unban(ban.net, "successful authentication", Severity::Warning, out);
                 if let Some(ob) = self.outbox.as_mut() {
                     ob.push(FactBody::Unban { net: ban.net, reason: format!("{who} authenticated from it") });
@@ -1686,7 +2136,12 @@ impl Engine {
             Some(_) if self.account_first_seen.len() < MAX_ACCOUNTS => *self.account_first_seen.entry(who.clone()).or_insert(now),
             _ => self.account_first_seen.get(&who).copied().unwrap_or(now),
         };
-        if cfg.accounts.new_network_alerts && ev.account.is_some() && !cfg.accounts.new_network_ignore.contains(&acct) {
+        // (only for the accounts kept above: their networks and providers are bounded alike)
+        if cfg.accounts.new_network_alerts
+            && ev.account.is_some()
+            && !cfg.accounts.new_network_ignore.contains(&acct)
+            && self.account_first_seen.contains_key(&who)
+        {
             let net = Net::new(ev.ip, if ev.ip.is_ipv4() { 16 } else { 48 });
             let learning = now - first_seen < cfg.accounts.learning_period.micros();
             let nets = self.account_nets.entry(who.clone()).or_default();
@@ -1727,7 +2182,18 @@ impl Engine {
             }
         }
 
-        if cfg.allowlist.trust_authenticated {
+        if ev.signal == Signal::SshAuthOk && ev.verified {
+            if let Some(user) = &ev.account {
+                if self.last_ssh.len() < MAX_KEY_ACCOUNTS || self.last_ssh.contains_key(user) {
+                    self.last_ssh.insert(user.clone(), (ev.ip, ev.ts));
+                }
+            }
+            if let (Some(key), true) = (&ev.key, cfg.accounts.new_key_alerts) {
+                self.check_ssh_key(&who, key, ev, out);
+            }
+        }
+
+        if cfg.allowlist.trust_authenticated && ev.verified {
             // Only for this service, and never shared with peers (see `apply_peer_fact`).
             let previous = self.trusted.entry(ev.ip).or_default().insert(ev.signal.source(), now);
             // Refreshing a trust that is less than an hour old isn't worth a save.
@@ -1770,7 +2236,8 @@ impl Engine {
         }
         let targeted: Vec<(String, u32)> = st.targeted.iter().map(|(k, n)| (k.clone(), *n)).collect();
         let category = counts.first().map_or("other", |(s, _)| category_of(*s));
-        self.ban(Net::host(ip), reason, evidence, category, out);
+        let forgeable = firewall_only(counts.iter().map(|(s, _)| *s));
+        self.ban(Net::host(ip), reason, evidence, category, forgeable, out);
         if !targeted.is_empty() {
             if let Some(a) = out.last_mut().filter(|a| a.kind == ActionKind::Ban) {
                 a.topic = Some(Topic::BruteForce);
@@ -1802,11 +2269,17 @@ impl Engine {
             return out;
         }
         let (new_after, gone_after) = (ecfg.new_after_scans.max(1), ecfg.gone_after_scans.max(1));
-        let exposed: BTreeMap<ListenerKey, String> =
-            report.listeners.iter().filter(|l| l.exposure.is_exposed() && !l.dynamic).map(|l| (l.key, l.process.clone())).collect();
-        let describe = |k: &ListenerKey| report.listeners.iter().find(|l| l.key == *k).map_or("", |l| l.exposure.describe()).to_string();
+        let exposed: BTreeMap<ListenerKey, String> = report
+            .listeners
+            .iter()
+            .filter(|l| l.exposure.is_exposed() && !l.dynamic && !l.honeypot)
+            .map(|l| (l.key, l.process.clone()))
+            .collect();
+        let fw = report.firewall();
+        let describe = |k: &ListenerKey| report.listeners.iter().find(|l| l.key == *k).map_or(String::new(), |l| l.describe(fw));
 
-        if ufw_expected && report.ufw_active == Some(false) {
+        // ufw switched off with nothing else filtering (iptables rules of their own are read too)
+        if ufw_expected && report.ufw_active == Some(false) && fw == Firewall::Absent {
             self.alert_about(
                 "ufw-inactive".into(),
                 day,
@@ -1841,16 +2314,31 @@ impl Engine {
             );
         }
 
+        // A baseline learned under another firewall counts other listeners as exposed: learn
+        // it again rather than report what the change hid or opened as gone or new. One from
+        // a version that read only ufw saw an active ufw, or nothing.
+        let learned_under = self.exposure_firewall.unwrap_or(if fw == Firewall::Iptables { Firewall::Absent } else { fw });
+        let relearn = self.exposure_baseline.is_some() && learned_under != fw;
+        if relearn {
+            self.exposure_baseline = None;
+            self.exposure_pending.clear();
+        }
+        self.exposure_firewall = Some(fw);
         match self.exposure_baseline.as_mut() {
             None => {
                 let list: Vec<String> = exposed.iter().map(|(k, p)| format!("{k} ({p})")).collect();
                 self.exposure_baseline = Some(exposed.iter().map(|(k, p)| (*k, (p.clone(), 0))).collect());
+                let (key, why) = if relearn {
+                    ("exposure-relearned", format!(" (learned again: the firewall is now {})", fw.name()))
+                } else {
+                    ("exposure-learned", String::new())
+                };
                 self.alert_about(
-                    "exposure-learned".into(),
+                    key.into(),
                     day,
                     Severity::Info,
                     None,
-                    format!("exposure baseline learned: {} exposed listeners: {}", list.len(), list.join(", ")),
+                    format!("exposure baseline learned{why}: {} exposed listeners: {}", list.len(), list.join(", ")),
                     Some(Topic::Exposure),
                     vec![],
                     None,
@@ -1992,26 +2480,6 @@ impl Engine {
             }
         }
 
-        let mut wide: BTreeMap<Net, (usize, BTreeSet<Net>)> = BTreeMap::new();
-        for (net, g) in &narrow {
-            if net.is_v4() && sc.wide_enabled && !g.bad.is_empty() {
-                let w = wide.entry(Net::new(net.addr, sc.v4_wide_prefix)).or_default();
-                w.0 += g.bad.len();
-                w.1.insert(*net);
-            }
-        }
-        for (net, (count, subnets)) in wide {
-            if count >= sc.wide_min_bad_ips
-                && subnets.len() >= sc.wide_min_subnets
-                && self.covering_ban(&net).is_none()
-                && !self.net_protected(&net)
-            {
-                let reason = format!("{count} bad addresses across {} /{} subnets", subnets.len(), sc.v4_prefix);
-                let evidence = subnets.iter().map(|n| n.to_string()).collect();
-                self.ban(net, reason, evidence, "subnet", out);
-            }
-        }
-
         for (net, g) in narrow {
             let concentrated = g.bad.len() >= sc.min_bad_ips;
             let distributed = g.contributors >= sc.min_contributors && g.score >= sc.score_sum_threshold;
@@ -2025,22 +2493,97 @@ impl Engine {
             };
             let mut sample: Vec<String> = g.bad.iter().map(|ip| ip.to_string()).collect();
             sample.sort();
-            // What the members did (the latest lines of the worst ones), so the actions log
-            // keeps proof for a network ban too: "10-11 05:03:08 11.40.29.77 block TCP/23".
+            // the worst members' latest lines
             let mut members = g.members.clone();
             members.sort_by(|a, b| b.0.total_cmp(&a.0));
-            for (_, ip) in members.iter().take(10) {
-                if let Some(st) = self.ips.get(ip) {
-                    let lines: Vec<&str> = st.evidence.lines().collect();
-                    for l in &lines[lines.len().saturating_sub(3)..] {
-                        if let Some((stamp, text)) = l.split_at_checked(14) {
-                            sample.push(format!("{stamp} {ip}{text}"));
-                        }
+            sample.extend(self.members_evidence(members.iter().take(10).map(|m| m.1)));
+            self.ban(net, reason, sample, "subnet", false, out);
+        }
+        if sc.wide_enabled {
+            self.grow_subnet_bans(out);
+        }
+    }
+
+    /// Widens subnet bans step by step instead of jumping from `v4_prefix` straight to
+    /// `v4_wide_prefix`: a ban grows to the narrowest network that also holds the nearest
+    /// other ban (an address or a subnet) at most `wide_max_step` prefix bits wider, then
+    /// again from there. An attacking range is followed as it shows up, while the rest of
+    /// the provider's /16 (other customers, VPN exits) stays reachable. IPv6 bans grow the
+    /// same way from `v6_prefix` up to `v6_wide_prefix`, `wide_max_step_v6` bits at a time.
+    fn grow_subnet_bans(&mut self, out: &mut Vec<Action>) {
+        let cfg = Arc::clone(&self.cfg);
+        let sc = &cfg.subnets;
+        for v4 in [true, false] {
+            let (narrow, wide, step) = if v4 {
+                (sc.v4_prefix, sc.v4_wide_prefix, sc.wide_max_step)
+            } else {
+                (sc.v6_prefix, sc.v6_wide_prefix, sc.wide_max_step_v6)
+            };
+            if wide >= narrow {
+                continue;
+            }
+            let widest = |n: &Net| Net::new(n.addr, wide);
+            // A ban never grows past its widest network, so only the bans there matter to it.
+            let mut nearby: BTreeMap<Net, Vec<Net>> = BTreeMap::new();
+            for n in self.bans.keys().filter(|n| n.is_v4() == v4) {
+                nearby.entry(widest(n)).or_default().push(*n);
+            }
+            let mut seeds: Vec<Net> =
+                self.bans.keys().filter(|n| n.is_v4() == v4 && !n.is_host() && (wide + 1..=narrow).contains(&n.prefix)).copied().collect();
+            seeds.sort();
+            for seed in seeds {
+                // gone: taken in by an earlier seed's growth
+                let Some(bans) = nearby.get_mut(&widest(&seed)).filter(|b| b.contains(&seed)) else { continue };
+                let mut grown = seed;
+                loop {
+                    let reach = grown.prefix.saturating_sub(step).max(wide);
+                    let next = bans
+                        .iter()
+                        .filter(|b| !grown.contains_net(b))
+                        .map(|b| grown.common(b))
+                        .filter(|n| n.prefix >= reach)
+                        .max_by_key(|n| n.prefix);
+                    // a protected address or another provider (ASN) in the narrowest step is in
+                    // every wider one too
+                    match next {
+                        Some(n) if !self.net_protected(&n) && self.geo.as_ref().is_none_or(|g| g.one_network(&n)) => grown = n,
+                        _ => break,
+                    }
+                }
+                if grown == seed {
+                    continue;
+                }
+                let mut taken: Vec<Net> = bans.iter().filter(|b| grown.contains_net(b) && **b != seed).copied().collect();
+                taken.sort();
+                bans.retain(|b| !grown.contains_net(b));
+                bans.push(grown);
+                let mut shown: Vec<String> = taken.iter().take(5).map(|n| n.to_string()).collect();
+                if taken.len() > 5 {
+                    shown.push(format!("{} more", taken.len() - 5));
+                }
+                let reason = format!("grown from {seed}, banned nearby: {}", shown.join(", "));
+                let mut evidence: Vec<String> = taken.iter().map(|n| n.to_string()).collect();
+                evidence.extend(self.members_evidence(taken.iter().filter(|n| n.is_host()).take(10).map(|n| n.addr)));
+                self.ban(grown, reason, evidence, "subnet", false, out);
+            }
+        }
+    }
+
+    /// The latest lines of what these addresses did, so the actions log keeps proof for a
+    /// network ban too: "10-11 05:03:08 11.48.29.77 block TCP/23".
+    fn members_evidence(&self, ips: impl Iterator<Item = IpAddr>) -> Vec<String> {
+        let mut out = Vec::new();
+        for ip in ips {
+            if let Some(st) = self.ips.get(&ip) {
+                let lines: Vec<&str> = st.evidence.lines().collect();
+                for l in &lines[lines.len().saturating_sub(3)..] {
+                    if let Some((stamp, text)) = l.split_at_checked(14) {
+                        out.push(format!("{stamp} {ip}{text}"));
                     }
                 }
             }
-            self.ban(net, reason, sample, "subnet", out);
         }
+        out
     }
 
     fn gc(&mut self, pressure: bool) {
@@ -2081,7 +2624,19 @@ impl Engine {
         });
         let ahalf = cfg.accounts.half_life.micros();
         self.accounts.retain(|_, a| now - a.updated < 6 * ahalf || now < a.under_attack_until);
-        self.alert_gate.retain(|_, t| now - *t < 86_400 * crate::time::SEC);
+        self.priv_fails.retain(|_, f| now - f.2 < 30 * MIN);
+        // System alerts (a few dozen fixed keys) may be gated for up to a week (the cluster
+        // key reminder); the rest (per address or account) for a day at most.
+        let day = 86_400 * crate::time::SEC;
+        self.alert_gate.retain(|k, t| now - *t < if k.starts_with("system:") { 8 * day } else { day });
+        // The other keys name what users and attackers vary (programs, files, accounts): a
+        // flood of them must not fill the memory or the state file. The oldest go first.
+        let mut times: Vec<Micros> = self.alert_gate.iter().filter(|(k, _)| !k.starts_with("system:")).map(|(_, t)| *t).collect();
+        if times.len() > MAX_ALERT_GATE {
+            let cut = times.len() - MAX_ALERT_GATE;
+            let keep_from = *times.select_nth_unstable(cut).1;
+            self.alert_gate.retain(|k, t| k.starts_with("system:") || *t >= keep_from);
+        }
         let forgive = cfg.bans.forgive_after.micros();
         let bans = &self.bans;
         self.offenders.retain(|net, o| now - o.last_ban < forgive || bans.contains_key(net));
@@ -2182,6 +2737,30 @@ impl Engine {
             world: self.world(),
             port_names: cfg.port_names(),
             actions_log: None,
+            patches: self.patches.clone(),
+            verify: self.verify_view.clone().or_else(|| {
+                self.verify.as_ref().map(|b| crate::verify::VerifyView {
+                    last_run: b.last_run,
+                    mismatched: b.mismatched.len(),
+                    suid: b.suid.len(),
+                    ..Default::default()
+                })
+            }),
+            procwatch: self.proc_view.clone(),
+            allow_hosts: self.allow_hosts.clone(),
+            patterns: cfg
+                .patterns
+                .iter()
+                .zip(&self.pattern_stats)
+                .map(|(p, st)| crate::parse::custom::PatternView {
+                    kind: p.kind,
+                    from: p.from(),
+                    weight: p.weight,
+                    port: p.port,
+                    stats: crate::parse::custom::PatternStats { ips: st.top(PATTERN_TOP_IPS), ..st.clone() },
+                    addresses: st.ips.len(),
+                })
+                .collect(),
         }
     }
 
@@ -2209,6 +2788,9 @@ impl Engine {
             halve(m);
         }
         self.port_hits_cc.retain(|_, m| !m.is_empty());
+        for st in &mut self.pattern_stats {
+            st.prune(self.now);
+        }
     }
 
     fn world(&self) -> WorldView {
@@ -2328,6 +2910,7 @@ impl Engine {
             digest_last_sent: self.digest_last_sent,
             alert_gate: self.alert_gate.iter().map(|(k, t)| (k.clone(), *t)).collect(),
             exposure_baseline: self.exposure_baseline.as_ref().map(|b| b.iter().map(|(k, (p, _))| (*k, p.clone())).collect()),
+            exposure_firewall: self.exposure_firewall,
             cron: self.cron.clone(),
             av: self.av.clone(),
             followers: self.followers.clone(),
@@ -2340,6 +2923,10 @@ impl Engine {
                     .map(|(c, m)| (String::from_utf8_lossy(c).into_owned(), m.iter().map(|(p, n)| (*p, *n)).collect()))
                     .collect(),
             }),
+            ssh_keys: self.ssh_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            verify: self.verify.clone(),
+            procwatch: self.procwatch.clone(),
+            patterns: self.pattern_stats.iter().filter(|s| s.since > 0).cloned().collect(),
         }
     }
 
@@ -2365,6 +2952,7 @@ impl Engine {
         };
         self.recent = st.recent.into_iter().collect();
         self.exposure_baseline = st.exposure_baseline.map(|b| b.into_iter().map(|(k, p)| (k, (p, 0))).collect());
+        self.exposure_firewall = st.exposure_firewall;
         self.allowed = st.allowed.into_iter().map(|a| (a.net, a)).collect();
         if let Some(d) = st.digest {
             self.digest = d;
@@ -2387,6 +2975,20 @@ impl Engine {
                 self.port_hits_cc.insert([a, b], ports.into_iter().take(COUNTRY_PORTS).collect());
             }
         }
+        self.ssh_keys = st.ssh_keys.into_iter().take(MAX_KEY_ACCOUNTS).collect();
+        self.verify = st.verify;
+        self.procwatch = st.procwatch;
+        self.set_pattern_stats(
+            st.patterns
+                .into_iter()
+                .map(|mut p| {
+                    // the same bounds as when counting (the file may have been edited)
+                    p.ips.truncate(crate::parse::custom::MAX_PATTERN_IPS);
+                    p.no_address_lines.truncate(crate::parse::custom::MAX_NO_ADDRESS_LINES);
+                    p
+                })
+                .collect(),
+        );
         self.now = self.now.max(st.saved);
     }
 }
@@ -2398,7 +3000,7 @@ mod tests {
 
     fn engine() -> Engine {
         let mut cfg = Config::default();
-        cfg.allowlist.nets.push("11.35.43.31".parse().unwrap());
+        cfg.allowlist.nets.push("11.43.43.31".parse().unwrap());
         Engine::new(Arc::new(cfg), 0)
     }
 
@@ -2431,12 +3033,12 @@ mod tests {
         // ssh: lines keep coming (own logins, reloads...) but none names an address
         for i in 0..300 {
             e.count_record(Source::Ssh, 103 * h + i * SEC);
-            e.on_event(&Event::new(103 * h + i * 60 * SEC, "11.8.1.2".parse().unwrap(), Signal::FwBlock));
+            e.on_event(&Event::new(103 * h + i * 60 * SEC, "11.10.1.2".parse().unwrap(), Signal::FwBlock));
             e.count_record(Source::Ufw, 103 * h + i * 60 * SEC);
         }
         let m = msgs(e.check_silence(106 * h + SEC));
         assert!(m.iter().any(|m| m.starts_with("301 ssh log lines in the last 6h")), "{m:?}");
-        e.on_event(&ev(106 * 3600 + 2, "11.8.1.1", Signal::SshPreauth));
+        e.on_event(&ev(106 * 3600 + 2, "11.10.1.1", Signal::SshPreauth));
         e.count_record(Source::Ssh, 106 * h + 2 * SEC);
         assert_eq!(msgs(e.check_silence(106 * h + 3 * SEC)), vec!["ssh log lines name client addresses again"]);
     }
@@ -2447,8 +3049,8 @@ mod tests {
         assert!(!e.snapshot(0, 10).world.geo);
         e.geo = Some(Arc::new(crate::geo::tests::sample()));
         e.on_event(&ev(1, "5.9.1.1", Signal::FwTripwire).port(Some(23))); // DE, banned
-        e.on_event(&ev(2, "11.28.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
-        e.on_event(&ev(3, "11.28.1.1", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(2, "11.36.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
+        e.on_event(&ev(3, "11.36.1.1", Signal::FwBlock).port(Some(3389)));
         e.on_event(&ev(4, "8.8.8.8", Signal::FwBlock).port(Some(22))); // no geo data
         e.on_event(&ev(5, "1.0.0.5", Signal::XmppAuthOk)); // AU user
         let w = e.snapshot(0, 10).world;
@@ -2483,7 +3085,7 @@ mod tests {
         assert_eq!(w2.ports, vec![(3389, 1)], "halved; counters reaching 0 are dropped");
         assert!(w2.by_country.get("DE").is_none_or(|d| d.ports.is_empty()));
         // most offenders first, whatever the bans
-        e.on_event(&ev(6, "11.28.1.2", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(6, "11.36.1.2", Signal::FwBlock).port(Some(3389)));
         let w = e.snapshot(0, 10).world;
         assert_eq!(w.countries.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), ["FI", "DE"]);
     }
@@ -2535,17 +3137,17 @@ mod tests {
     #[test]
     fn canary_bans_at_first_attempt_and_login_is_critical() {
         let mut e = engine();
-        let a = e.on_event(&ev(1, "11.9.9.9", Signal::SshCanary).account(Some("ubuntu")));
-        assert_eq!(bans(&a), vec!["11.9.9.9"]);
+        let a = e.on_event(&ev(1, "11.15.9.9", Signal::SshCanary).account(Some("ubuntu")));
+        assert_eq!(bans(&a), vec!["11.15.9.9"]);
         assert_eq!(a[0].category.as_deref(), Some("canary"));
         assert!(a.iter().all(|a| a.accounts.is_empty()), "nobody to notify about a canary account");
-        let login = Event::new(2 * SEC, "11.9.9.8".parse().unwrap(), Signal::XmppCanary)
+        let login = Event::new(2 * SEC, "11.15.9.8".parse().unwrap(), Signal::XmppCanary)
             .detail(format!("{} test@x.org", crate::event::CANARY_LOGIN));
         let a = e.on_event(&login);
         assert!(a.iter().any(|a| a.severity == Severity::Critical && a.topic == Some(Topic::Compromise)), "{a:?}");
-        assert!(e.protection("11.9.9.8".parse().unwrap()).is_none(), "a canary login earns no trust");
+        assert!(e.protection("11.15.9.8".parse().unwrap()).is_none(), "a canary login earns no trust");
         // your own (allowlisted) address mistyping a name: alert, no ban
-        let a = e.on_event(&ev(3, "11.35.43.31", Signal::SshCanary).account(Some("root")));
+        let a = e.on_event(&ev(3, "11.43.43.31", Signal::SshCanary).account(Some("root")));
         assert!(bans(&a).is_empty());
         assert!(a.iter().any(|a| a.topic == Some(Topic::Protected)));
     }
@@ -2556,6 +3158,7 @@ mod tests {
         let report = |t: i64, dead: &[&str]| ExposureReport {
             scanned: t * 60 * SEC,
             ufw_active: Some(true),
+            firewall: None,
             listeners: vec![],
             dead_rules: dead.iter().map(|d| d.to_string()).collect(),
         };
@@ -2574,6 +3177,55 @@ mod tests {
     }
 
     #[test]
+    fn exposure_baseline_learned_again_when_the_firewall_changes() {
+        use crate::event::Proto;
+        use crate::exposure::{Exposure, Firewall, Listener};
+        let l = |port: u16, exposure| Listener {
+            key: ListenerKey { proto: Proto::Tcp, addr: "0.0.0.0".parse().unwrap(), port },
+            process: "p".into(),
+            exposure,
+            dynamic: false,
+            rule: None,
+            limited: false,
+            honeypot: false,
+        };
+        let report = |t: i64, fw: Option<Firewall>, ufw: Option<bool>, ls: Vec<Listener>| ExposureReport {
+            scanned: t * 60 * SEC,
+            ufw_active: ufw,
+            firewall: fw,
+            listeners: ls,
+            dead_rules: vec![],
+        };
+        let msgs = |a: Vec<Action>| a.into_iter().map(|a| a.message).collect::<Vec<_>>();
+        // no firewall: everything public is exposed
+        let mut e = engine();
+        let open = || vec![l(22, Exposure::Unfiltered), l(8080, Exposure::Unfiltered)];
+        let m = msgs(e.on_exposure(report(0, Some(Firewall::Absent), None, open()), true));
+        assert!(m[0].starts_with("exposure baseline learned: 2 exposed"), "{m:?}");
+        // iptables rules now read: 8080 is blocked, which is no "gone" listener
+        let filtered = || vec![l(22, Exposure::Allowed), l(8080, Exposure::Firewalled)];
+        let m = msgs(e.on_exposure(report(1, Some(Firewall::Iptables), None, filtered()), true));
+        assert_eq!(m, ["exposure baseline learned (learned again: the firewall is now iptables): 1 exposed listeners: 0.0.0.0:22/tcp (p)"]);
+        for t in 2..12 {
+            assert!(msgs(e.on_exposure(report(t, Some(Firewall::Iptables), None, filtered()), true)).is_empty(), "scan {t}");
+        }
+        // the state file keeps what the baseline was learned under
+        let mut back = engine();
+        back.restore(decode_state(&encode_state(&e.export(None)).unwrap()).unwrap());
+        assert!(msgs(back.on_exposure(report(12, Some(Firewall::Iptables), None, filtered()), true)).is_empty());
+
+        // a baseline from a version that read only ufw: still good under ufw, learned again
+        // once iptables is read where there was no ufw
+        let mut old = engine();
+        old.exposure_baseline = Some(BTreeMap::from([(l(22, Exposure::Allowed).key, ("p".to_string(), 0))]));
+        assert!(msgs(old.on_exposure(report(0, Some(Firewall::Ufw), Some(true), vec![l(22, Exposure::Allowed)]), true)).is_empty());
+        let mut old = engine();
+        old.exposure_baseline = Some(BTreeMap::from([(l(8080, Exposure::Unfiltered).key, ("p".to_string(), 0))]));
+        let m = msgs(old.on_exposure(report(0, Some(Firewall::Iptables), None, filtered()), true));
+        assert!(m[0].contains("learned again: the firewall is now iptables"), "{m:?}");
+    }
+
+    #[test]
     fn exposure_drift() {
         use crate::event::Proto;
         use crate::exposure::{Exposure, Listener};
@@ -2583,10 +3235,14 @@ mod tests {
             process: "p".into(),
             exposure,
             dynamic: false,
+            rule: None,
+            limited: false,
+            honeypot: false,
         };
         let report = |t: i64, ls: Vec<Listener>, dead: Vec<&str>| ExposureReport {
             scanned: t * 60 * SEC,
             ufw_active: Some(true),
+            firewall: None,
             listeners: ls,
             dead_rules: dead.into_iter().map(String::from).collect(),
         };
@@ -2612,6 +3268,13 @@ mod tests {
         let m = msgs(e.on_exposure(report(10, vec![l(22, Exposure::Allowed)], vec![]), true));
         assert_eq!(m, vec!["internet-facing listener 0.0.0.0:51821/tcp (p) is gone - service stopped?"]);
 
+        // logguard's own honeypot listeners are exposed on purpose: never alerted either
+        let trap = |port| Listener { honeypot: true, ..l(port, Exposure::Allowed) };
+        for t in 0..2 {
+            let r = report(10 + t, vec![l(22, Exposure::Allowed), trap(2323)], vec![]);
+            assert!(!msgs(e.on_exposure(r, true)).iter().any(|m| m.contains("2323")));
+        }
+
         // TURN relay sockets in an allowed range come and go with calls: never alerted.
         let relay = |port| Listener { dynamic: true, ..l(port, Exposure::Allowed) };
         assert!(msgs(e.on_exposure(report(11, vec![l(22, Exposure::Allowed), relay(50001)], vec![]), true)).is_empty());
@@ -2634,18 +3297,91 @@ mod tests {
         assert!(msgs(e2.on_exposure(report(17, vec![l(22, Exposure::Allowed)], vec![]), true)).is_empty(), "baseline survives restart");
     }
 
+    /// A tripwire hit's source address may be forged: a ban or report on blocked packets alone
+    /// says so, and isn't applied to an address that logged in at the receiving node lately.
+    #[test]
+    fn forgeable_peer_evidence_spares_logged_in_users() {
+        use crate::cluster::{ClusterCfg, Fact};
+        let mut origin = engine();
+        origin.enable_sharing(vec![]);
+        origin.on_event(&ev(1, "7.7.7.1", Signal::FwTripwire).port(Some(23)));
+        for i in 0..3 {
+            origin.on_event(&ev(2 + i, "7.7.7.2", Signal::SshInvalidUser).account(Some("oracle")));
+        }
+        let facts = origin.take_outbox(10.0);
+        let forgeable = |ip: &str| {
+            facts
+                .iter()
+                .filter_map(|f| match f {
+                    FactBody::Ban { net, forgeable, .. } if net.to_string() == ip => Some(("ban", *forgeable)),
+                    FactBody::Report { ip: i, forgeable, .. } if i.to_string() == ip => Some(("report", *forgeable)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(forgeable("7.7.7.1"), [("ban", true), ("report", true)], "{facts:?}");
+        assert_eq!(forgeable("7.7.7.2"), [("ban", false), ("report", false)], "{facts:?}");
+
+        let ccfg = ClusterCfg::default();
+        let mut here = engine();
+        for ip in ["7.7.7.1", "7.7.7.2"] {
+            here.on_event(&Event::new(0, ip.parse().unwrap(), Signal::XmppAuthOk).account(Some("a@x.org")));
+        }
+        let mut seq = 0;
+        let mut apply = |e: &mut Engine, body: &FactBody| {
+            seq += 1;
+            e.apply_peer_fact(&Fact { origin: "vpn".into(), seq, created: 10 * SEC, hops: 1, body: body.clone() }, &ccfg)
+        };
+        let mut all = vec![];
+        for f in &facts {
+            all.extend(apply(&mut here, f));
+        }
+        assert_eq!(bans(&all), ["7.7.7.2"], "only the one on evidence that can't be forged");
+        assert!(here.ips.get(&"7.7.7.1".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "the report was left out");
+        // someone who hasn't logged in here is banned on it as before
+        let mut fresh = engine();
+        let all: Vec<Action> = facts.iter().flat_map(|f| apply(&mut fresh, f)).collect();
+        assert_eq!(bans(&all), ["7.7.7.1", "7.7.7.2"]);
+    }
+
+    /// Peer bans never reach wider than this node bans itself.
+    #[test]
+    fn peer_bans_no_wider_than_own() {
+        use crate::cluster::{ClusterCfg, Fact};
+        let ccfg = ClusterCfg::default();
+        let mut seq = 0;
+        let mut ban = |e: &mut Engine, net: &str| {
+            seq += 1;
+            let body = FactBody::Ban { net: net.parse().unwrap(), until: 3600 * SEC, reason: "x".into(), forgeable: false };
+            bans(&e.apply_peer_fact(&Fact { origin: "vpn".into(), seq, created: SEC, hops: 1, body }, &ccfg))
+        };
+        let mut cfg = Config::default();
+        cfg.subnets.v4_wide_prefix = 20;
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        assert!(ban(&mut e, "11.10.0.0/16").is_empty() && ban(&mut e, "11.11.0.0/19").is_empty());
+        assert_eq!(ban(&mut e, "11.12.0.0/20"), ["11.12.0.0/20"]);
+        // without growth: /24 at most; IPv6 /64
+        let mut cfg = Config::default();
+        cfg.subnets.wide_enabled = false;
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        assert!(ban(&mut e, "11.13.0.0/23").is_empty() && ban(&mut e, "3fff:100::/48").is_empty());
+        assert_eq!(ban(&mut e, "11.13.0.0/24"), ["11.13.0.0/24"]);
+    }
+
     #[test]
     fn cluster_facts() {
         use crate::cluster::{ClusterCfg, Fact, FactBody};
         let ccfg = ClusterCfg::default();
         let fact = |body| Fact { origin: "vpn".into(), seq: 1, created: 1000 * SEC, hops: 1, body };
         let mut e = engine();
-        e.enable_sharing(vec!["11.25.48.86".parse().unwrap()]);
+        e.enable_sharing(vec!["11.33.48.86".parse().unwrap()]);
         e.now = 1000 * SEC;
 
         // remote ban: applied, capped to max_remote_ban, tagged with its origin, not re-shared as ours
-        let a =
-            e.apply_peer_fact(&fact(FactBody::Ban { net: "1.2.3.4".parse().unwrap(), until: 999_999 * SEC, reason: "scan".into() }), &ccfg);
+        let a = e.apply_peer_fact(
+            &fact(FactBody::Ban { net: "1.2.3.4".parse().unwrap(), until: 999_999 * SEC, reason: "scan".into(), forgeable: false }),
+            &ccfg,
+        );
         assert!(a[0].message.contains("(from peer vpn)"), "{}", a[0].message);
         let b = e.banned_by("1.2.3.4".parse().unwrap()).unwrap().clone();
         assert_eq!(b.origin.as_deref(), Some("vpn"));
@@ -2653,15 +3389,20 @@ mod tests {
         assert!(e.take_outbox(10.0).is_empty());
 
         // protected addresses: home (allowlist) and cluster peers are never banned by peers
-        for ip in ["11.35.43.31", "11.25.48.86"] {
+        for ip in ["11.43.43.31", "11.33.48.86"] {
             assert!(e
-                .apply_peer_fact(&fact(FactBody::Ban { net: ip.parse().unwrap(), until: 2000 * SEC, reason: "x".into() }), &ccfg)
+                .apply_peer_fact(
+                    &fact(FactBody::Ban { net: ip.parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
+                    &ccfg
+                )
                 .is_empty());
         }
 
         // reports add up across nodes at report_factor (0.5): 2 reports of 120 points = ban
-        let rep =
-            |seq, pts| Fact { seq, ..fact(FactBody::Report { ip: "5.5.5.5".parse().unwrap(), points: pts, signals: "tripwire".into() }) };
+        let rep = |seq, pts| Fact {
+            seq,
+            ..fact(FactBody::Report { ip: "5.5.5.5".parse().unwrap(), points: pts, signals: "tripwire".into(), forgeable: false })
+        };
         assert!(e.apply_peer_fact(&rep(2, 120.0), &ccfg).is_empty());
         let a = e.apply_peer_fact(&rep(3, 120.0), &ccfg);
         assert_eq!(bans(&a), vec!["5.5.5.5"]);
@@ -2678,7 +3419,10 @@ mod tests {
         e.apply_peer_fact(&fact(FactBody::Trust { ip: "7.7.7.7".parse().unwrap() }), &ccfg);
         assert_eq!(e.protection("7.7.7.7".parse().unwrap()), None);
         // a peer's reports count against an address that logged in here
-        let rep7 = |seq| Fact { seq, ..fact(FactBody::Report { ip: "6.6.6.7".parse().unwrap(), points: 200.0, signals: "x".into() }) };
+        let rep7 = |seq| Fact {
+            seq,
+            ..fact(FactBody::Report { ip: "6.6.6.7".parse().unwrap(), points: 200.0, signals: "x".into(), forgeable: false })
+        };
         let mut a = e.apply_peer_fact(&rep7(10), &ccfg);
         a.extend(e.apply_peer_fact(&rep7(11), &ccfg));
         assert_eq!(bans(&a), vec!["6.6.6.7"]);
@@ -2689,18 +3433,29 @@ mod tests {
         // a broken or compromised peer: absurdly wide networks and non-numbers are ignored
         for wide in ["0.0.0.0/1", "10.0.0.0/8", "2000::/3"] {
             let net: Net = wide.parse().unwrap();
-            assert!(e.apply_peer_fact(&fact(FactBody::Ban { net, until: 2000 * SEC, reason: "x".into() }), &ccfg).is_empty());
+            assert!(e
+                .apply_peer_fact(&fact(FactBody::Ban { net, until: 2000 * SEC, reason: "x".into(), forgeable: false }), &ccfg)
+                .is_empty());
             assert!(e.apply_peer_fact(&fact(FactBody::Allow { net, until: 2000 * SEC, note: "x".into() }), &ccfg).is_empty());
         }
-        let nan = Fact { seq: 4, ..fact(FactBody::Report { ip: "5.5.5.6".parse().unwrap(), points: f64::NAN, signals: "x".into() }) };
+        let nan = Fact {
+            seq: 4,
+            ..fact(FactBody::Report { ip: "5.5.5.6".parse().unwrap(), points: f64::NAN, signals: "x".into(), forgeable: false })
+        };
         assert!(e.apply_peer_fact(&nan, &ccfg).is_empty());
         assert!(!e.ips.contains_key(&"5.5.5.6".parse().unwrap()), "nothing recorded");
-        let huge = Fact { seq: 5, ..fact(FactBody::Report { ip: "5.5.5.7".parse().unwrap(), points: 1e300, signals: "x".into() }) };
+        let huge = Fact {
+            seq: 5,
+            ..fact(FactBody::Report { ip: "5.5.5.7".parse().unwrap(), points: 1e300, signals: "x".into(), forgeable: false })
+        };
         e.apply_peer_fact(&huge, &ccfg);
         assert_eq!(e.ips[&"5.5.5.7".parse().unwrap()].fast, 100.0, "capped at one threshold");
         assert!(
-            e.apply_peer_fact(&fact(FactBody::Ban { net: "11.8.0.0/16".parse().unwrap(), until: 2000 * SEC, reason: "x".into() }), &ccfg)
-                .len()
+            e.apply_peer_fact(
+                &fact(FactBody::Ban { net: "11.10.0.0/16".parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
+                &ccfg
+            )
+            .len()
                 == 1
         );
     }
@@ -2729,24 +3484,24 @@ mod tests {
                 seq: 1,
                 created: 20 * SEC,
                 hops: 1,
-                body: FactBody::Ban { net: "11.9.0.0/24".parse().unwrap(), until: 9000 * SEC, reason: "r".into() },
+                body: FactBody::Ban { net: "11.15.0.0/24".parse().unwrap(), until: 9000 * SEC, reason: "r".into(), forgeable: false },
             },
             &ClusterCfg::default(),
         );
-        let err = e.operator_unban("11.9.0.7".parse().unwrap()).unwrap_err();
-        assert!(err.contains("covered by the ban on 11.9.0.0/24"), "{err}");
+        let err = e.operator_unban("11.15.0.7".parse().unwrap()).unwrap_err();
+        assert!(err.contains("covered by the ban on 11.15.0.0/24"), "{err}");
         assert!(e.operator_unban("8.8.4.4".parse().unwrap()).unwrap_err().contains("no active ban"));
 
         // allowlisting lifts bans inside it, protects, and expires
-        let a = e.operator_allow("11.9.0.0/24".parse().unwrap(), 100 * SEC, "office".into());
+        let a = e.operator_allow("11.15.0.0/24".parse().unwrap(), 100 * SEC, "office".into());
         assert_eq!(a.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::Unban, ActionKind::Allow]);
-        assert_eq!(e.protection("11.9.0.7".parse().unwrap()), Some("operator allowlist"));
-        let tripped: Vec<Action> = (0..5).flat_map(|i| e.on_event(&ev(30 + i, "11.9.0.7", Signal::XmppTlsFail))).collect();
+        assert_eq!(e.protection("11.15.0.7".parse().unwrap()), Some("operator allowlist"));
+        let tripped: Vec<Action> = (0..5).flat_map(|i| e.on_event(&ev(30 + i, "11.15.0.7", Signal::XmppTlsFail))).collect();
         assert!(bans(&tripped).is_empty());
         let expired = e.tick(200 * SEC);
         assert!(expired.iter().any(|a| a.kind == ActionKind::Disallow));
-        assert!(e.protection("11.9.0.7".parse().unwrap()).is_none());
-        assert!(e.operator_disallow("11.9.0.0/24".parse().unwrap()).is_err());
+        assert!(e.protection("11.15.0.7".parse().unwrap()).is_none());
+        assert!(e.operator_disallow("11.15.0.0/24".parse().unwrap()).is_err());
     }
 
     #[test]
@@ -2807,7 +3562,7 @@ mod tests {
     fn snapshot_top_n_and_persistence_is_lean() {
         let mut e = engine();
         for host in 1..=50u8 {
-            e.on_event(&ev(i64::from(host), &format!("11.8.1.{host}"), Signal::XmppConn).port(Some(5269)));
+            e.on_event(&ev(i64::from(host), &format!("11.10.1.{host}"), Signal::XmppConn).port(Some(5269)));
         }
         for i in 0..3 {
             e.on_event(&ev(100 + i, "9.9.9.9", Signal::XmppTlsFail));
@@ -2838,13 +3593,13 @@ mod tests {
     #[test]
     fn three_tls_failures_ban() {
         let mut e = engine();
-        assert!(e.on_event(&ev(0, "11.42.40.218", Signal::XmppTlsFail)).is_empty());
-        assert!(e.on_event(&ev(5, "11.42.40.218", Signal::XmppTlsFail)).is_empty());
-        let a = e.on_event(&ev(9, "11.42.40.218", Signal::XmppTlsFail));
-        assert_eq!(bans(&a), vec!["11.42.40.218"]);
+        assert!(e.on_event(&ev(0, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(5, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
+        let a = e.on_event(&ev(9, "11.50.40.218", Signal::XmppTlsFail));
+        assert_eq!(bans(&a), vec!["11.50.40.218"]);
         assert_eq!(a[0].until, Some(9 * SEC + 3600 * SEC));
         // no duplicate ban while active
-        assert!(e.on_event(&ev(10, "11.42.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(10, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
     }
 
     #[test]
@@ -2867,7 +3622,7 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for i in 0..10 {
-            all.extend(e.on_event(&ev(i, "11.35.43.31", Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(i, "11.43.43.31", Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty());
         assert!(all.iter().any(|a| a.kind == ActionKind::Alert));
@@ -2901,12 +3656,22 @@ mod tests {
             all.extend(e.on_event(&ev(30 + i, "5.5.5.1", Signal::SshInvalidUser).account(Some("oracle"))));
         }
         assert_eq!(bans(&all), vec!["5.5.5.1"]);
-        // a canary name or a tripwire port, even on the same service
+        // a canary name, even on the same service
         let mut e = engine();
+        e.enable_sharing(vec![]);
         login(&mut e, "5.5.5.2", 0);
         login(&mut e, "5.5.5.3", 0);
         assert_eq!(bans(&e.on_event(&ev(5, "5.5.5.2", Signal::XmppCanary).account(Some("test@x.org")))), vec!["5.5.5.2"]);
-        assert_eq!(bans(&e.on_event(&ev(5, "5.5.5.3", Signal::FwTripwire).port(Some(23)))), vec!["5.5.5.3"]);
+        // but not blocked packets, a tripwire port or a scan included: one forged SYN would
+        // lock the user out (and they may share a carrier NAT); nor are they reported to peers
+        let mut all = e.on_event(&ev(5, "5.5.5.3", Signal::FwTripwire).port(Some(23)));
+        for port in 1000..1020 {
+            all.extend(e.on_event(&ev(6, "5.5.5.3", Signal::FwBlock).port(Some(port))));
+        }
+        assert!(bans(&all).is_empty(), "{all:?}");
+        let facts = e.take_outbox(1.0);
+        assert!(!facts.iter().any(|f| format!("{f:?}").contains("5.5.5.3")), "{facts:?}");
+        assert!(matches!(&facts[..], [FactBody::Ban { forgeable: false, .. }]), "the canary ban is shared: {facts:?}");
         // trust ends trust_ttl (24 h by default) after the last login
         let mut e = engine();
         login(&mut e, "5.5.5.4", 0);
@@ -2941,7 +3706,7 @@ mod tests {
     #[test]
     fn port_spread_scanner() {
         let mut e = engine();
-        let ip = "11.34.253.221";
+        let ip = "11.42.253.221";
         let mut all = vec![];
         for (i, port) in [5222u16, 5269, 5280, 5443].iter().enumerate() {
             all.extend(e.on_event(&ev(i as i64, ip, Signal::XmppConn).port(Some(*port))));
@@ -2978,23 +3743,23 @@ mod tests {
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i, &format!("11.11.59.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i, &format!("11.18.91.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
         let b = bans(&all);
-        assert!(b.contains(&"11.11.59.0/24".to_string()));
+        assert!(b.contains(&"11.18.91.0/24".to_string()));
         let sub = all.iter().find(|a| a.target.map(|t| t.prefix) == Some(24)).unwrap();
         assert_eq!(sub.superseded.len(), 3, "host bans inside the subnet are replaced");
-        assert!(e.banned_by("11.11.59.200".parse().unwrap()).is_some());
+        assert!(e.banned_by("11.18.91.200".parse().unwrap()).is_some());
 
         // A subnet that contains a trusted address is never banned wholesale.
         let mut e = engine();
-        e.on_event(&Event::new(0, "11.16.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        e.on_event(&Event::new(0, "11.24.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i + 1, &format!("11.16.44.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i + 1, &format!("11.24.44.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
@@ -3006,11 +3771,135 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for host in 1..=6 {
-            all.extend(e.on_event(&ev(host, &format!("11.24.48.{host}"), Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(host, &format!("11.32.48.{host}"), Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty(), "one probe per address is not a ban on its own");
         all.extend(e.tick(120 * SEC));
-        assert_eq!(bans(&all), vec!["11.24.48.0/24"]);
+        assert_eq!(bans(&all), vec!["11.32.48.0/24"]);
+    }
+
+    /// Three failed TLS handshakes within 3 s: a host ban.
+    fn attack(e: &mut Engine, t: i64, ip: &str) {
+        for i in 0..3 {
+            e.on_event(&ev(t + i, ip, Signal::XmppTlsFail));
+        }
+    }
+
+    #[test]
+    fn subnet_bans_grow_step_by_step() {
+        let mut e = engine();
+        for host in [10, 11, 12] {
+            attack(&mut e, 0, &format!("11.18.91.{host}"));
+        }
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.18.91.0/24"], "the first subnet ban is a /24");
+
+        // 5 prefix bits away (common network /19): more than one step, so it stays a host ban
+        attack(&mut e, 200, "11.18.68.5");
+        assert!(bans(&e.tick(300 * SEC)).is_empty());
+
+        // in the same /22: the ban grows to the /22 and takes both in
+        attack(&mut e, 400, "11.18.89.7");
+        let a = e.tick(500 * SEC);
+        assert_eq!(bans(&a), vec!["11.18.88.0/22"]);
+        let grown = a.iter().find(|a| a.kind == ActionKind::Ban).unwrap();
+        assert_eq!(grown.superseded.len(), 2, "{:?}", grown.superseded);
+        assert!(grown.message.contains("grown from 11.18.91.0/24, banned nearby: 11.18.89.7"), "{}", grown.message);
+        assert!(grown.evidence.iter().any(|l| l.contains(" 11.18.89.7 ")), "what it did: {:?}", grown.evidence);
+        assert_eq!(e.banned_by("11.18.90.200".parse().unwrap()).unwrap().net.to_string(), "11.18.88.0/22");
+        assert!(e.banned_by("11.18.92.1".parse().unwrap()).is_none(), "the rest of the /16 stays reachable");
+
+        // /22 -> /20 (11.18.81.1), which brings 11.18.68.5 within one step: /19, as one ban
+        attack(&mut e, 600, "11.18.81.1");
+        let a = e.tick(700 * SEC);
+        assert_eq!(bans(&a), vec!["11.18.64.0/19"]);
+        let grown = a.iter().find(|a| a.kind == ActionKind::Ban).unwrap();
+        assert!(grown.message.contains("grown from 11.18.88.0/22, banned nearby: 11.18.68.5, 11.18.81.1"), "{}", grown.message);
+
+        // never past v4_wide_prefix (/16), never into the next /16
+        attack(&mut e, 800, "11.18.104.1");
+        attack(&mut e, 800, "11.19.0.1");
+        assert!(bans(&e.tick(900 * SEC)).is_empty(), "3 bits from the /19: too far");
+        attack(&mut e, 1000, "11.18.32.9");
+        assert_eq!(bans(&e.tick(1100 * SEC)), vec!["11.18.0.0/16"], "/18, then 11.18.104.1 is one step away");
+        assert_eq!(e.banned_by("11.19.0.1".parse().unwrap()).unwrap().net.to_string(), "11.19.0.1");
+        assert!(bans(&e.tick(1200 * SEC)).is_empty());
+        let cover = subnet_coverage(&e.export(None).bans);
+        assert_eq!(cover, SubnetCoverage { subnets: 1, v4_addresses: 65_536, widest_v4: Some(16) });
+    }
+
+    #[test]
+    fn subnet_growth_limits() {
+        let seed = |e: &mut Engine| {
+            for host in [10, 11, 12] {
+                attack(e, 0, &format!("11.18.91.{host}"));
+            }
+            assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.18.91.0/24"]);
+        };
+        // a user who logged in from the next /24 keeps it out of the ban
+        let mut e = engine();
+        e.on_event(&Event::new(0, "11.18.90.50".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        seed(&mut e);
+        attack(&mut e, 200, "11.18.89.7");
+        assert!(bans(&e.tick(300 * SEC)).is_empty());
+
+        // two banned /24s side by side make exactly their /23
+        let mut e = engine();
+        seed(&mut e);
+        for host in [20, 21, 22] {
+            attack(&mut e, 200, &format!("11.18.90.{host}"));
+        }
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.90.0/24", "11.18.90.0/23"]);
+
+        // with a network database: never into another provider's addresses
+        let mut e = engine();
+        let mut db = crate::geo::GeoDb::default();
+        db.read("11.18.88.0,11.18.89.255,64501,\"Other\"\n11.18.90.0,11.18.95.255,64500,\"Provider\"\n".as_bytes(), false).unwrap();
+        e.geo = Some(Arc::new(db));
+        seed(&mut e);
+        attack(&mut e, 200, "11.18.89.7");
+        attack(&mut e, 200, "11.18.90.9");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.90.0/23"], "the /22 would hold AS64501's 11.18.88.0/23");
+
+        // a larger step: one ban anywhere within it is enough (here 5 bits, /24 -> /19)
+        let mut cfg = Config::default();
+        cfg.subnets.wide_max_step = 8;
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        seed(&mut e);
+        attack(&mut e, 200, "11.18.68.5");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.64.0/19"]);
+
+        // growth off: /24 bans stay /24
+        let mut cfg = Config::default();
+        cfg.subnets.wide_enabled = false;
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        seed(&mut e);
+        attack(&mut e, 200, "11.18.89.7");
+        assert!(bans(&e.tick(300 * SEC)).is_empty());
+
+        // IPv6 /64 bans grow too, 4 bits at a time, up to /48
+        let mut e = engine();
+        for host in 1..=3 {
+            attack(&mut e, 0, &format!("3fff:100:1:2::{host}"));
+        }
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:100:1:2::/64"]);
+        attack(&mut e, 200, "3fff:100:1:3::1");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["3fff:100:1:2::/63"], "the narrowest network with the nearest ban");
+        attack(&mut e, 400, "3fff:100:1:ff::1");
+        assert!(bans(&e.tick(500 * SEC)).is_empty(), "8 bits away: more than 4 at a time");
+        attack(&mut e, 600, "3fff:100:1:8::1");
+        assert_eq!(bans(&e.tick(700 * SEC)), vec!["3fff:100:1::/56"], "through the /60 on to the far one, in one go");
+        attack(&mut e, 800, "3fff:100:2::1");
+        assert!(bans(&e.tick(900 * SEC)).is_empty(), "another /48: never past v6_wide_prefix");
+        // ...and not at all with v6_wide_prefix = v6_prefix
+        let mut cfg = Config::default();
+        cfg.subnets.v6_wide_prefix = 64;
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        for host in 1..=3 {
+            attack(&mut e, 0, &format!("3fff:100:1:2::{host}"));
+        }
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:100:1:2::/64"]);
+        attack(&mut e, 200, "3fff:100:1:3::1");
+        assert!(bans(&e.tick(300 * SEC)).is_empty());
     }
 
     #[test]
@@ -3023,17 +3912,21 @@ mod tests {
         let a = e.on_event(&ok(8 * 86_400, "3.3.3.3"));
         assert!(a.iter().any(|a| a.message.contains("new network 3.3.0.0/16")));
         assert!(e.on_event(&ok(8 * 86_400 + 5, "2.2.2.9")).is_empty(), "known network");
+        // accounts beyond MAX_ACCOUNTS are not tracked: their networks aren't kept either
+        e.account_first_seen.extend((0..MAX_ACCOUNTS).map(|i| (format!("ejabberd:u{i}@x"), 0)));
+        e.on_event(&Event::new(9 * 86_400 * SEC, "4.4.4.4".parse().unwrap(), Signal::XmppAuthOk).account(Some("new@x")));
+        assert!(!e.account_nets.contains_key("ejabberd:new@x") && !e.account_asns.contains_key("ejabberd:new@x"));
     }
 
     #[test]
     fn own_address_is_never_scored_and_wall_alerts_have_real_time() {
         let mut e = engine();
-        e.set_own_addresses(vec!["11.17.39.236".parse().unwrap()]);
+        e.set_own_addresses(vec!["11.25.39.236".parse().unwrap()]);
         for i in 0..20 {
-            assert!(bans(&e.on_event(&ev(i, "11.17.39.236", Signal::XmppNoAuth))).is_empty());
+            assert!(bans(&e.on_event(&ev(i, "11.25.39.236", Signal::XmppNoAuth))).is_empty());
         }
-        assert_eq!(e.protection("11.17.39.236".parse().unwrap()), Some("this host"));
-        assert!(e.ips.get(&"11.17.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
+        assert_eq!(e.protection("11.25.39.236".parse().unwrap()), Some("this host"));
+        assert!(e.ips.get(&"11.25.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
         // engine clock still at the start (no log line yet): the alert gets the wall-clock time
         let mut e = engine();
         let a = e.system_alert_wall("cert:x", 86_400 * SEC, Severity::High, "expires".into(), 1_791_806_149 * SEC);
@@ -3045,15 +3938,15 @@ mod tests {
     fn longer_bans_outlive_a_shorter_subnet_ban() {
         let mut e = engine();
         let mut out = vec![];
-        let long: Net = "11.9.9.9".parse().unwrap();
+        let long: Net = "11.15.9.9".parse().unwrap();
         e.insert_ban(long, 30 * 86_400 * SEC, 5, "repeat".into(), None, "m".into(), vec![], "x", &mut out);
-        let short: Net = "11.9.9.0/24".parse().unwrap();
+        let short: Net = "11.15.9.0/24".parse().unwrap();
         e.insert_ban(short, 3600 * SEC, 1, "subnet".into(), None, "m".into(), vec![], "x", &mut out);
         assert_eq!(out[1].superseded, vec![long], "nftables needs the host element gone first");
-        assert!(e.banned_by("11.9.9.9".parse().unwrap()).is_some_and(|b| b.net == short));
+        assert!(e.banned_by("11.15.9.9".parse().unwrap()).is_some_and(|b| b.net == short));
         let a = e.tick(3601 * SEC);
         let kinds: Vec<(ActionKind, String)> = a.iter().map(|a| (a.kind, a.target.unwrap().to_string())).collect();
-        assert_eq!(kinds, vec![(ActionKind::Unban, "11.9.9.0/24".into()), (ActionKind::Ban, "11.9.9.9".into())]);
+        assert_eq!(kinds, vec![(ActionKind::Unban, "11.15.9.0/24".into()), (ActionKind::Ban, "11.15.9.9".into())]);
         assert_eq!(a[1].until, Some(30 * 86_400 * SEC), "same end as before");
         assert!(e.export(None).bans.iter().all(|b| b.inner.is_empty()));
     }
@@ -3100,7 +3993,7 @@ mod tests {
         let ok = |t: i64, ip: &str| Event::new(t * SEC, ip.parse().unwrap(), Signal::XmppAuthOk).account(Some("user5@x"));
         assert!(e.on_event(&ok(0, "5.9.1.1")).is_empty(), "learning");
         // a different /16 (and country) of the same provider: no news
-        assert!(e.on_event(&ok(8 * 86_400, "11.28.1.1")).is_empty());
+        assert!(e.on_event(&ok(8 * 86_400, "11.36.1.1")).is_empty());
         let a = e.on_event(&ok(8 * 86_400 + 60, "1.0.0.7"));
         assert_eq!(
             a[0].message,
@@ -3146,6 +4039,50 @@ mod tests {
         assert!(e.banned_by("3.3.3.3".parse().unwrap()).is_none());
     }
 
+    /// A weekly alert stays weekly: garbage collection keeps its gate.
+    #[test]
+    fn weekly_system_alerts_stay_weekly() {
+        let mut e = engine();
+        let day = 86_400 * SEC;
+        let week = 7 * day;
+        let remind = |e: &mut Engine, t| e.system_alert_wall("cluster-key-age", week, Severity::Warning, "rotate".into(), t);
+        assert_eq!(remind(&mut e, day).len(), 1);
+        e.tick(3 * day); // collects garbage
+        assert!(remind(&mut e, 3 * day).is_empty(), "two days later");
+        assert_eq!(remind(&mut e, day + week).len(), 1, "a week later");
+    }
+
+    /// A login can only lift a ban in shadow mode, and only one tied to its connection; an
+    /// unverified one earns no trust either.
+    #[test]
+    fn logins_lift_no_bans_in_enforce_mode_and_unverified_ones_earn_no_trust() {
+        let ip: IpAddr = "3.3.3.3".parse().unwrap();
+        let login = |verified| Event::new(10 * SEC, ip, Signal::XmppAuthOk).account(Some("c@d")).verified(verified);
+        let banned = |mode| {
+            let mut e = Engine::new(Arc::new(Config { mode, ..Default::default() }), 0);
+            e.enable_sharing(vec![]);
+            for i in 0..3 {
+                e.on_event(&ev(i, "3.3.3.3", Signal::XmppTlsFail));
+            }
+            let _ = e.take_outbox(f64::MAX);
+            e
+        };
+        let mut e = banned(crate::config::Mode::Enforce);
+        let a = e.on_event(&login(true));
+        assert!(a.iter().all(|a| a.kind != ActionKind::Unban), "enforce: the ban stays");
+        assert!(a.iter().any(|a| a.topic == Some(Topic::FalsePositive) && a.message.contains("ban kept")));
+        assert!(e.banned_by(ip).is_some());
+        assert!(!e.take_outbox(f64::MAX).iter().any(|f| matches!(f, FactBody::Unban { .. })), "nothing lifted at the peers");
+
+        let mut e = banned(crate::config::Mode::Shadow);
+        e.on_event(&login(false));
+        assert!(e.banned_by(ip).is_some(), "an unverified login lifts nothing");
+        assert!(!e.trusted_for(ip, Source::Ejabberd), "and earns no trust");
+        e.on_event(&login(true));
+        assert!(e.banned_by(ip).is_none());
+        assert!(e.trusted_for(ip, Source::Ejabberd));
+    }
+
     #[test]
     fn persistence_roundtrip() {
         let mut e = engine();
@@ -3186,5 +4123,159 @@ mod tests {
         assert_eq!((a[0].severity, a[0].topic), (Severity::High, Some(Topic::Integrity)));
         assert_eq!(a[0].evidence, ["+ `@reboot root /opt/y`"]);
         assert!(crate::notify::NotifyCfg::default().admin_topics.contains(&Topic::Integrity));
+    }
+
+    #[test]
+    fn operator_bans() {
+        let mut e = engine();
+        e.enable_sharing(vec!["203.0.113.9".parse().unwrap()]);
+        e.now = 100 * SEC;
+        let net: Net = "11.15.9.9".parse().unwrap();
+        let a = e.operator_ban(net, 100 * SEC + 7 * 86_400 * SEC, "scanner".into()).unwrap();
+        assert_eq!(bans(&a), vec!["11.15.9.9"]);
+        assert!(a[0].message.contains("for 7d00h (operator): scanner"), "{}", a[0].message);
+        assert_eq!(a[0].category.as_deref(), Some("operator"));
+        let shared = e.take_outbox(1000.0);
+        assert!(matches!(&shared[..], [FactBody::Ban { forgeable: false, .. }]), "shared, as evidence a peer applies: {shared:?}");
+        // again: the old ban goes first (nftables would keep its timeout)
+        let a = e.operator_ban(net, 200 * SEC, "shorter".into()).unwrap();
+        assert_eq!(a.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::Unban, ActionKind::Ban]);
+        // refused: protected addresses, ones inside a wider ban, networks wider than own bans
+        for (target, why) in [("11.43.43.31", "allowlisted"), ("203.0.113.9", "cluster peer"), ("10.0.0.1", "private")] {
+            let err = e.operator_ban(target.parse().unwrap(), 300 * SEC, "x".into()).unwrap_err();
+            assert!(err.contains(why), "{target}: {err}");
+        }
+        assert!(e.operator_ban("11.43.43.0/24".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("protected"));
+        assert!(e.operator_ban("11.9.0.0/12".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("wider"));
+        e.operator_ban("11.15.9.0/24".parse().unwrap(), 300 * SEC, "range".into()).unwrap();
+        assert!(e
+            .operator_ban("11.15.9.7".parse().unwrap(), 300 * SEC, "x".into())
+            .unwrap_err()
+            .contains("inside the ban on 11.15.9.0/24"));
+    }
+
+    #[test]
+    fn allowlisted_host_names() {
+        let mut e = engine();
+        let ip = "198.51.100.20";
+        e.on_event(&ev(1, ip, Signal::SshCanary).account(Some("root")));
+        assert!(e.banned_by(ip.parse().unwrap()).is_some());
+        // the home connection's name now resolves to it: unbanned, and never banned again
+        let a = e.set_allow_hosts(vec![ip.parse().unwrap()]);
+        assert!(a.iter().any(|a| a.kind == ActionKind::Unban && a.message.contains("allowlisted host name")), "{a:?}");
+        assert_eq!(e.protection(ip.parse().unwrap()), Some("allowlisted host name"));
+        let a = e.on_event(&ev(2, ip, Signal::SshCanary).account(Some("root")));
+        assert!(bans(&a).is_empty() && a.iter().any(|a| a.topic == Some(Topic::Protected)));
+        // the name moved on: the old address is an address like any other
+        e.set_allow_hosts(vec!["198.51.100.21".parse().unwrap()]);
+        assert_eq!(e.protection(ip.parse().unwrap()), None);
+        assert!(e.snapshot(0, 10).allow_hosts == vec!["198.51.100.21".parse::<Net>().unwrap()]);
+    }
+
+    #[test]
+    fn new_ssh_keys_after_learning() {
+        let mut e = engine();
+        let login =
+            |t: i64, key: &str| Event::new(t * SEC, "198.51.100.30".parse().unwrap(), Signal::SshAuthOk).account(Some("gw")).key(Some(key));
+        assert!(e.on_event(&login(0, "ED25519 SHA256:aaa")).is_empty());
+        assert!(e.on_event(&login(86_400, "ED25519 SHA256:bbb")).is_empty(), "learned during the first week");
+        assert!(e.on_event(&login(8 * 86_400, "ED25519 SHA256:aaa")).is_empty());
+        let a = e.on_event(&login(9 * 86_400, "RSA SHA256:evil"));
+        assert_eq!((a.len(), a[0].severity, a[0].topic), (1, Severity::High, Some(Topic::Compromise)));
+        assert!(a[0].message.contains("ssh:gw logged in from 198.51.100.30 with an SSH key it never used before (RSA SHA256:evil"));
+        assert!(e.on_event(&login(9 * 86_400 + 60, "RSA SHA256:evil")).is_empty(), "known from now on");
+        // kept across a restart
+        let mut back = engine();
+        back.restore(decode_state(&encode_state(&e.export(None)).unwrap()).unwrap());
+        assert!(back.on_event(&login(10 * 86_400, "RSA SHA256:evil")).is_empty());
+        // su names the account's last SSH login
+        let sw = crate::parse::privilege::parse("su", "FAILED SU (to root) gw on pts/0").unwrap();
+        let a = back.on_privilege(&sw, 10 * 86_400 * SEC + 5 * SEC);
+        assert!(a[0].message.contains("(gw's last SSH login: 198.51.100.30, 5s ago)"), "{}", a[0].message);
+    }
+
+    #[test]
+    fn alert_gate_is_bounded() {
+        let mut e = engine();
+        e.now = 1000 * SEC;
+        e.alert_gate.insert("system:cluster-key-age".into(), 0);
+        for i in 0..MAX_ALERT_GATE as i64 + 500 {
+            e.alert_gate.insert(format!("proc-exe:x{i}:/tmp/x{i}"), i);
+        }
+        e.gc(false);
+        assert_eq!(e.alert_gate.len(), MAX_ALERT_GATE + 1);
+        assert!(e.alert_gate.contains_key("system:cluster-key-age"), "system keys stay");
+        assert!(!e.alert_gate.contains_key("proc-exe:x0:/tmp/x0") && e.alert_gate.contains_key("proc-exe:x50499:/tmp/x50499"));
+    }
+
+    /// One local user changing their own crontab, scripts or processes every minute gets
+    /// `USER_ALERTS_PER_HOUR` alerts to the admins an hour, and one saying the rest are only
+    /// logged; changes only root can make are never held back.
+    #[test]
+    fn a_users_own_changes_have_an_hourly_budget() {
+        let mut e = engine();
+        let h = 3600 * SEC;
+        let finding = |i: usize, owner: Option<u32>| crate::cronwatch::Finding {
+            key: format!("cron:/var/spool/cron/crontabs/eve:{i}"),
+            every: 0,
+            severity: Severity::High,
+            message: format!("cron: crontab changed #{i}"),
+            evidence: vec![],
+            notify: true,
+            owner,
+        };
+        let sent = |a: &[Action]| a.iter().filter(|a| a.topic == Some(Topic::Integrity)).count();
+        let mut a = Vec::new();
+        for i in 0..8 {
+            a.extend(e.findings(vec![finding(i, Some(1000))], 10 * h + i as i64 * MIN));
+        }
+        assert_eq!(a.len(), 9, "every change on record, and the notice: {a:?}");
+        assert_eq!(sent(&a), USER_ALERTS_PER_HOUR + 1);
+        let notice = a.iter().find(|a| a.message.contains("only logged (")).unwrap();
+        assert!(notice.message.contains("uid 1000") && notice.topic == Some(Topic::Integrity), "{}", notice.message);
+        let held: Vec<&Action> = a.iter().filter(|a| a.topic.is_none()).collect();
+        assert_eq!(held.len(), 3);
+        assert!(held[0].message.ends_with("[only logged: uid 1000 had its 5 alerts this hour]"), "{}", held[0].message);
+        // another user, and root's own changes, are not held back by it
+        assert_eq!(sent(&e.findings(vec![finding(20, Some(1001))], 10 * h + 9 * MIN)), 1);
+        assert_eq!(sent(&e.findings((30..40).map(|i| finding(i, None)).collect(), 10 * h + 10 * MIN)), 10);
+        // an hour on, the user's alerts go out again
+        assert_eq!(sent(&e.findings(vec![finding(50, Some(1000))], 11 * h + 5 * MIN)), 1);
+    }
+
+    /// A local user trying every account there is gets one alert per 10 minutes, not one
+    /// per account: the hourly messages about compromises stay for the rest.
+    #[test]
+    fn privilege_failures_alert_per_user() {
+        let mut e = engine();
+        let fail = |target: &str| crate::parse::privilege::parse("su", &format!("FAILED SU (to {target}) eve on pts/1")).unwrap();
+        let mut alerts = 0;
+        for (i, target) in ["root", "daemon", "bin", "sys", "www-data", "ejabberd"].iter().enumerate() {
+            alerts += e.on_privilege(&fail(target), (100 + i as i64) * SEC).len();
+        }
+        assert_eq!(alerts, 1);
+        let a = e.on_privilege(&fail("root"), 100 * SEC + 11 * MIN);
+        assert!(a[0].message.contains("7 failures in 11m"), "{}", a[0].message);
+        let ok = crate::parse::privilege::parse("su", "(to daemon) eve on pts/1").unwrap();
+        let a = e.on_privilege(&ok, 100 * SEC + 12 * MIN);
+        assert!(a[0].severity == Severity::Warning && a[0].message.contains("after 7 failed attempts"), "{}", a[0].message);
+    }
+
+    #[test]
+    fn honeypot_hits_are_not_forgeable() {
+        let mut e = engine();
+        e.enable_sharing(vec![]);
+        let a = e.on_event(&ev(1, "11.14.8.8", Signal::TripwireConnect).port(Some(2323)));
+        assert_eq!(bans(&a), vec!["11.14.8.8"]);
+        assert_eq!(a[0].category.as_deref(), Some("tripwire"));
+        let facts = e.take_outbox(10.0);
+        assert!(
+            facts.iter().all(|f| matches!(f, FactBody::Ban { forgeable: false, .. } | FactBody::Report { forgeable: false, .. })),
+            "a completed handshake names its sender: {facts:?}"
+        );
+        // a logged-in address (a carrier NAT neighbour) is still excused, as for blocked SYNs
+        let user = "11.14.8.9";
+        e.on_event(&ev(2, user, Signal::SshAuthOk).account(Some("gw")));
+        assert!(bans(&e.on_event(&ev(3, user, Signal::TripwireConnect).port(Some(2323)))).is_empty());
     }
 }

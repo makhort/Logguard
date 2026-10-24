@@ -203,7 +203,7 @@ async fn outbox_to_telegram() {
         delete_after: Some(Duration::from_secs(3600)),
         protect: true,
         state_path: dir.join("state.json"),
-        servers: ServerNames::parse("xmpp=11.17.39.236,example.org; vpn=11.25.48.86").unwrap(),
+        servers: ServerNames::parse("xmpp=11.25.39.236,example.org; vpn=11.33.48.86").unwrap(),
         recipient: None,
     };
     let api = Api::new(&url, TOKEN).unwrap();
@@ -216,7 +216,7 @@ async fn outbox_to_telegram() {
         &outbox,
         "alert-0001.msg",
         "[xmpp] logguard: new registration\n\n[Info] account alice@example.org registered from 1.2.3.4\n  \
-         cluster peer 11.25.48.86:7946 failing; nextcloud.example.org:443 5d",
+         cluster peer 11.33.48.86:7946 failing; nextcloud.example.org:443 5d",
     );
     let old = alert(&outbox, "alert-0000.msg", "[xmpp] logguard: system\n\nold");
     std::fs::File::options().write(true).open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(25 * 3600)).unwrap();
@@ -243,7 +243,7 @@ async fn outbox_to_telegram() {
 
     // the weekly report: without the admin's OpenPGP key it waits, never sent in clear
     let report =
-        "Abuse report from xmpp (11.17.39.236) and vpn\nPeriod: 2026-10-12 to 2026-10-19 UTC.\n\nHello, abuse@hetzner.de,\n1.2.3.4 tried\n";
+        "Abuse report from xmpp (11.25.39.236) and vpn\nPeriod: 2026-10-12 to 2026-10-19 UTC.\n\nHello, abuse@hetzner.de,\n1.2.3.4 tried\n";
     std::fs::write(outbox.join("abuse-report-2026-10-19.txt"), report).unwrap();
     std::fs::write(outbox.join(".abuse-report-2026-10-26.txt.tmp"), "being written").unwrap();
     bot.deliver_files().await;
@@ -262,7 +262,7 @@ async fn outbox_to_telegram() {
     let today = chrono::Utc::now().format("%Y-%m-%d");
     assert!(form.contains(&format!("filename=\"report-{today}.txt.pgp\"")), "{form}");
     assert!(form.contains(FILE_CAPTION), "{form}");
-    for clear in ["Abuse", "abuse", "Period", "hetzner", "11.17.39.236", "xmpp (", "1.2.3.4"] {
+    for clear in ["Abuse", "abuse", "Period", "hetzner", "11.25.39.236", "xmpp (", "1.2.3.4"] {
         assert!(!form.contains(clear), "{clear} in clear: {form}");
     }
     assert!(form.contains(&format!("\r\n{ADMIN}\r\n")), "chat_id: {form}");

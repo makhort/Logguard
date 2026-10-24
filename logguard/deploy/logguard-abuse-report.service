@@ -14,6 +14,10 @@ EnvironmentFile=-/etc/default/logguard-abuse-report
 ExecStart=/usr/local/sbin/logguard-abuse-report
 Nice=10
 IOSchedulingClass=idle
+# Reports from peers are read into memory (each capped at 64 MB unpacked); a week's merge of
+# real ones needs a few MB.
+MemoryHigh=192M
+MemoryMax=256M
 
 # Sandbox: reads logguard's records, writes the cluster inbox (/var/lib/logguard) and the
 # bots' outboxes (logguard-xmpp-bot's, logguard-tg-bot's, logguard-mail-bot's; any may be missing), talks to the peers and

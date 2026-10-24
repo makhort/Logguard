@@ -37,6 +37,10 @@ pub struct FeedsCfg {
     /// 0 = no check. After an intended change (a new feed), delete
     /// `<cache_dir>/accepted.txt` once.
     pub max_growth: f64,
+    /// Lists of networks (ASNs) to block wholesale, e.g. Spamhaus ASN-DROP
+    /// (`https://www.spamhaus.org/drop/asndrop.json`): their addresses come from the `[geo]`
+    /// network database and are loaded with the other feeds, under the same limits.
+    pub asn_urls: Vec<String>,
 }
 
 impl Default for FeedsCfg {
@@ -50,11 +54,15 @@ impl Default for FeedsCfg {
             ],
             refresh: Dur(86_400),
             cache_dir: "/var/lib/logguard/feeds".into(),
-            fetch: ["curl", "-fsSL", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"].map(String::from).to_vec(),
+            // a redirect may not leave https (a feed or RDAP answer from anyone on the way)
+            fetch: ["curl", "-fsSL", "--proto-redir", "=https", "--max-time", "60", "--retry", "2", "--max-filesize", "50000000"]
+                .map(String::from)
+                .to_vec(),
             max_entries: 100_000,
             min_prefix_v4: 12,
             min_prefix_v6: 24,
             max_growth: 2.0,
+            asn_urls: vec![],
         }
     }
 }
@@ -78,6 +86,15 @@ pub struct FeedStatus {
     /// Loaded into nftables (false in shadow mode, with the ufw backend, or on error).
     pub applied: bool,
     pub error: Option<String>,
+    /// Networks (ASNs) listed by `asn_urls`, and the address blocks they came to.
+    #[serde(default)]
+    pub asns: usize,
+    #[serde(default)]
+    pub asn_networks: usize,
+    /// The ASN lists were left out: no `[geo]` network database loaded yet (a refresh
+    /// follows once it is).
+    #[serde(default)]
+    pub asn_pending: bool,
 }
 
 /// Special-purpose ranges that must never be blocked (FireHOL level1 lists several).
@@ -115,6 +132,27 @@ pub fn parse_feed(text: &str) -> Vec<Net> {
         };
         if let Ok(net) = token.parse::<Net>() {
             out.push(net);
+        }
+    }
+    out
+}
+
+/// Parses ASN lists: Spamhaus ASN-DROP JSON lines (`{"asn":6939,...}`), `AS6939 ; ...` text,
+/// or one number per line.
+pub fn parse_asns(text: &str) -> std::collections::BTreeSet<u32> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let token = if line.starts_with('{') {
+            line.split("\"asn\":").nth(1).map(|r| r.trim_start().trim_start_matches('"')).unwrap_or("")
+        } else {
+            line.split(['#', ';']).next().unwrap_or("").trim()
+        };
+        let digits: String = token.trim_start_matches(['A', 'S', 'a', 's']).chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            if n > 0 {
+                out.insert(n);
+            }
         }
     }
     out
@@ -288,43 +326,102 @@ fn accepted_path(dir: &Path) -> PathBuf {
     dir.join("accepted.txt")
 }
 
+/// What a list was built from (its URLs), written at the top of `accepted.txt`: a list from
+/// other sources is an intended change, which the growth check doesn't refuse.
+fn sources_id(urls: &[String], asn_urls: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(urls.join("\n"));
+    if !asn_urls.is_empty() {
+        h.update("\n--asn--\n");
+        h.update(asn_urls.join("\n"));
+    }
+    h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Downloads a list, falling back to the cached copy; `parse` says whether it holds anything.
+fn fetch_list(cfg: &FeedsCfg, url: &str, holds: impl Fn(&str) -> bool) -> (Option<String>, SourceStatus) {
+    let cache = cache_path(&cfg.cache_dir, url);
+    let mut src = SourceStatus { url: url.to_string(), ..Default::default() };
+    let text = match download(cfg, url) {
+        Ok(t) if holds(&t) => {
+            let _ = std::fs::write(&cache, &t);
+            Some(t)
+        }
+        result => {
+            src.error = Some(match result {
+                Ok(_) => "downloaded list contains no networks".into(),
+                Err(e) => format!("{e:#}"),
+            });
+            src.from_cache = true;
+            std::fs::read_to_string(&cache).ok()
+        }
+    };
+    (text, src)
+}
+
 /// Downloads (or reads cached) lists and returns the networks to load. A result that is
 /// too big (`max_entries`) or grew too much (`max_growth`) is refused: the last accepted
 /// list is returned instead, with the reason in the status.
-pub fn refresh(cfg: &FeedsCfg, protected: &[Net]) -> (Vec<Net>, FeedStatus) {
+///
+/// `expand` gives the networks of the ASNs `asn_urls` list (from the `[geo]` network
+/// database); None while no database is loaded: the ASN lists are left out then.
+pub fn refresh(
+    cfg: &FeedsCfg,
+    protected: &[Net],
+    expand: &dyn Fn(&std::collections::BTreeSet<u32>) -> Option<Vec<Net>>,
+) -> (Vec<Net>, FeedStatus) {
     let mut status = FeedStatus { refreshed: time::now(), ..Default::default() };
     let _ = std::fs::create_dir_all(&cfg.cache_dir);
     let mut all = Vec::new();
     for url in &cfg.urls {
-        let cache = cache_path(&cfg.cache_dir, url);
-        let mut src = SourceStatus { url: url.clone(), ..Default::default() };
-        let text = match download(cfg, url) {
-            Ok(t) if !parse_feed(&t).is_empty() => {
-                let _ = std::fs::write(&cache, &t);
-                Some(t)
-            }
-            result => {
-                src.error = Some(match result {
-                    Ok(_) => "downloaded list contains no networks".into(),
-                    Err(e) => format!("{e:#}"),
-                });
-                src.from_cache = true;
-                std::fs::read_to_string(&cache).ok()
-            }
-        };
+        let (text, mut src) = fetch_list(cfg, url, |t| !parse_feed(t).is_empty());
         let nets = text.map(|t| parse_feed(&t)).unwrap_or_default();
         src.entries = nets.len();
         all.extend(nets);
         status.sources.push(src);
     }
+    let mut asns = std::collections::BTreeSet::new();
+    for url in &cfg.asn_urls {
+        let (text, mut src) = fetch_list(cfg, url, |t| !parse_asns(t).is_empty());
+        let listed = text.map(|t| parse_asns(&t)).unwrap_or_default();
+        src.entries = listed.len();
+        asns.extend(listed);
+        status.sources.push(src);
+    }
+    let mut sources = (cfg.urls.clone(), cfg.asn_urls.clone());
+    if !asns.is_empty() {
+        status.asns = asns.len();
+        match expand(&asns) {
+            Some(nets) => {
+                status.asn_networks = nets.len();
+                all.extend(nets);
+            }
+            None => {
+                // not expanded: the list is what the plain feeds make, for the growth check too
+                sources.1.clear();
+                status.asn_pending = true;
+            }
+        }
+    }
     let (kept, skipped) = sanitize(all, protected, cfg.min_prefix_v4, cfg.min_prefix_v6);
     let nets = aggregate(kept);
     status.skipped = skipped;
-    let accepted = std::fs::read_to_string(accepted_path(&cfg.cache_dir)).map(|t| parse_feed(&t)).unwrap_or_default();
+    let accepted_text = std::fs::read_to_string(accepted_path(&cfg.cache_dir)).unwrap_or_default();
+    let id = sources_id(&sources.0, &sources.1);
+    // a list of older versions has no id: it came from the plain feeds
+    let accepted_id = accepted_text
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("# sources "))
+        .map_or_else(|| sources_id(&cfg.urls, &[]), |s| s.trim().to_string());
+    let accepted = parse_feed(&accepted_text);
     // the protected list may have changed since: apply it to the old list too
     let accepted = aggregate(sanitize(accepted, protected, cfg.min_prefix_v4, cfg.min_prefix_v6).0);
     let refused = if nets.len() > cfg.max_entries {
         Some(format!("{} networks exceed max_entries {}", nets.len(), cfg.max_entries))
+    } else if accepted_id != id {
+        None // other lists than last time: an intended change
     } else {
         growth_problem(&accepted, &nets, cfg.max_growth)
     };
@@ -338,7 +435,7 @@ pub fn refresh(cfg: &FeedsCfg, protected: &[Net]) -> (Vec<Net>, FeedStatus) {
             accepted
         }
         None => {
-            let text: String = nets.iter().map(|n| format!("{n}\n")).collect();
+            let text: String = std::iter::once(format!("# sources {id}\n")).chain(nets.iter().map(|n| format!("{n}\n"))).collect();
             let _ = std::fs::write(accepted_path(&cfg.cache_dir), text);
             nets
         }
@@ -383,7 +480,7 @@ mod tests {
     fn parses_spamhaus_firehol_and_json() {
         let spamhaus = "; Spamhaus DROP List 2026/10/11\n; Last-Modified: x\n11.1.16.0/20 ; SBL256894\n11.2.32.0/22 ; SBL459831\n";
         let firehol = "#\n# firehol_level1\n#\n0.0.0.0/8\n11.1.16.0/20\n10.0.0.0/8\n11.3.10.0/23\n224.0.0.0/3\n";
-        let json = "{\"cidr\":\"11.10.56.0/22\",\"sblid\":\"SBL1\",\"rir\":\"ripencc\"}\n{\"type\":\"metadata\",\"timestamp\":1}\n";
+        let json = "{\"cidr\":\"11.16.56.0/22\",\"sblid\":\"SBL1\",\"rir\":\"ripencc\"}\n{\"type\":\"metadata\",\"timestamp\":1}\n";
         let v6 = "3fff:110::/29 ; SBL300728\n";
         let all: Vec<Net> = [spamhaus, firehol, json, v6].iter().flat_map(|t| parse_feed(t)).collect();
         assert_eq!(all.len(), 9);
@@ -393,15 +490,53 @@ mod tests {
         assert_eq!(skipped, 4, "0/8, 10/8, 224/3 and the protected 11.3.10.0/23");
         let merged = aggregate(kept);
         let s: Vec<String> = merged.iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, vec!["3fff:110::/29", "11.1.16.0/20", "11.2.32.0/22", "11.10.56.0/22"]);
+        assert_eq!(s, vec!["3fff:110::/29", "11.1.16.0/20", "11.2.32.0/22", "11.16.56.0/22"]);
+    }
+
+    #[test]
+    fn asn_lists() {
+        let json = "{\"asn\":6939,\"rir\":\"arin\",\"domain\":\"he.net\"}\n{\"type\":\"metadata\",\"timestamp\":1}\n";
+        let text = "; Spamhaus ASN-DROP\nAS64500 ; RU | X\n64501\nas64502\n0\nnot a number\n";
+        let all: Vec<u32> = parse_asns(json).into_iter().chain(parse_asns(text)).collect();
+        assert_eq!(all, vec![6939, 64500, 64501, 64502]);
+
+        let dir = std::env::temp_dir().join(format!("logguard-feeds-asn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = FeedsCfg {
+            cache_dir: dir.clone(),
+            urls: vec!["https://invalid.example/l".into()],
+            asn_urls: vec!["https://invalid.example/asn".into()],
+            fetch: vec!["false".into()],
+            ..Default::default()
+        };
+        std::fs::write(cache_path(&dir, &cfg.urls[0]), "11.1.16.0/20\n").unwrap();
+        std::fs::write(cache_path(&dir, &cfg.asn_urls[0]), "AS64500\n").unwrap();
+        // no network database yet: the plain feeds only, and why
+        let (nets, st) = refresh(&cfg, &[], &|_| None);
+        assert_eq!((nets.len(), st.asns, st.asn_pending, st.error.as_deref()), (1, 1, true, None));
+        // with it: the ASN's networks too, accepted although they are far more than the
+        // last list (other sources: an intended change)
+        let expand = |asns: &std::collections::BTreeSet<u32>| -> Option<Vec<Net>> {
+            Some(asns.iter().map(|_| "100.64.0.0/10".parse().unwrap()).chain(["11.9.0.0/12".parse().unwrap()]).collect())
+        };
+        let (nets, st) = refresh(&cfg, &[], &expand);
+        let s: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
+        assert_eq!(s, ["11.1.16.0/20", "11.9.0.0/12"], "the bogon is dropped as always: {st:?}");
+        assert_eq!((st.asn_networks, st.error), (2, None));
+        assert!(std::fs::read_to_string(dir.join("accepted.txt")).unwrap().starts_with("# sources "));
+        // the same sources again: the growth check applies
+        let (_, st) = refresh(&cfg, &[], &expand);
+        assert_eq!(st.error, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn aggregate_removes_nested() {
         let nets: Vec<Net> =
-            ["11.22.0.0/16", "11.22.53.0/24", "11.22.53.7", "11.19.62.0/24", "11.19.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
+            ["11.30.0.0/16", "11.30.53.0/24", "11.30.53.7", "11.27.62.0/24", "11.27.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
         let s: Vec<String> = aggregate(nets).iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, vec!["11.19.0.0/16", "11.22.0.0/16"]);
+        assert_eq!(s, vec!["11.27.0.0/16", "11.30.0.0/16"]);
     }
 
     #[test]
@@ -415,11 +550,11 @@ mod tests {
         };
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(cache_path(&dir, &cfg.urls[0]), "11.1.16.0/20\n").unwrap();
-        let (nets, st) = refresh(&cfg, &[]);
+        let (nets, st) = refresh(&cfg, &[], &|_| None);
         assert_eq!(nets.len(), 1);
         assert!(st.sources[0].from_cache && st.sources[0].error.is_some());
         let cfg = FeedsCfg { max_entries: 0, ..cfg };
-        let (nets, st) = refresh(&cfg, &[]);
+        let (nets, st) = refresh(&cfg, &[], &|_| None);
         assert_eq!(nets.len(), 1, "max_entries guard: the last accepted list stays");
         assert!(st.error.as_deref().is_some_and(|e| e.contains("max_entries")), "{st:?}");
         let _ = std::fs::remove_dir_all(dir);
@@ -438,22 +573,22 @@ mod tests {
         };
         let list = |text: &str| std::fs::write(cache_path(&dir, &cfg.urls[0]), text).unwrap();
         list("11.1.16.0/20\n11.2.32.0/22\n");
-        assert_eq!(refresh(&cfg, &[]).0.len(), 2, "first load: no baseline");
+        assert_eq!(refresh(&cfg, &[], &|_| None).0.len(), 2, "first load: no baseline");
         // one new /12 is ~250x the space: refused, the accepted list stays
         list("11.1.16.0/20\n11.2.32.0/22\n100.0.0.0/12\n");
-        let (nets, st) = refresh(&cfg, &[]);
+        let (nets, st) = refresh(&cfg, &[], &|_| None);
         assert_eq!(nets.len(), 2);
         assert!(st.error.as_deref().is_some_and(|e| e.contains("IPv4 addresses")), "{st:?}");
         // a few more small networks are normal growth
-        list("11.1.16.0/20\n11.2.32.0/22\n11.3.10.0/23\n11.10.56.0/22\n");
-        let (nets, st) = refresh(&cfg, &[]);
+        list("11.1.16.0/20\n11.2.32.0/22\n11.3.10.0/23\n11.16.56.0/22\n");
+        let (nets, st) = refresh(&cfg, &[], &|_| None);
         assert_eq!((nets.len(), st.error), (4, None));
         // wider than the floor (/12): never loaded
         list("11.1.16.0/20\n64.0.0.0/8\n");
-        assert!(!refresh(&cfg, &[]).0.iter().any(|n| n.prefix == 8));
+        assert!(!refresh(&cfg, &[], &|_| None).0.iter().any(|n| n.prefix == 8));
         // max_growth = 0: no check
         list("11.1.16.0/20\n100.0.0.0/12\n");
-        assert_eq!(refresh(&FeedsCfg { max_growth: 0.0, ..cfg.clone() }, &[]).0.len(), 2);
+        assert_eq!(refresh(&FeedsCfg { max_growth: 0.0, ..cfg.clone() }, &[], &|_| None).0.len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

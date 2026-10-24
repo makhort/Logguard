@@ -74,6 +74,9 @@ WAIT_MIN=${ABUSE_REPORT_WAIT_MIN:-15}
 RELAY_WAIT_MIN=${ABUSE_REPORT_RELAY_WAIT_MIN:-60}
 # merge: look up each network's abuse mailbox (RDAP via rdap.org, ~1 request per second).
 CONTACTS=${ABUSE_REPORT_CONTACTS:-yes}
+# relay: the largest merged report handed on (unpacked); a week's report is far smaller, and
+# a peer's file (one cluster message, 1 MB) could unpack a thousandfold into /run.
+MAX_REPORT_BYTES=$((64 << 20))
 
 if [ "$ROLE" = auto ]; then
     if [ "$(setting notify xmpp)" = false ] && [ "$peered" = yes ]; then
@@ -208,18 +211,24 @@ if [ "$ROLE" = relay ]; then
     until merged > /dev/null || [ "$SECONDS" -ge "$deadline" ]; do
         sleep 30
     done
-    if report=$(merged); then
-        gzip -dc "$report" > "$work/report.txt"
-        deliver "$work/report.txt" "merged on $(basename "$report" .txt.gz | sed 's/^abuse-report-//')"
+    report=$(merged) || report=
+    if [ -n "$report" ]; then
+        if gzip -dc "$report" | head -c "$MAX_REPORT_BYTES" > "$work/report.txt" \
+            && [ "$(wc -c < "$work/report.txt")" -lt "$MAX_REPORT_BYTES" ]; then
+            deliver "$work/report.txt" "merged on $(basename "$report" .txt.gz | sed 's/^abuse-report-//')"
+            rm -f "$report"
+            # the peers' own reports were merged there
+            find "$INBOX" -maxdepth 1 -type f -name 'abuse-*.json.gz' -delete 2> /dev/null || true
+            exit 0
+        fi
+        echo "WARNING: $report is damaged or larger than $((MAX_REPORT_BYTES >> 20)) MB unpacked; merging here instead"
         rm -f "$report"
-        # the peers' own reports were merged there
-        find "$INBOX" -maxdepth 1 -type f -name 'abuse-*.json.gz' -delete 2> /dev/null || true
     else
         # No merging peer (no XMPP server in this cluster), or it failed: merge here.
         echo "WARNING: no merged report arrived within $RELAY_WAIT_MIN minutes (no merging peer, or its" \
             "ABUSE_REPORT_FORWARD_TO isn't set); merging here (ABUSE_REPORT_ROLE=merge skips the wait)"
-        merge_here ", merged here"
     fi
+    merge_here ", merged here"
     exit 0
 fi
 

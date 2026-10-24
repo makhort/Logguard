@@ -2,7 +2,7 @@ name: logguard-tg-bot
 
 # Two kinds of push run this:
 #   - a branch push that changes these paths: the tests, then the bundle as a workflow artifact
-#   - a push of this crate's version tag, e.g. logguard-tg-bot-v0.1.0 (the version must be
+#   - a push of this crate's version tag, e.g. logguard-tg-bot-v0.2.0 (the version must be
 #     Cargo.toml's): the same, then the release job attaches the bundle to the GitHub Release
 #     of that tag. GitHub doesn't evaluate paths for tag pushes; other crates' tags don't match.
 on:
@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to commits (the tag or branch in the comment): a tag can be moved, and
+# the check job builds the bundle the release job attests and publishes.
+
 jobs:
   check:
     runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
@@ -27,19 +30,20 @@ jobs:
       run:
         working-directory: logguard-tg-bot
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check the tag against Cargo.toml
         if: github.ref_type == 'tag'
         run: ./scripts/bundle.sh --check-tag "$GITHUB_REF_NAME"
       # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable   # pinned to a commit, it can't take it from the ref name
           components: rustfmt, clippy, llvm-tools
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: logguard-tg-bot
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
           tool: cargo-audit
       - run: ./scripts/ci.sh
@@ -60,7 +64,7 @@ jobs:
           sudo test -f /opt/logguard-tg-bot/config.env
           if systemctl is-active -q logguard-tg-bot; then exit 1; fi             # not started until it is filled in
           /opt/logguard-tg-bot/logguard-tg-bot --version
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: logguard-tg-bot/target/bundle/*.zip
           archive: false
@@ -83,7 +87,7 @@ jobs:
       BUNDLE: ${{ needs.check.outputs.bundle }}
     steps:
       # upload-artifact named the artifact after the file (archive: false)
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ needs.check.outputs.bundle }}
           path: dist
@@ -100,7 +104,7 @@ jobs:
           sha256sum -c "$BUNDLE.sha256"           # the very file check built and installed
       - id: attest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: dist/${{ needs.check.outputs.bundle }}
       - name: Attach to the GitHub Release

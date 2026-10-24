@@ -2,7 +2,7 @@
 //! state and serves snapshots to the TUI over a Unix socket.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -49,10 +49,34 @@ enum Msg {
     Cron(Box<crate::cronwatch::CronReport>),
     Av(Box<crate::avscan::AvReport>),
     Resources(Box<crate::resources::Report>),
+    /// journalctl kept rejecting the saved journal position: what to tell the admins.
+    JournalReset(String),
+    /// What `journalctl --verify` found wrong (empty: nothing).
+    JournalVerify(Vec<String>),
+    /// The `[allowlist] hosts` resolved again, with what could not be resolved, and whether
+    /// that has gone on long enough to tell the admins (not a lookup at boot before DNS works).
+    AllowHosts(Vec<crate::net::Net>, Vec<String>, bool),
+    Patches(Box<crate::patches::PatchReport>),
+    Verify(Box<crate::verify::VerifyReport>),
+    Proc(Box<crate::procwatch::ProcReport>),
+    /// A completed handshake with a honeypot listener (`[ports] honeypot`), with its time.
+    Honeypot(crate::honeypot::Hit, time::Micros),
+    /// A line of a log file a pattern of your own reads (`[[patterns]] file`).
+    Custom(Record),
 }
+
+/// The journal fields `record::parse_journal_json` reads (journalctl adds the cursor and the
+/// time itself). Only these are printed: any local user can log entries with hundreds of
+/// fields of their own, which would otherwise come along, each up to 4 KB.
+const JOURNAL_FIELDS: &str = "MESSAGE,SYSLOG_IDENTIFIER,SYSLOG_PID,_SYSTEMD_UNIT,_PID,_EXE,_TRANSPORT,_UID";
+
+/// Longest journal line read: with only [`JOURNAL_FIELDS`] (each at most 4 KB, which JSON
+/// escaping can make a few times longer) a real one is far shorter.
+const MAX_JOURNAL_LINE: u64 = 1 << 20;
 
 pub fn journalctl_args(cfg: &Config, cursor: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = ["--follow", "--output=json", "--no-pager", "--quiet"].map(String::from).to_vec();
+    args.push(format!("--output-fields={JOURNAL_FIELDS}"));
     match cursor {
         Some(c) => args.push(format!("--after-cursor={c}")),
         None => args.push(format!("--since=-{}s", cfg.journal.initial_lookback.0)),
@@ -68,6 +92,7 @@ pub fn journalctl_args(cfg: &Config, cursor: Option<&str>) -> Vec<String> {
 
 /// Runs journalctl, restarting it from the last seen cursor if it ever exits.
 fn reader(cfg: Arc<Config>, mut cursor: Option<String>, tx: SyncSender<Msg>, child_slot: Arc<Mutex<Option<Child>>>, stop: Arc<AtomicBool>) {
+    let lookback = cfg.journal.initial_lookback;
     let mut quick_exits = 0;
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
@@ -83,9 +108,14 @@ fn reader(cfg: Arc<Config>, mut cursor: Option<String>, tx: SyncSender<Msg>, chi
         };
         let stdout = child.stdout.take().expect("piped stdout");
         *child_slot.lock().unwrap() = Some(child);
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            let (rec, cur) = parse_journal_json(&line);
+        let (mut lines, mut buf) = (BufReader::new(stdout), Vec::new());
+        loop {
+            buf.clear();
+            if !matches!(crate::record::read_line_capped(&mut lines, &mut buf, MAX_JOURNAL_LINE), Ok(n) if n > 0) {
+                break;
+            }
+            // a line cut short isn't JSON any more: skipped, as one journalctl can't print
+            let (rec, cur) = parse_journal_json(&String::from_utf8_lossy(&buf));
             if let Some(c) = &cur {
                 cursor = Some(c.clone());
             }
@@ -107,18 +137,32 @@ fn reader(cfg: Arc<Config>, mut cursor: Option<String>, tx: SyncSender<Msg>, chi
             // journalctl exit immediately; don't retry it forever.
             quick_exits = if started.elapsed() < Duration::from_secs(3) { quick_exits + 1 } else { 0 };
             if quick_exits >= 2 && cursor.is_some() {
-                eprintln!(
-                    "logguard: journalctl keeps rejecting the saved position; reading the last {} instead",
-                    cfg.journal.initial_lookback
-                );
+                eprintln!("logguard: journalctl keeps rejecting the saved position; reading the last {lookback} instead");
                 cursor = None;
                 quick_exits = 0;
+                // Lines between the saved position and the lookback may never be read. Normal
+                // after a downtime longer than journald keeps logs; otherwise someone may have
+                // removed journal files (evidence).
+                let msg = format!(
+                    "journald no longer has logguard's saved position in the journal (its files were rotated or vacuumed away, \
+                     or deleted): reading the last {lookback} instead, so lines logged in between may never have been read. \
+                     Expected after a downtime longer than journald keeps logs; otherwise check who removed journal files \
+                     (ls -l /var/log/journal/*; journalctl --verify)"
+                );
+                if tx.send(Msg::JournalReset(msg)).is_err() {
+                    return;
+                }
             }
             eprintln!("logguard: journalctl exited, restarting in 5s");
             thread::sleep(Duration::from_secs(5));
         }
     }
 }
+
+/// Longest line kept from a followed log: Apache's lines are at most a few KB, and a failed
+/// login in nextcloud.log is short. The rest of a longer one is read and dropped, so a line
+/// without end can't grow without bound.
+const MAX_FOLLOWED_LINE: u64 = 64 * 1024;
 
 /// Follows a command's stdout and stderr line by line (e.g. `docker logs -f`, `tail -F`),
 /// restarting it whenever it exits (container recreated, Docker restarted, file missing).
@@ -167,7 +211,7 @@ fn follow(
                     let mut reader = BufReader::new(pipe);
                     let mut buf = Vec::new();
                     let mut reported = seen;
-                    while matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
+                    while matches!(crate::record::read_line_capped(&mut reader, &mut buf, MAX_FOLLOWED_LINE), Ok(n) if n > 0) {
                         let text = String::from_utf8_lossy(&buf);
                         if let Some(rec) = crate::record::parse_nextcloud_line(&text).filter(|r| r.ts > seen) {
                             last.fetch_max(rec.ts, Ordering::Relaxed);
@@ -200,6 +244,145 @@ fn follow(
     });
 }
 
+/// Follows a log file a pattern of your own reads (`tail -F`, from its end: lines written
+/// while logguard was down aren't read), as `Source::Custom` records stamped when read.
+fn follow_file(path: String, tx: SyncSender<Msg>, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut warned = false;
+        while !stop.load(Ordering::Relaxed) {
+            let child = Command::new("tail")
+                .args(["-F", "-n", "0", &path])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    if !warned {
+                        warned = true;
+                        eprintln!("logguard: [[patterns]] {path}: cannot run tail: {e}");
+                    }
+                    thread::sleep(Duration::from_secs(30));
+                    continue;
+                }
+            };
+            let Some(out) = child.stdout.take() else { continue };
+            let (mut reader, mut buf) = (BufReader::new(out), Vec::new());
+            while matches!(crate::record::read_line_capped(&mut reader, &mut buf, MAX_FOLLOWED_LINE), Ok(n) if n > 0) {
+                let msg = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
+                buf.clear();
+                let sender = Some(Box::new(crate::record::Sender { file: Some(path.clone()), ..Default::default() }));
+                let rec = Record { ts: time::now(), source: crate::record::Source::Custom, pid: 0, msg, cursor: None, sender };
+                if tx.send(Msg::Custom(rec)).is_err() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            thread::sleep(Duration::from_secs(10));
+        }
+    });
+}
+
+/// `journalctl --verify` (with the sealing verification key, when one is set): the files
+/// that failed, leaving out the ones journald is writing (checked while they change, they
+/// can fail without anything wrong).
+fn verify_journal(cfg: &Config) -> Vec<String> {
+    let mut cmd = Command::new(&cfg.journal.journalctl);
+    cmd.args(["--verify", "--no-pager"]);
+    let key = &cfg.journal.verify_key_file;
+    if !key.as_os_str().is_empty() {
+        match fs::read_to_string(key) {
+            Ok(k) if !k.trim().is_empty() => {
+                cmd.arg(format!("--verify-key={}", k.trim()));
+            }
+            Ok(_) => return vec![format!("{} is empty", key.display())],
+            Err(e) => return vec![format!("cannot read {}: {e}", key.display())],
+        }
+    }
+    match crate::proc::run(cmd, None, Duration::from_secs(600)) {
+        Err(e) => vec![e],
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+            let failed = failed_journal_files(&text);
+            if failed.is_empty() && !out.status.success() && !text.contains("PASS") {
+                vec![crate::event::clean(&out.complaint(), 300)]
+            } else {
+                failed
+            }
+        }
+    }
+}
+
+/// What to tell the admins about `[journal] verify_key_file`, if it is set. A Forward Secure
+/// Sealing verification key is the seed every sealing key derives from (systemd's FSPRG): who
+/// holds it can seal edited journal files of any past period too. On this host, it catches
+/// only an intruder who doesn't look for it; and journalctl takes it on its command line,
+/// which every local user can read (`ps`) while the check runs, unless /proc hides it.
+fn verify_key_warning(cfg: &Config, mountinfo: &str) -> Option<String> {
+    let key = &cfg.journal.verify_key_file;
+    if cfg.journal.verify_every.0 == 0 || key.as_os_str().is_empty() {
+        return None;
+    }
+    let shown = if proc_hides_pids(mountinfo) {
+        ""
+    } else {
+        " It is also on journalctl's command line during each check, where every local user can read it \
+         (mount /proc with hidepid=invisible to hide it)."
+    };
+    Some(format!(
+        "[journal] verify_key_file {}: a sealing verification key can seal journal entries too, for any past period, so \
+         an intruder with root who reads it can rewrite the journal unnoticed. Kept on this server, the check only \
+         catches tampering by someone who doesn't look for the key: keep it elsewhere and verify copies of the \
+         journal there for a real guarantee.{shown}",
+        key.display()
+    ))
+}
+
+/// Whether /proc is mounted so that users can't see other users' processes (`hidepid`), from
+/// `/proc/self/mountinfo`.
+fn proc_hides_pids(mountinfo: &str) -> bool {
+    mountinfo.lines().any(|l| {
+        // `<id> <parent> <dev> <root> <mount point> <options> ... - <type> <source> <fs options>`
+        let (head, tail) = l.split_once(" - ").unwrap_or((l, ""));
+        let head: Vec<&str> = head.split_whitespace().collect();
+        let opts = [head.get(5).copied(), tail.split_whitespace().nth(2)];
+        head.get(4) == Some(&"/proc")
+            && opts
+                .iter()
+                .flatten()
+                .flat_map(|o| o.split(','))
+                .filter_map(|o| o.strip_prefix("hidepid="))
+                .any(|v| !matches!(v, "0" | "off"))
+    })
+}
+
+/// The `FAIL:` lines of `journalctl --verify` about archived files (names with `@`; the
+/// active `system.journal` changes while it is checked).
+fn failed_journal_files(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("FAIL: "))
+        .filter(|f| f.split_whitespace().next().and_then(|p| p.rsplit('/').next()).is_some_and(|name| name.contains('@')))
+        .map(|f| crate::event::clean(f, 300))
+        .take(10)
+        .collect()
+}
+
+/// Sleeps up to `d`, waking early when the daemon stops; false when it did.
+fn nap(d: Duration, stop: &AtomicBool) -> bool {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_secs(1).min(until.saturating_duration_since(Instant::now())));
+    }
+    !stop.load(Ordering::Relaxed)
+}
+
 type Control = (String, std::sync::mpsc::Sender<String>);
 
 fn serve_control(path: PathBuf, control: SyncSender<Control>) -> Result<()> {
@@ -214,9 +397,11 @@ fn serve_control(path: PathBuf, control: SyncSender<Control>) -> Result<()> {
             let Ok(mut s) = stream else { continue };
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-            let mut cmd = [0u8; 1024];
-            let n = s.read(&mut cmd).unwrap_or(0);
-            let cmd = String::from_utf8_lossy(&cmd[..n]).trim().to_string();
+            // the whole command, however it arrives (a long `allow` note in two pieces): the
+            // clients close their side after it; at most 4 KB, and no longer than the timeout
+            let mut cmd = Vec::new();
+            let _ = (&mut s).take(4096).read_to_end(&mut cmd);
+            let cmd = String::from_utf8_lossy(&cmd).trim().to_string();
             let cmd = if cmd.is_empty() { "snapshot".to_string() } else { cmd };
             // Executed by the main loop (it owns all state); the socket is root-only (0600).
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -372,6 +557,9 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
+    // No terminal is ours: a hangup (from one we opened by mistake as the controlling terminal)
+    // must not stop the daemon, as SIGHUP would by default.
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::new(AtomicBool::new(false)))?;
 
     let now = time::now();
     // Engine time starts at 0 (or the saved time) and is driven by record timestamps
@@ -405,6 +593,8 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     // The host itself (its checks, Nextcloud or bots reaching it via its public address).
     let own_nets: Vec<crate::net::Net> = crate::net::local_addresses().into_iter().map(crate::net::Net::host).collect();
     pipe.engine.set_own_addresses(own_nets.clone());
+    // `[allowlist] hosts`, as last resolved
+    let mut host_nets: Vec<crate::net::Net> = Vec::new();
     let never_block: Vec<crate::net::Net> = peer_nets.iter().chain(&own_nets).copied().collect();
     let mut enforcer = Enforcer::new(&cfg, &never_block);
     enforcer.restore(&pipe.engine.active_bans(), now);
@@ -430,11 +620,15 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         eprintln!("logguard: control socket disabled: {e:#}");
     }
     let protected: Vec<crate::net::Net> = cfg.allowlist.nets.iter().chain(never_block.iter()).copied().collect();
+    // The geo database the main loop has, for the feeds' ASN lists: used under the lock, so
+    // it is released (before a reload) only when no list is being expanded with it.
+    let geo_slot: Arc<Mutex<Option<Arc<crate::geo::GeoDb>>>> = Arc::new(Mutex::new(None));
     let feeds_refresh = if cfg.feeds.enabled {
         let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
-        let (tx, fcfg, protected) = (tx.clone(), cfg.feeds.clone(), protected.clone());
+        let (tx, fcfg, protected, slot) = (tx.clone(), cfg.feeds.clone(), protected.clone(), Arc::clone(&geo_slot));
         thread::spawn(move || loop {
-            let (nets, status) = crate::feeds::refresh(&fcfg, &protected);
+            let expand = |asns: &std::collections::BTreeSet<u32>| slot.lock().unwrap().as_ref().map(|db| db.networks_of(asns));
+            let (nets, status) = crate::feeds::refresh(&fcfg, &protected, &expand);
             if tx.send(Msg::Feeds(nets, Box::new(status))).is_err() {
                 return;
             }
@@ -453,6 +647,19 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             while !stop.load(Ordering::Relaxed) {
                 let mut certs: Vec<crate::digest::CertStatus> =
                     dcfg.certs.iter().map(|t| crate::digest::check_cert(&dcfg.openssl, t)).collect();
+                let wait = |d: Duration| {
+                    let end = std::time::Instant::now() + d;
+                    while std::time::Instant::now() < end {
+                        if stop.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    true
+                };
+                crate::digest::recheck_failed(&mut certs, &crate::digest::CERT_RETRY_WAITS, wait, |t| {
+                    crate::digest::check_cert(&dcfg.openssl, t)
+                });
                 for pattern in &dcfg.cert_files {
                     certs.extend(crate::digest::expand_files(pattern).iter().map(|p| crate::digest::check_cert_file(&dcfg.openssl, p)));
                 }
@@ -538,11 +745,13 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         }
     }
     if cfg.exposure.enabled {
-        let (tx, ecfg, stop) = (tx.clone(), cfg.exposure.clone(), Arc::clone(&stop));
+        let (tx, ecfg, tools, stop) = (tx.clone(), cfg.exposure.clone(), cfg.enforce.clone(), Arc::clone(&stop));
+        // logguard's own honeypot listeners: listed, marked, never alerted about
+        let honeypots: Vec<u16> = cfg.ports.honeypot.iter().map(|h| h.port).collect();
         thread::spawn(move || {
             let mut warned = false;
             while !stop.load(Ordering::Relaxed) {
-                match crate::exposure::scan(&ecfg) {
+                match crate::exposure::scan(&ecfg, &tools, &honeypots) {
                     Ok(r) => {
                         if tx.send(Msg::Exposure(Box::new(r))).is_err() {
                             return;
@@ -560,10 +769,13 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     }
     if cfg.cron.enabled {
         let (tx, ccfg, stop) = (tx.clone(), cfg.cron.clone(), Arc::clone(&stop));
+        let expected = crate::cronwatch::expected_path(&cfg.state_file);
         thread::spawn(move || {
             let mut scanner = crate::cronwatch::Scanner::default();
             while !stop.load(Ordering::Relaxed) {
-                if tx.send(Msg::Cron(Box::new(scanner.scan(&ccfg)))).is_err() {
+                let mut r = scanner.scan(&ccfg);
+                r.expected = crate::cronwatch::load_expected(&expected, r.scanned);
+                if tx.send(Msg::Cron(Box::new(r))).is_err() {
                     return;
                 }
                 thread::sleep(Duration::from_secs(ccfg.interval.0.max(10)));
@@ -580,6 +792,96 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 thread::sleep(Duration::from_secs(rcfg.interval.0.max(10)));
             }
         });
+    }
+    if !cfg.allowlist.hosts.is_empty() {
+        let (tx, hosts, stop) = (tx.clone(), cfg.allowlist.hosts.clone(), Arc::clone(&stop));
+        thread::spawn(move || {
+            let mut failing_since: Option<Instant> = None;
+            loop {
+                let (nets, errors) = crate::net::resolve_hosts(&hosts);
+                let failing = !errors.is_empty();
+                failing_since = if failing { failing_since.or(Some(Instant::now())) } else { None };
+                let report = failing_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(600));
+                if tx.send(Msg::AllowHosts(nets, errors, report)).is_err()
+                    || !nap(Duration::from_secs(if failing { 60 } else { 600 }), &stop)
+                {
+                    return;
+                }
+            }
+        });
+    }
+    if cfg.journal.verify_every.0 > 0 {
+        let (tx, c, stop) = (tx.clone(), Arc::clone(&cfg), Arc::clone(&stop));
+        thread::spawn(move || {
+            // not at boot, with everything else starting
+            while nap(Duration::from_secs(900), &stop) {
+                if tx.send(Msg::JournalVerify(verify_journal(&c))).is_err()
+                    || !nap(Duration::from_secs(c.journal.verify_every.0.saturating_sub(900)), &stop)
+                {
+                    return;
+                }
+            }
+        });
+    }
+    if cfg.patches.enabled {
+        let (tx, pcfg, stop) = (tx.clone(), cfg.patches.clone(), Arc::clone(&stop));
+        thread::spawn(move || {
+            while nap(Duration::from_secs(120), &stop) {
+                if tx.send(Msg::Patches(Box::new(crate::patches::scan(&pcfg, time::now())))).is_err() {
+                    return;
+                }
+                if !nap(Duration::from_secs(pcfg.interval.0.max(600).saturating_sub(120)), &stop) {
+                    return;
+                }
+            }
+        });
+    }
+    if cfg.verify.enabled {
+        let (tx, vcfg, stop) = (tx.clone(), cfg.verify.clone(), Arc::clone(&stop));
+        let mut last = pipe.engine.verify_last_run();
+        thread::spawn(move || loop {
+            // the first pass a quarter of an hour after start (or when the last is due), not at boot
+            let due = if last <= 0 { time::now() + 900 * time::SEC } else { last + vcfg.interval.micros() };
+            let wait = Duration::from_micros(u64::try_from(due - time::now()).unwrap_or(0)).max(Duration::from_secs(900));
+            if !nap(wait, &stop) {
+                return;
+            }
+            let report = crate::verify::scan(&vcfg, &|| stop.load(Ordering::Relaxed));
+            if stop.load(Ordering::Relaxed) {
+                return; // cut short: not a result
+            }
+            last = report.finished;
+            if tx.send(Msg::Verify(Box::new(report))).is_err() {
+                return;
+            }
+        });
+    }
+    if cfg.procwatch.enabled {
+        let (tx, pcfg, stop) = (tx.clone(), cfg.procwatch.clone(), Arc::clone(&stop));
+        thread::spawn(move || loop {
+            let r = crate::procwatch::scan(&pcfg);
+            let available = r.available;
+            if tx.send(Msg::Proc(Box::new(r))).is_err() || !available || !nap(Duration::from_secs(pcfg.interval.0.max(10)), &stop) {
+                return; // (no /proc: nothing to watch)
+            }
+        });
+    }
+    let honeypot_errors = if cfg.ports.honeypot.is_empty() {
+        vec![]
+    } else {
+        let tx = tx.clone();
+        let ports: Vec<u16> = cfg.ports.honeypot.iter().map(|h| h.port).collect();
+        // a flood is dropped rather than queued: each source counts once a minute anyway
+        crate::honeypot::start(
+            &ports,
+            move |hit| !matches!(tx.try_send(Msg::Honeypot(hit, time::now())), Err(std::sync::mpsc::TrySendError::Disconnected(_))),
+            Arc::clone(&stop),
+        )
+    };
+    for p in &cfg.patterns {
+        if let Some(f) = &p.file {
+            follow_file(f.display().to_string(), tx.clone(), Arc::clone(&stop));
+        }
     }
     if cfg.antivirus.enabled {
         let (tx, path, stop) = (tx.clone(), cfg.antivirus.log.clone(), Arc::clone(&stop));
@@ -602,6 +904,8 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     let mut deferred_exposure: Option<crate::exposure::ExposureReport> = None;
     let mut deferred_live: Vec<(&'static str, Record)> = Vec::new();
     let mut deferred_positions: Vec<(&'static str, time::Micros)> = Vec::new();
+    let mut deferred_events: Vec<crate::event::Event> = Vec::new();
+    let mut deferred_custom: Vec<Record> = Vec::new();
     if let Some(c) = &cluster {
         if !c.cfg.listen.is_empty() {
             let tx = tx.clone();
@@ -633,13 +937,24 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 });
             }
             let (inbox, skew, limits) = (c.cfg.inbox.clone(), c.cfg.max_clock_skew, c.limits.clone());
+            let senders = crate::cluster::Senders::default();
             // A file from a peer is written here, in the connection's thread: it carries no facts.
             let deliver = move |env: crate::cluster::Envelope, from: Option<std::net::IpAddr>| {
+                let limit = limits.of(from);
+                let own_name = senders.observe(&env.from, from, limit.is_some());
                 if env.file.is_none() {
                     return tx.send(Msg::Peer(Box::new(env), from)).is_ok();
                 }
-                if limits.of(from).is_some_and(|k| !k.contains(&crate::cluster::FactKind::Files)) {
+                if limit.as_ref().is_some_and(|k| !k.contains(&crate::cluster::FactKind::Files)) {
                     eprintln!("logguard: cluster: file from {} refused: [cluster] peer_accept doesn't allow files from there", env.from);
+                    return true;
+                }
+                if !own_name {
+                    eprintln!(
+                        "logguard: cluster: file from '{}' ({}) refused: a peer limited by [cluster] peer_accept sends under its own node name only",
+                        crate::event::clean(&env.from, 64),
+                        from.map_or("?".into(), |ip| ip.to_string())
+                    );
                     return true;
                 }
                 match crate::cluster::store_file(&inbox, &env, skew, time::now()) {
@@ -709,6 +1024,27 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             sink.handle(&enforcer, &mut pipe.engine, a);
         }
     }
+    if let Some(err) = enforcer.trip_error.as_ref() {
+        let msg = format!(
+            "nftables rejected the kernel tripwire rules, so tripwire hits are seen only through UFW's log (about 3 lines a minute); \
+             set [ports] kernel_tripwires = false to stop this warning. Error: {err}"
+        );
+        for a in pipe.engine.system_alert_wall("trip-setup", 86_400 * time::SEC, Severity::Warning, msg, time::now()) {
+            sink.handle(&enforcer, &mut pipe.engine, a);
+        }
+    }
+    if let Some(msg) = verify_key_warning(&cfg, &fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()) {
+        eprintln!("logguard: {msg}");
+        for a in pipe.engine.system_alert_wall("journal-verify-key", 7 * 86_400 * time::SEC, Severity::Warning, msg, time::now()) {
+            sink.handle(&enforcer, &mut pipe.engine, a);
+        }
+    }
+    if !honeypot_errors.is_empty() {
+        let msg = format!("[ports] honeypot: {}", honeypot_errors.join("; "));
+        for a in pipe.engine.system_alert_wall("honeypot", 86_400 * time::SEC, Severity::High, msg, time::now()) {
+            sink.handle(&enforcer, &mut pipe.engine, a);
+        }
+    }
     if pipe.engine.digest.since == 0 {
         pipe.engine.digest.since = now; // first period starts now, not at the epoch
     }
@@ -754,6 +1090,17 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             }
             for (name, t) in std::mem::take(&mut deferred_positions) {
                 advance(&mut pipe, name, t);
+            }
+            for ev in std::mem::take(&mut deferred_events) {
+                for a in pipe.event(ev) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            for mut rec in std::mem::take(&mut deferred_custom) {
+                clamp_ts(&mut rec);
+                for a in pipe.feed(&rec) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
             }
             for (env, from) in std::mem::take(&mut deferred_peers) {
                 if let Some(c) = cluster.as_mut() {
@@ -837,7 +1184,7 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                     );
                     peer_nets = nets;
                     pipe.engine.set_peer_nets(peer_nets.clone());
-                    let never_block: Vec<crate::net::Net> = peer_nets.iter().chain(&own_nets).copied().collect();
+                    let never_block: Vec<crate::net::Net> = peer_nets.iter().chain(&own_nets).chain(&host_nets).copied().collect();
                     if let Err(e) = enforcer.set_extra_allow(&never_block) {
                         eprintln!("logguard: updating the nftables allowlist with the peers: {e:#}");
                     }
@@ -874,11 +1221,19 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             }
             Ok(Msg::GeoRelease(ack)) => {
                 pipe.engine.geo = None;
+                *geo_slot.lock().unwrap() = None;
                 let _ = ack.send(());
             }
             Ok(Msg::Geo(db, errors)) => {
                 if let Some(db) = db {
+                    *geo_slot.lock().unwrap() = Some(Arc::clone(&db));
                     pipe.engine.geo = Some(db);
+                    // the ASN lists waited for it
+                    if pipe.engine.feeds.as_ref().is_some_and(|f| f.asn_pending) {
+                        if let Some(r) = &feeds_refresh {
+                            let _ = r.send(());
+                        }
+                    }
                 }
                 if !errors.is_empty() {
                     let msg = format!("geo database download failed (labels use the previous copy, if any): {}", errors.join("; "));
@@ -936,6 +1291,92 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             Ok(Msg::Exposure(r)) if !caught_up => deferred_exposure = Some(*r),
             Ok(Msg::Exposure(r)) => {
                 for a in pipe.engine.on_exposure(*r, cfg.sources.ufw) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            Ok(Msg::JournalReset(msg)) => {
+                for a in pipe.engine.system_alert_wall("journal-reset", 86_400 * time::SEC, Severity::High, msg, time::now()) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            Ok(Msg::JournalVerify(failed)) => {
+                if !failed.is_empty() {
+                    let msg = format!(
+                        "journalctl --verify failed: {} - journal files damaged{}",
+                        failed.join("; "),
+                        if cfg.journal.verify_key_file.as_os_str().is_empty() {
+                            ""
+                        } else {
+                            ", or changed after they were sealed (tampering)"
+                        }
+                    );
+                    for a in pipe.engine.system_alert_wall("journal-verify", 86_400 * time::SEC, Severity::High, msg, time::now()) {
+                        sink.handle(&enforcer, &mut pipe.engine, a);
+                    }
+                }
+            }
+            Ok(Msg::AllowHosts(nets, errors, report)) => {
+                if report {
+                    let msg = format!("[allowlist] hosts: {} (the addresses resolved before stay allowlisted)", errors.join("; "));
+                    for a in pipe.engine.system_alert_wall("allow-hosts", 86_400 * time::SEC, Severity::Warning, msg, time::now()) {
+                        sink.handle(&enforcer, &mut pipe.engine, a);
+                    }
+                }
+                // a failed lookup keeps the addresses known so far
+                let mut nets = nets;
+                if !errors.is_empty() {
+                    nets.extend(host_nets.iter().copied());
+                    nets.sort();
+                    nets.dedup();
+                }
+                if nets != host_nets {
+                    eprintln!(
+                        "logguard: [allowlist] hosts now resolve to {}",
+                        nets.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    host_nets = nets;
+                    for a in pipe.engine.set_allow_hosts(host_nets.clone()) {
+                        sink.handle(&enforcer, &mut pipe.engine, a);
+                    }
+                    let never_block: Vec<crate::net::Net> = peer_nets.iter().chain(&own_nets).chain(&host_nets).copied().collect();
+                    if let Err(e) = enforcer.set_extra_allow(&never_block) {
+                        eprintln!("logguard: updating the nftables allowlist with [allowlist] hosts: {e:#}");
+                    }
+                }
+            }
+            Ok(Msg::Patches(r)) => pipe.engine.on_patches(*r),
+            Ok(Msg::Verify(r)) => {
+                for a in pipe.engine.on_verify(&r) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            Ok(Msg::Proc(r)) => {
+                for a in pipe.engine.on_procwatch(&r) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            Ok(Msg::Honeypot(hit, ts)) => {
+                let ev = crate::event::Event::new(ts, hit.ip, crate::event::Signal::TripwireConnect)
+                    .port(Some(hit.port))
+                    .detail(format!("connected to honeypot TCP/{}", hit.port));
+                if !caught_up {
+                    if deferred_events.len() < 10_000 {
+                        deferred_events.push(ev);
+                    }
+                } else {
+                    for a in pipe.event(ev) {
+                        sink.handle(&enforcer, &mut pipe.engine, a);
+                    }
+                }
+            }
+            Ok(Msg::Custom(rec)) if !caught_up => {
+                if deferred_custom.len() < 10_000 {
+                    deferred_custom.push(rec);
+                }
+            }
+            Ok(Msg::Custom(mut rec)) => {
+                clamp_ts(&mut rec);
+                for a in pipe.feed(&rec) {
                     sink.handle(&enforcer, &mut pipe.engine, a);
                 }
             }
@@ -1022,6 +1463,11 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         }
         if last_heal.elapsed() >= Duration::from_secs(30) {
             last_heal = Instant::now();
+            // tripwire ports something listens on now (any address, whatever the exposure watch
+            // leaves out) aren't logged in the kernel: a service started there isn't a tripwire
+            if let Err(e) = enforcer.set_trip_ports(crate::enforce::trip_ports(&cfg, &crate::enforce::served_tcp_ports())) {
+                eprintln!("logguard: updating the kernel tripwire ports: {e:#}");
+            }
             let missing = !enforcer.table_present();
             if let Some(msg) =
                 missing.then(|| enforcer.heal(&pipe.engine.active_bans(), &pipe.engine.allowed(), &feed_nets, time::now())).flatten()
@@ -1129,7 +1575,30 @@ fn control(
                 Ok(n) => {
                     let note = if note.is_empty() { "operator".to_string() } else { note.join(" ") };
                     let actions = pipe.engine.operator_allow(n, now + secs * time::SEC, note);
-                    (format!("ok\n{}", summarize(&actions)), actions)
+                    let mut text = format!("ok\n{}", summarize(&actions));
+                    // ufw can't let it through a wider ban (an allow rule would open every port)
+                    if let Some(b) = pipe.engine.covering_ban(&n).filter(|_| enforcer.kind == crate::enforce::Kind::Ufw) {
+                        text += &format!("\nnote: with ufw it stays blocked by the ban on {0}: `logguard unban {0}` to let it in", b.net);
+                    }
+                    (text, actions)
+                }
+                Err(e) => (format!("error: {e}"), vec![]),
+            }
+        }
+        ["ban", _, secs, note @ ..] => {
+            let secs: i64 = match secs.parse::<i64>() {
+                // capped at a year, like allow
+                Ok(s) if s > 0 => s.min(365 * 86_400),
+                _ => return ("error: duration must be a positive number of seconds".into(), vec![]),
+            };
+            let note = if note.is_empty() { "operator".to_string() } else { note.join(" ") };
+            match net(1).and_then(|n| pipe.engine.operator_ban(n, pipe.engine.now.max(now) + secs * time::SEC, note)) {
+                Ok(actions) => {
+                    let mut text = format!("ok\n{}", summarize(&actions));
+                    if enforcer.kind == crate::enforce::Kind::Shadow {
+                        text += "\nnote: shadow mode: decided and shared, but not applied to this firewall";
+                    }
+                    (text, actions)
                 }
                 Err(e) => (format!("error: {e}"), vec![]),
             }
@@ -1267,6 +1736,50 @@ mod tests {
     }
 
     #[test]
+    fn followed_lines_are_capped() {
+        let long = vec![b'x'; 3 * MAX_FOLLOWED_LINE as usize];
+        let input = [b"first\n".as_slice(), &long, b"\nlast\n"].concat();
+        let mut r = BufReader::new(input.as_slice());
+        let mut lines = vec![];
+        let mut buf = Vec::new();
+        while crate::record::read_line_capped(&mut r, &mut buf, MAX_FOLLOWED_LINE).unwrap() > 0 {
+            lines.push(buf.len());
+            buf.clear();
+        }
+        assert_eq!(lines, [6, MAX_FOLLOWED_LINE as usize, 5], "the long line cut, the next one whole");
+    }
+
+    /// A command the client sends in pieces (a long `allow` note) reaches the daemon whole.
+    #[test]
+    fn control_commands_arrive_whole() {
+        let dir = std::env::temp_dir().join(format!("logguard-ctl-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("ctl.sock");
+        let (tx, rx) = sync_channel::<Control>(1);
+        serve_control(path.clone(), tx).unwrap();
+        let cmd = format!("allow 192.0.2.1 60 {}", "x".repeat(2000));
+        let client = {
+            let (path, cmd) = (path.clone(), cmd.clone());
+            thread::spawn(move || {
+                let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                let (a, b) = cmd.split_at(100);
+                s.write_all(a.as_bytes()).unwrap();
+                thread::sleep(Duration::from_millis(100));
+                s.write_all(b.as_bytes()).unwrap();
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut reply = String::new();
+                s.read_to_string(&mut reply).unwrap();
+                reply
+            })
+        };
+        let (got, reply) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, cmd);
+        reply.send("ok".into()).unwrap();
+        assert_eq!(client.join().unwrap(), "ok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn notifies_systemd() {
         let dir = std::env::temp_dir().join(format!("logguard-notify-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -1297,14 +1810,37 @@ mod tests {
     }
 
     #[test]
+    fn journal_verification_key_warning() {
+        let plain = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n";
+        let hidden = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw,hidepid=invisible\n";
+        let off = "22 1 0:21 / /proc rw,relatime shared:12 - proc proc rw,hidepid=0\n";
+        assert!(!proc_hides_pids(plain) && proc_hides_pids(hidden) && !proc_hides_pids(off));
+        assert!(proc_hides_pids("22 1 0:21 / /proc rw shared:12 - proc proc rw,hidepid=2,gid=4\n"));
+        assert!(!proc_hides_pids("40 22 0:5 / /proc/sys rw - proc proc rw,hidepid=invisible\n"), "another mount point");
+        let mut cfg = Config::default();
+        assert_eq!(verify_key_warning(&cfg, plain), None, "no key set");
+        cfg.journal.verify_every = time::Dur(86_400);
+        cfg.journal.verify_key_file = "/etc/logguard/journal-verify.key".into();
+        let w = verify_key_warning(&cfg, plain).unwrap();
+        assert!(w.contains("can seal journal entries too") && w.contains("hidepid=invisible"), "{w}");
+        assert!(!verify_key_warning(&cfg, hidden).unwrap().contains("command line"));
+    }
+
+    #[test]
     fn journalctl_matches_are_ored() {
         let cfg = Config::default();
         let args = journalctl_args(&cfg, None);
         assert!(args.contains(&"--since=-3600s".to_string()));
-        let tail = &args[args.len() - 9..];
+        // only the fields parse_journal_json reads
+        let fields = args.iter().find_map(|a| a.strip_prefix("--output-fields=")).unwrap();
+        for f in ["MESSAGE", "SYSLOG_IDENTIFIER", "_SYSTEMD_UNIT", "_PID", "_EXE", "_TRANSPORT", "_UID"] {
+            assert!(fields.split(',').any(|x| x == f), "{f}");
+        }
+        let tail = &args[args.len() - 13..];
         assert_eq!(tail[0], "_SYSTEMD_UNIT=ejabberd.service");
         assert_eq!(tail[1], "+");
         assert_eq!(tail[8], "_TRANSPORT=kernel");
+        assert_eq!(tail[12], "SYSLOG_IDENTIFIER=sudo");
         let args = journalctl_args(&cfg, Some("s=1;i=2"));
         assert!(args.contains(&"--after-cursor=s=1;i=2".to_string()));
     }

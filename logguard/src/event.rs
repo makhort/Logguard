@@ -53,13 +53,23 @@ pub enum Signal {
     XmppCanary,
     SshCanary,
     NcCanary,
+    /// A completed TCP handshake with one of logguard's own tripwire listeners (`[ports]
+    /// honeypot`): unlike a blocked SYN, its source address can't be forged.
+    TripwireConnect,
+    /// A line matched by a pattern of your own (`[[patterns]]`, `kind = "failure"`): a failed
+    /// login, counted per account like the built-in ones. The pattern sets the points.
+    CustomFailure,
+    /// The same, `kind = "probe"`: hostile, but no login.
+    CustomProbe,
+    /// The same, `kind = "success"`: a login, which earns its address trust.
+    CustomSuccess,
 }
 
 /// Event detail of a *successful* login to a canary account (worse than a failed one).
 pub const CANARY_LOGIN: &str = "LOGGED IN to canary account";
 
 impl Signal {
-    pub const ALL: [Signal; 23] = [
+    pub const ALL: [Signal; 27] = [
         Signal::XmppTlsFail,
         Signal::XmppAuthFail,
         Signal::XmppAuthOk,
@@ -83,6 +93,10 @@ impl Signal {
         Signal::XmppCanary,
         Signal::SshCanary,
         Signal::NcCanary,
+        Signal::TripwireConnect,
+        Signal::CustomFailure,
+        Signal::CustomProbe,
+        Signal::CustomSuccess,
     ];
 
     pub fn name(self) -> &'static str {
@@ -110,11 +124,15 @@ impl Signal {
             Signal::XmppCanary => "xmpp_canary",
             Signal::SshCanary => "ssh_canary",
             Signal::NcCanary => "nc_canary",
+            Signal::TripwireConnect => "tripwire_connect",
+            Signal::CustomFailure => "custom_failure",
+            Signal::CustomProbe => "custom_probe",
+            Signal::CustomSuccess => "custom_success",
         }
     }
 
     pub fn is_success(self) -> bool {
-        matches!(self, Signal::XmppAuthOk | Signal::SshAuthOk)
+        matches!(self, Signal::XmppAuthOk | Signal::SshAuthOk | Signal::CustomSuccess)
     }
 
     pub fn is_canary(self) -> bool {
@@ -122,7 +140,7 @@ impl Signal {
     }
 
     pub fn is_auth_failure(self) -> bool {
-        matches!(self, Signal::XmppAuthFail | Signal::SshAuthFail | Signal::SshInvalidUser | Signal::NcAuthFail)
+        matches!(self, Signal::XmppAuthFail | Signal::SshAuthFail | Signal::SshInvalidUser | Signal::NcAuthFail | Signal::CustomFailure)
     }
 
     pub fn source(self) -> Source {
@@ -143,9 +161,10 @@ impl Signal {
             | Signal::SshPreauth
             | Signal::SshPenalty
             | Signal::SshCanary => Source::Ssh,
-            Signal::FwBlock | Signal::FwLimit | Signal::FwTripwire => Source::Ufw,
+            Signal::FwBlock | Signal::FwLimit | Signal::FwTripwire | Signal::TripwireConnect => Source::Ufw,
             Signal::PeerReport => Source::Peer,
             Signal::WebProbe | Signal::NcAuthFail | Signal::NcCanary => Source::Nextcloud,
+            Signal::CustomFailure | Signal::CustomProbe | Signal::CustomSuccess => Source::Custom,
         }
     }
 }
@@ -172,11 +191,46 @@ pub struct Event {
     pub account: Option<String>,
     /// Short human-readable evidence.
     pub detail: String,
+    /// The line is known to describe the connection it names. A login that isn't (an
+    /// ejabberd line that can't be tied to a tracked connection) counts for its account, but
+    /// earns its address no trust and lifts no ban: a forged line must never weaken protection.
+    pub verified: bool,
+    /// Points instead of the signal's weight (a pattern of your own sets its own).
+    pub points: Option<f64>,
+    /// The SSH key a public-key login used (`ED25519 SHA256:...`).
+    pub key: Option<String>,
 }
 
 impl Event {
     pub fn new(ts: Micros, ip: IpAddr, signal: Signal) -> Self {
-        Event { ts, ip, signal, port: None, proto: Proto::Tcp, account: None, detail: String::new() }
+        Event {
+            ts,
+            ip,
+            signal,
+            port: None,
+            proto: Proto::Tcp,
+            account: None,
+            detail: String::new(),
+            verified: true,
+            points: None,
+            key: None,
+        }
+    }
+
+    pub fn points(mut self, points: Option<f64>) -> Self {
+        self.points = points;
+        self
+    }
+
+    /// Key fingerprints come from the log line: control characters dropped, length capped.
+    pub fn key(mut self, key: Option<&str>) -> Self {
+        self.key = key.map(|k| clean(k, 120));
+        self
+    }
+
+    pub fn verified(mut self, verified: bool) -> Self {
+        self.verified = verified;
+        self
     }
 
     pub fn port(mut self, port: Option<u16>) -> Self {

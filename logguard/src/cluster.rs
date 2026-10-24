@@ -45,10 +45,18 @@ const AAD: &[u8] = b"logguard-cluster-v1";
 const MAX_FRAME: usize = 1 << 20;
 const CHUNK: usize = 512 * 1024;
 const MAX_CONNECTIONS: usize = 8;
+/// Connections one address may have open at once: a peer sends one frame at a time, and with
+/// `allow_only_peers = false` a stranger holding every slot (30 s each) would cut the cluster off.
+const MAX_PER_SOURCE: usize = 2;
 /// Whole-frame deadline per connection: a slow sender can't hold a connection slot open.
 const READ_DEADLINE: Duration = Duration::from_secs(30);
 /// Facts remembered at once (bans with long timeouts accumulate).
 const MAX_KNOWN: usize = 200_000;
+/// Text of the relayed notices remembered at once (each for an hour): a peer that may send
+/// nothing else (a Telegram relay node, even broken into) can't exhaust the memory with them.
+const MAX_NOTICE_BYTES: usize = 2 << 20;
+/// Longest notice body kept from a peer: a digest is a few KB.
+const MAX_NOTICE_BODY: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,8 +187,8 @@ impl ClusterCfg {
         if !(0.0..=1.0).contains(&self.report_factor) {
             bail!("[cluster] report_factor must be within 0..=1");
         }
-        if self.node_name().chars().any(|c| c.is_whitespace() || c.is_control()) {
-            bail!("[cluster] node_id must not contain whitespace");
+        if !node_name_ok(&self.node_name()) {
+            bail!("[cluster] node_id must be 1-253 characters without whitespace");
         }
         if let Some(p) = self.peer_accept.keys().find(|p| !self.peers.contains(p)) {
             bail!("[cluster] peer_accept: '{p}' is not one of the peers (write it as in `peers`)");
@@ -271,6 +279,11 @@ pub enum FactBody {
         net: Net,
         until: Micros,
         reason: String,
+        /// The evidence is firewall logs only (blocked packets), whose source address is
+        /// easily forged: not applied to an address that logged in at the receiving node
+        /// lately. Older nodes leave it out, and ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forgeable: bool,
     },
     Unban {
         net: Net,
@@ -280,6 +293,9 @@ pub enum FactBody {
         ip: IpAddr,
         points: f64,
         signals: String,
+        /// As for `Ban`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forgeable: bool,
     },
     Trust {
         ip: IpAddr,
@@ -318,6 +334,35 @@ impl FactBody {
             FactBody::Notice { .. } => after(3600),
         }
     }
+
+    /// A peer's text, made fit to show: it reaches alerts, the actions log and `logguard
+    /// status` on a terminal, so no control or hidden characters, and a bounded length.
+    fn tidy(&mut self) {
+        use crate::event::{clean, plain_text};
+        match self {
+            FactBody::Ban { reason, .. } | FactBody::Unban { reason, .. } => *reason = clean(reason, 500),
+            FactBody::Report { signals, .. } => *signals = clean(signals, 200),
+            FactBody::Allow { note, .. } => *note = clean(note, 200),
+            FactBody::Notice { subject, body } => {
+                *subject = clean(subject, 300);
+                *body = plain_text(body).chars().take(MAX_NOTICE_BODY).collect();
+            }
+            FactBody::Trust { .. } => {}
+        }
+    }
+
+    /// The text a notice holds (0 for other facts).
+    fn notice_len(&self) -> usize {
+        match self {
+            FactBody::Notice { subject, body } => subject.len() + body.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// A node name as peers may send it: what `node_id` may be (a host name by default).
+fn node_name_ok(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 253 && !n.chars().any(|c| c.is_whitespace() || c.is_control() || crate::event::is_hidden(c))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -374,6 +419,43 @@ pub fn file_frame(key: &[u8; 32], from: &str, name: &str, content: &[u8], now: M
     seal(key, &env)
 }
 
+/// Most files the inbox holds: two per peer (its report, a merged one) leave plenty of room,
+/// and each is at most a frame (1 MB), so peers can't fill the disk.
+const MAX_INBOX_FILES: usize = 32;
+
+/// Which node names the peers' connections use. A file is written to the inbox under its
+/// sender's node name, which any key holder can write, and the abuse report job trusts that
+/// name: so a peer limited by `peer_accept` keeps the one name it first sent under, and may
+/// not use one an unlimited peer uses. (Right after a restart, before the other peers' first
+/// heartbeats, a limited peer could still claim one of their names once.)
+#[derive(Clone, Debug, Default)]
+pub struct Senders(Arc<std::sync::Mutex<SenderNames>>);
+
+#[derive(Debug, Default)]
+struct SenderNames {
+    limited: HashMap<IpAddr, String>,
+    unlimited: std::collections::HashSet<String>,
+}
+
+impl Senders {
+    /// Records that a connection from `ip` sent a message as `name`; false when that name
+    /// isn't the sender's to use (only ever for a limited peer).
+    pub fn observe(&self, name: &str, ip: Option<IpAddr>, limited: bool) -> bool {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !limited {
+            if s.unlimited.len() < 1000 {
+                s.unlimited.insert(name.to_string());
+            }
+            return true;
+        }
+        let Some(ip) = ip.map(crate::net::normalize) else { return false };
+        if s.unlimited.contains(name) || (s.limited.len() >= 1000 && !s.limited.contains_key(&ip)) {
+            return false;
+        }
+        s.limited.entry(ip).or_insert_with(|| name.to_string()) == name
+    }
+}
+
 /// Writes a peer's file to `dir` as [`inbox_name`] (mode 0600, replacing the
 /// previous one atomically) and returns its path. The content is only checked to be gzip:
 /// nothing here parses it.
@@ -401,6 +483,10 @@ pub fn store_file(dir: &Path, env: &Envelope, max_skew: Dur, now: Micros) -> Res
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(inbox_name(&file.name, &env.from));
+    let held = std::fs::read_dir(dir)?.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')).count();
+    if held >= MAX_INBOX_FILES && !path.exists() {
+        bail!("the inbox {} already holds {held} files", dir.display());
+    }
     let tmp = dir.join(format!(".{}-{}.tmp", file.name, env.from));
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     f.write_all(&gz)?;
@@ -546,6 +632,8 @@ pub struct Cluster {
     extra_keys: Vec<[u8; 32]>,
     last_seq: u64,
     known: HashMap<(String, u64), Stored>,
+    /// The notices' share of `known` (see [`MAX_NOTICE_BYTES`]).
+    notice_bytes: usize,
     pub view: ClusterView,
     /// `peer_accept` by address, shared with the listener (files are taken there).
     pub limits: PeerLimits,
@@ -575,6 +663,7 @@ impl Cluster {
             extra_keys: extra,
             last_seq: 0,
             known: HashMap::new(),
+            notice_bytes: 0,
             limits: PeerLimits::new(cfg),
             refused_logged: Default::default(),
         })
@@ -608,6 +697,7 @@ impl Cluster {
         self.last_seq = seq;
         let fact = Fact { origin: self.node_id.clone(), seq, created: now, hops: 0, body };
         let expires = fact.body.expires(now);
+        self.notice_bytes += fact.body.notice_len();
         self.known.insert((fact.origin.clone(), seq), Stored { fact, expires, learned: now });
     }
 
@@ -615,7 +705,7 @@ impl Cluster {
     /// facts this node hasn't seen yet.
     pub fn ingest(&mut self, env: Envelope, from: Option<IpAddr>, now: Micros) -> Vec<Fact> {
         let skew = self.cfg.max_clock_skew.micros();
-        if env.from == self.node_id || env.sent.abs_diff(now) > skew.unsigned_abs() {
+        if env.from == self.node_id || env.sent.abs_diff(now) > skew.unsigned_abs() || !node_name_ok(&env.from) {
             self.view.rejected += 1;
             return vec![];
         }
@@ -624,7 +714,7 @@ impl Cluster {
         let mut fresh = Vec::new();
         for mut f in env.facts {
             let id = (f.origin.clone(), f.seq);
-            if f.origin == self.node_id || self.known.contains_key(&id) {
+            if f.origin == self.node_id || self.known.contains_key(&id) || !node_name_ok(&f.origin) {
                 continue;
             }
             let kind = f.body.kind();
@@ -648,6 +738,13 @@ impl Cluster {
                 continue;
             }
             f.hops += 1;
+            f.body.tidy();
+            let notice = f.body.notice_len();
+            if notice > 0 && self.notice_bytes + notice > MAX_NOTICE_BYTES {
+                self.view.rejected += 1;
+                continue;
+            }
+            self.notice_bytes += notice;
             self.known.insert(id, Stored { fact: f.clone(), expires, learned: now });
             fresh.push(f);
         }
@@ -658,7 +755,15 @@ impl Cluster {
     /// Builds one envelope per peer: new facts since the last send, or everything on a
     /// full sync. Empty envelopes double as heartbeats.
     pub fn outgoing(&mut self, now: Micros) -> Vec<(usize, Vec<u8>)> {
-        self.known.retain(|_, s| s.expires > now);
+        let mut freed = 0;
+        self.known.retain(|_, s| {
+            let keep = s.expires > now;
+            if !keep {
+                freed += s.fact.body.notice_len();
+            }
+            keep
+        });
+        self.notice_bytes = self.notice_bytes.saturating_sub(freed);
         self.view.facts_known = self.known.len();
         let full_every = self.cfg.full_sync_every.micros();
         let mut out = Vec::new();
@@ -825,6 +930,7 @@ pub fn serve(
     let listener = TcpListener::bind(listen).with_context(|| format!("binding cluster listener {listen}"))?;
     let deliver = Arc::new(deliver);
     let active = Arc::new(AtomicUsize::new(0));
+    let per_source: Arc<std::sync::Mutex<HashMap<Option<IpAddr>, usize>>> = Arc::default();
     std::thread::spawn(move || {
         let mut logged = std::collections::HashSet::new();
         for stream in listener.incoming() {
@@ -841,8 +947,17 @@ pub fn serve(
             if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
                 continue; // dropped: too many concurrent peers/probes
             }
+            {
+                let mut open = per_source.lock().unwrap_or_else(|e| e.into_inner());
+                let n = open.entry(from).or_default();
+                if *n >= MAX_PER_SOURCE {
+                    continue; // dropped: that address has its share
+                }
+                *n += 1;
+            }
             active.fetch_add(1, Ordering::Relaxed);
-            let (deliver, active, keys) = (Arc::clone(&deliver), Arc::clone(&active), Arc::clone(&keys));
+            let (deliver, active, keys, per_source) =
+                (Arc::clone(&deliver), Arc::clone(&active), Arc::clone(&keys), Arc::clone(&per_source));
             std::thread::spawn(move || {
                 let peer = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
                 let mut r = Deadline { s: &mut s, until: std::time::Instant::now() + READ_DEADLINE };
@@ -852,6 +967,14 @@ pub fn serve(
                     }
                     Err(e) => eprintln!("logguard: cluster: rejected connection from {peer}: {e:#}"),
                 }
+                let mut open = per_source.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(n) = open.get_mut(&from) {
+                    *n -= 1;
+                    if *n == 0 {
+                        open.remove(&from);
+                    }
+                }
+                drop(open);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -899,7 +1022,7 @@ mod tests {
     }
 
     fn ban(net: &str, until_s: i64) -> FactBody {
-        FactBody::Ban { net: net.parse().unwrap(), until: until_s * SEC, reason: "scan".into() }
+        FactBody::Ban { net: net.parse().unwrap(), until: until_s * SEC, reason: "scan".into(), forgeable: false }
     }
 
     #[test]
@@ -1008,7 +1131,32 @@ mod tests {
         let mut plain = env.clone();
         plain.file.as_mut().unwrap().gz = base64::engine::general_purpose::STANDARD.encode(b"not gzip");
         assert!(refused(&plain, &dir).contains("not gzip"));
+        // a full inbox takes no new names, but still replaces a file it has
+        for i in 0..MAX_INBOX_FILES {
+            std::fs::write(dir.join(format!("other-{i}")), "x").unwrap();
+        }
+        assert!(refused(&Envelope { from: "new".into(), ..env.clone() }, &dir).contains("already holds"));
+        store_file(&dir, &env, skew, now).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A limited peer sends files under its own node name only, never under another peer's.
+    #[test]
+    fn limited_peers_keep_their_own_name() {
+        let s = Senders::default();
+        let (tg, vpn): (IpAddr, IpAddr) = ("192.0.2.30".parse().unwrap(), "192.0.2.20".parse().unwrap());
+        assert!(s.observe("tg", Some(tg), true));
+        assert!(s.observe("tg", Some(tg), true), "again");
+        assert!(!s.observe("tg2", Some(tg), true), "a second name");
+        assert!(s.observe("vpn", Some(vpn), false));
+        assert!(!s.observe("vpn", Some(tg), true), "an unlimited peer's name");
+        // a limited address that first claimed another's name is stuck with it once that one speaks
+        let s = Senders::default();
+        assert!(s.observe("vpn", Some(tg), true));
+        assert!(s.observe("vpn", Some(vpn), false));
+        assert!(!s.observe("vpn", Some(tg), true));
+        assert!(!s.observe("tg", Some(tg), true));
+        assert!(!s.observe("tg", None, true), "no address: no name");
     }
 
     /// Nodes without the `file` field (older versions) still read such a message: as a
@@ -1111,6 +1259,43 @@ mod tests {
     }
 
     #[test]
+    fn notices_are_bounded_in_memory() {
+        let k = generate_key();
+        let now = time::now();
+        let mut a = cluster("a", &k, vec!["192.0.2.1:7946".into()]);
+        let notices = |at: Micros, from_seq: u64, n: u64| Envelope {
+            v: 1,
+            from: "tg".into(),
+            sent: at,
+            facts: (from_seq..from_seq + n)
+                .map(|seq| Fact {
+                    origin: "tg".into(),
+                    seq,
+                    created: at,
+                    hops: 0,
+                    body: FactBody::Notice { subject: "s".into(), body: "x".repeat(100 * 1024) },
+                })
+                .collect(),
+            file: None,
+        };
+        // each cut to 16 KB; 2 MB of them at once
+        let got = a.ingest(notices(now, 1, 200), None, now);
+        assert_eq!(got.len(), 127, "{} notices kept", got.len());
+        assert!(got.iter().all(|f| matches!(&f.body, FactBody::Notice { body, .. } if body.len() == MAX_NOTICE_BODY)));
+        assert_eq!(a.view.rejected, 73);
+        // other facts still get in
+        let ban = Envelope {
+            facts: vec![Fact { origin: "tg".into(), seq: 999, created: now, hops: 0, body: ban("9.9.9.9", now / SEC + 60) }],
+            ..notices(now, 0, 0)
+        };
+        assert_eq!(a.ingest(ban, None, now).len(), 1);
+        // once they expire (an hour), there is room again
+        let later = now + 3601 * SEC;
+        a.outgoing(later);
+        assert_eq!(a.ingest(notices(later, 1000, 3), None, later).len(), 3);
+    }
+
+    #[test]
     fn rejects_stale_and_unaccepted() {
         let k = generate_key();
         let now = time::now();
@@ -1134,6 +1319,31 @@ mod tests {
         assert!(a.ingest(expired, None, now).is_empty());
     }
 
+    /// Peers' names and text reach alerts and terminals: odd names are refused, text is cleaned.
+    #[test]
+    fn peer_text_is_cleaned_on_arrival() {
+        let k = generate_key();
+        let now = time::now();
+        let mut a = cluster("a", &k, vec![]);
+        let fact = |origin: &str, seq, body| Fact { origin: origin.into(), seq, created: now, hops: 0, body };
+        let env = |from: &str, facts| Envelope { v: 1, from: from.into(), sent: now, facts, file: None };
+        assert!(
+            a.ingest(env("x\u{1b}]52;c;", vec![]), None, now).is_empty() && a.view.rejected == 1,
+            "a sender's name with control characters"
+        );
+        assert!(!a.view.heard_from.keys().any(|n| n.contains('\u{1b}')));
+        let notice = FactBody::Notice { subject: "s\u{1b}[2Jt".into(), body: "line 1\nline\u{7} 2\u{202e}".into() };
+        let ban = FactBody::Ban { net: "9.9.9.9".parse().unwrap(), until: now + 3600 * SEC, reason: "r\u{1b}[0m".into(), forgeable: false };
+        let got = a.ingest(
+            env("b", vec![fact("b", 1, notice), fact("b", 2, ban), fact("c\nd", 3, FactBody::Trust { ip: "9.9.9.8".parse().unwrap() })]),
+            None,
+            now,
+        );
+        assert_eq!(got.len(), 2, "an origin with a line break is dropped");
+        assert_eq!(got[0].body, FactBody::Notice { subject: "s[2Jt".into(), body: "line 1\nline 2".into() });
+        assert!(matches!(&got[1].body, FactBody::Ban { reason, .. } if reason == "r[0m"));
+    }
+
     #[test]
     fn over_real_tcp() {
         let k = generate_key();
@@ -1145,7 +1355,10 @@ mod tests {
         serve(&addr, vec![key], PeerFilter::peers(vec!["127.0.0.1".parse().unwrap()]), move |env, _| tx.send(env).is_ok()).unwrap();
         let now = time::now();
         let mut a = cluster("a", &k, vec![addr.clone()]);
-        a.originate(FactBody::Report { ip: "5.6.7.8".parse().unwrap(), points: 40.0, signals: "3x fw_tripwire".into() }, now);
+        a.originate(
+            FactBody::Report { ip: "5.6.7.8".parse().unwrap(), points: 40.0, signals: "3x fw_tripwire".into(), forgeable: false },
+            now,
+        );
         let frames = a.outgoing(now);
         send_frame(&addr, &frames[0].1).unwrap();
         let env = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1180,6 +1393,18 @@ mod tests {
         send_frame(&addr, &frames[0].1).unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
+        // one address that opens connections and sends nothing holds two slots at most: the
+        // other peers still get through (with allow_only_peers = false, anyone could)
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(&addr).unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let mut refused = 0;
+        for mut s in idle {
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            // a dropped one reads as closed at once; an open one waits for its frame
+            refused += usize::from(matches!(s.read(&mut [0u8; 1]), Ok(0)));
+        }
+        assert_eq!(refused, MAX_CONNECTIONS - MAX_PER_SOURCE);
+
         // a header claiming 1 MB but delivering 3 bytes is rejected without allocating 1 MB
         let mut frame = b"LGC1".to_vec();
         frame.extend_from_slice(&(MAX_FRAME as u32).to_be_bytes());
@@ -1196,7 +1421,10 @@ mod tests {
         let mut b = cluster("b", &k, vec![]);
         for i in 0..20_000u32 {
             let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i);
-            a.originate(FactBody::Ban { net: Net::host(ip.into()), until: now + 3600 * SEC, reason: "x".repeat(60) }, now);
+            a.originate(
+                FactBody::Ban { net: Net::host(ip.into()), until: now + 3600 * SEC, reason: "x".repeat(60), forgeable: false },
+                now,
+            );
         }
         let frames = a.outgoing(now);
         let to_b: Vec<&Vec<u8>> = frames.iter().filter(|(i, _)| *i == 0).map(|(_, f)| f).collect();

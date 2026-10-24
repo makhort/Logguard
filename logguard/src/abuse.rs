@@ -8,7 +8,7 @@
 //! nodes decided (their evidence is in their own report).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -86,16 +86,17 @@ pub fn load_bans(path: &Path, from: Micros) -> Result<Vec<Action>> {
         let file = std::fs::File::open(&f).with_context(|| format!("opening {}", f.display()))?;
         let reader: Box<dyn Read> =
             if f.extension().is_some_and(|e| e == "gz") { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+        // a damaged (rotated, compressed) file still yields what it has up to the damage
+        let _ = crate::record::for_each_action_line(reader, |line| {
             if !line.contains("\"ban\"") {
-                continue;
+                return;
             }
-            if let Ok(a) = serde_json::from_str::<Action>(&line) {
+            if let Ok(a) = serde_json::from_str::<Action>(line) {
                 if a.kind == ActionKind::Ban && a.ts >= from && a.target.is_some() {
                     out.push(a);
                 }
             }
-        }
+        });
     }
     out.sort_by_key(|a| a.ts);
     Ok(out)
@@ -388,15 +389,45 @@ pub struct Report {
     pub offenders: Vec<Offender>,
 }
 
+/// Largest report read (decompressed). A week's JSON report of a busy server is a few MB; a
+/// peer's file is at most one cluster frame (1 MB), which gzip could inflate a thousandfold.
+pub const MAX_REPORT: u64 = 64 << 20;
+
 /// A `--json` report file, plain or gzip-compressed (as `cluster-send-report` delivers it).
 pub fn read_report_file(path: &Path) -> Result<String> {
-    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    if !raw.starts_with(&[0x1f, 0x8b]) {
-        return String::from_utf8(raw).with_context(|| format!("{} is not UTF-8", path.display()));
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut raw = Vec::new();
+    file.take(MAX_REPORT + 1).read_to_end(&mut raw).with_context(|| format!("reading {}", path.display()))?;
+    let raw = if raw.starts_with(&[0x1f, 0x8b]) {
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(raw.as_slice())
+            .take(MAX_REPORT + 1)
+            .read_to_end(&mut text)
+            .with_context(|| format!("decompressing {}", path.display()))?;
+        text
+    } else {
+        raw
+    };
+    if raw.len() as u64 > MAX_REPORT {
+        anyhow::bail!("{} is larger than {} MB: not a report", path.display(), MAX_REPORT >> 20);
     }
-    let mut text = String::new();
-    flate2::read::GzDecoder::new(raw.as_slice()).read_to_string(&mut text).with_context(|| format!("decompressing {}", path.display()))?;
-    Ok(text)
+    String::from_utf8(raw).with_context(|| format!("{} is not UTF-8", path.display()))
+}
+
+/// What a peer's report may say about an offender, made safe: abuse contacts as plain e-mail
+/// addresses only (as from RDAP), and no hidden characters in its text.
+fn tidy(o: &mut Offender) {
+    use crate::event::clean;
+    if let Some(c) = o.contact.as_mut() {
+        c.abuse = c.abuse.iter().filter_map(|e| plain_email(e)).take(5).collect();
+        c.network = clean(&c.network, 100);
+    }
+    o.place = o.place.as_deref().map(|p| clean(p, 160));
+    o.categories = o.categories.iter().map(|c| clean(c, 40)).collect();
+    for l in &mut o.evidence {
+        l.text = clean(&l.text, 300);
+        l.server = l.server.as_deref().map(|s| clean(s, 100));
+    }
 }
 
 /// Combines the reports of several servers: one entry per source, evidence lines marked
@@ -418,9 +449,10 @@ pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
         seen.push(id);
         from = from.min(r.from);
         to = to.max(r.to);
-        let tag = r.servers.first().map(Server::tag);
-        servers.extend(r.servers);
+        let tag = r.servers.first().map(Server::tag).map(|t| crate::event::clean(&t, 100));
+        servers.extend(r.servers.into_iter().map(|s| Server { host: crate::event::clean(&s.host, 100), ..s }));
         for mut o in r.offenders {
+            tidy(&mut o);
             for l in &mut o.evidence {
                 l.server = l.server.take().or_else(|| tag.clone());
             }
@@ -433,16 +465,9 @@ pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
                     m.last = m.last.max(o.last);
                     m.bans += o.bans;
                     m.categories.extend(o.categories);
-                    for l in o.evidence {
-                        if !m.evidence.contains(&l) {
-                            m.evidence.push(l);
-                        }
-                    }
-                    for ip in o.members {
-                        if !m.members.contains(&ip) {
-                            m.members.push(ip);
-                        }
-                    }
+                    // duplicates go below, sorted: a peer's report may hold a million lines
+                    m.evidence.extend(o.evidence);
+                    m.members.extend(o.members);
                     m.place = m.place.take().or(o.place);
                     m.contact = m.contact.take().or(o.contact);
                 }
@@ -452,7 +477,9 @@ pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
     let mut offenders: Vec<Offender> = by.into_values().collect();
     for o in &mut offenders {
         o.evidence.sort();
+        o.evidence.dedup();
         o.members.sort();
+        o.members.dedup();
     }
     rank(&mut offenders);
     (Report { servers, from: if from == Micros::MAX { 0 } else { from }, to, offenders }, skipped)
@@ -668,7 +695,37 @@ mod tests {
             let r: Report = serde_json::from_str(&read_report_file(&dir.join(f)).unwrap()).unwrap();
             assert_eq!((r.from, r.to), (1, 2), "{f}");
         }
+        // a small file that inflates beyond any report is refused, not read into memory
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![b' '; 1 << 20];
+        for _ in 0..=(MAX_REPORT >> 20) {
+            gz.write_all(&zeros).unwrap();
+        }
+        let big = gz.finish().unwrap();
+        assert!(big.len() < 1 << 20, "fits in a cluster frame: {} bytes", big.len());
+        std::fs::write(dir.join("big.json.gz"), big).unwrap();
+        assert!(read_report_file(&dir.join("big.json.gz")).unwrap_err().to_string().contains("larger than"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer's report is checked like an RDAP answer: its abuse contacts must be plain
+    /// e-mail addresses, its text has no hidden characters.
+    #[test]
+    fn merged_peer_reports_are_tidied() {
+        let mut o = collect(
+            &[ban("2026-10-10 08:00:00", "198.51.100.7", "ssh", &["10-10 07:59:58 invalid user oracle"])],
+            &Filter { only: vec![], min_events: 1 },
+        )
+        .remove(0);
+        o.contact = Some(Contact { abuse: vec!["x@y.example\nInjected".into(), "abuse@isp.example".into()], network: "N\u{1b}[2J".into() });
+        o.place = Some("Somewhere\u{202e}".into());
+        let r = Report { servers: vec![Server { host: "vpn\u{7}".into(), addresses: vec![] }], from: 0, to: 1, offenders: vec![o] };
+        let (m, _) = merge(vec![r]);
+        let c = m.offenders[0].contact.as_ref().unwrap();
+        assert_eq!(c.abuse, ["abuse@isp.example"]);
+        assert_eq!(c.network, "N[2J");
+        assert_eq!(m.offenders[0].place.as_deref(), Some("Somewhere"));
+        assert_eq!(m.servers[0].host, "vpn");
     }
 
     fn ban(ts: &str, target: &str, category: &str, evidence: &[&str]) -> Action {
@@ -756,7 +813,7 @@ mod tests {
         let old = collect(
             &[ban(
                 "2026-10-11 15:39:20",
-                "11.26.61.51",
+                "11.34.61.51",
                 "",
                 &["10-11 15:34:44 block TCP/46468", "10-11 15:39:20 port scan: 16 closed ports"],
             )],
@@ -814,6 +871,30 @@ mod tests {
         assert!(text.contains("Abuse report from xmpp.example (192.0.2.1) and vpn (192.0.2.2)"), "{text}");
         assert!(text.contains("2026-10-10 07:59:58 UTC  (to 192.0.2.1) invalid user oracle"), "{text}");
         assert!(text.contains("2026-10-11 09:00:00 UTC  (to 192.0.2.2) connection attempt to closed port TCP/23 (Telnet)"), "{text}");
+    }
+
+    /// A peer's report (up to 64 MB unpacked) merges in a moment, whatever it holds.
+    #[test]
+    fn large_peer_reports_merge_quickly() {
+        let off = |n: u32| Offender {
+            net: "198.51.100.7".parse().unwrap(),
+            first: 0,
+            last: 1,
+            bans: 1,
+            categories: BTreeSet::new(),
+            evidence: (0..n).map(|i| Line { ts: Micros::from(i), server: None, text: "block TCP/23".into() }).collect(),
+            members: (0..n).map(|i| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i))).collect(),
+            place: None,
+            contact: None,
+        };
+        let report =
+            |host: &str, o| Report { servers: vec![Server { host: host.into(), addresses: vec![] }], from: 0, to: 1, offenders: vec![o] };
+        let start = std::time::Instant::now();
+        let (m, _) = merge(vec![report("a", off(100_000)), report("b", off(100_000))]);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+        let o = &m.offenders[0];
+        assert_eq!(o.members.len(), 100_000, "each address once");
+        assert_eq!(o.evidence.len(), 200_000, "each server's lines");
     }
 
     #[test]

@@ -47,9 +47,10 @@ fi
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 echo "logguard-avscan start $(now)" >> "$LOG"
 if command -v "$SCANNER" > /dev/null; then
-    # TZ=UTC: the summary's Start/End Date lines are then in UTC too.
-    TZ=UTC "$SCANNER" "${args[@]}" "${targets[@]}" >> "$LOG" 2>&1
-    rc=$?
+    # TZ=UTC: the summary's Start/End Date lines are then in UTC too. Indented, so no line of
+    # the output (a file name with line breaks in it) can pass for one of the markers.
+    TZ=UTC "$SCANNER" "${args[@]}" "${targets[@]}" 2>&1 | sed -u 's/^/  /' >> "$LOG"
+    rc=${PIPESTATUS[0]}
 else
     echo "logguard-avscan: $SCANNER not found (apt install clamav clamav-freshclam)" >> "$LOG"
     rc=127

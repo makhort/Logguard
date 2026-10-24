@@ -59,6 +59,8 @@ pub struct Response {
 }
 
 const INVALID_USERNAME: &str = "✗ Invalid username.";
+/// Longest reason kept with an abuse report (the reporter's own words, in the state file).
+const MAX_REASON: usize = 300;
 
 const ADMIN_HELP: &str = "\
 *Accounts*
@@ -127,15 +129,18 @@ pub fn generate_password() -> String {
     groups.join("-")
 }
 
+/// The bot's rule for the accounts it creates (/add): 3-64 letters, digits, `.`, `-`, `_`.
+/// Accounts made otherwise (registration, ejabberdctl) can be named anything ejabberd takes.
 fn is_valid_username(u: &str) -> bool {
     (3..=64).contains(&u.chars().count()) && u.chars().all(|c| c.is_alphanumeric() || ".-_".contains(c))
 }
 
 /// The username in `john` or `john@any.domain` as ejabberd stores it: nodeprep'd
-/// (lowercase, compatibility forms folded: `Admin` and `ａｄｍｉｎ` are `admin`).
+/// (lowercase, compatibility forms folded: `Admin` and `ａｄｍｉｎ` are `admin`; never a
+/// quote, `&`, `/`, `:`, `<`, `>`, `@`, blank or control character).
 fn normalize_username(arg: &str) -> Option<String> {
     let node = tokio_xmpp::jid::NodePart::new(local_part(arg)).ok()?;
-    is_valid_username(node.as_str()).then(|| node.as_str().to_string())
+    Some(node.as_str().to_string())
 }
 
 /// The local part of `john` or `john@any.domain`.
@@ -358,11 +363,11 @@ impl<E: Ejabberd> Bot<E> {
         self.ctl.run(&["check_account", username, &self.domain]).await.is_ok()
     }
 
-    /// The username in `arg` (normalized), if it is well-formed and the account exists
-    /// (or, with `exists == false`, does not exist yet).
+    /// The username in `arg` (normalized), if the account exists; or, with `exists ==
+    /// false`, if it doesn't yet and the name is one the bot creates ([`is_valid_username`]).
     async fn username(&self, arg: &str, exists: bool) -> Result<String, Reply> {
         match normalize_username(arg) {
-            Some(u) if self.account_exists(&u).await == exists => Ok(u),
+            Some(u) if (exists || is_valid_username(&u)) && self.account_exists(&u).await == exists => Ok(u),
             _ => Err(INVALID_USERNAME.into()),
         }
     }
@@ -533,7 +538,16 @@ impl<E: Ejabberd> Bot<E> {
             return format!("{}: /abuse {}\n{}: /abuse {}", t.usage, t.abuse_args, t.example, t.abuse_example).into();
         };
         let default_reason = format!("Blocked by {who}");
-        let reason = args.get(1).copied().unwrap_or(&default_reason);
+        // the reporter's words, kept and shown again (/export): one line, and bounded
+        let reason: String = args
+            .get(1)
+            .copied()
+            .unwrap_or(&default_reason)
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(MAX_REASON)
+            .collect();
+        let reason = reason.as_str();
         let Ok(u) = self.username(arg, true).await else {
             return t.invalid_username.into();
         };

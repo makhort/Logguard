@@ -112,6 +112,22 @@ impl Pipeline {
         {
             return Vec::new();
         }
+        // lines no built-in parser reads: only those a pattern of your own finds something in
+        if rec.source == crate::record::Source::Custom {
+            if self.parsers.custom.is_empty() {
+                return Vec::new();
+            }
+            self.parsers.feed(rec, &mut self.events);
+            for (name, outcome) in std::mem::take(&mut self.parsers.pattern_seen) {
+                self.engine.count_pattern(&name, rec.ts, outcome, &rec.msg);
+            }
+            if self.events.is_empty() {
+                return Vec::new();
+            }
+            self.engine.count_record(rec.source, rec.ts);
+            self.engine.now = self.engine.now.max(rec.ts);
+            return self.drain();
+        }
         self.engine.count_record(rec.source, rec.ts);
         // Lines that only produce ops notes (certificates) must still advance time.
         self.engine.now = self.engine.now.max(rec.ts);
@@ -123,9 +139,16 @@ impl Pipeline {
         if rec.source == crate::record::Source::Systemd {
             actions.extend(self.service_alert(&rec.msg, rec.ts));
         }
+        if rec.source == crate::record::Source::Privilege {
+            let ident = rec.sender.as_ref().and_then(|s| s.ident.as_deref()).unwrap_or_else(|| crate::parse::privilege::ident_of(&rec.msg));
+            if let Some(sw) = crate::parse::privilege::parse(ident, &rec.msg) {
+                actions.extend(self.engine.on_privilege(&sw, rec.ts));
+            }
+        }
         actions.extend(self.services_down(rec.ts));
         for note in std::mem::take(&mut self.parsers.ejabberd.ops) {
-            let mut message = note.message;
+            // log text (paths, host names, ACME's reasons): nothing that displays otherwise
+            let mut message = crate::event::clean(&note.message, 500);
             let mut severity = note.severity;
             if note.key.starts_with("cert-expiry:") {
                 // ejabberd also warns about old certificates still lying in acme/live. If every
@@ -143,10 +166,10 @@ impl Pipeline {
                     );
                 }
             }
-            // The path comes from a log line: only hash real certificate files.
-            if let Some(path) =
-                note.new_cert.as_ref().filter(|p| p.starts_with('/') && !p.contains("/../") && std::path::Path::new(p).is_file())
-            {
+            // The path comes from a log line: only hash real certificate files (a few KB; this
+            // runs on the main loop, so nothing openssl would take long over).
+            let certificate_file = |p: &String| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= 1 << 20);
+            if let Some(path) = note.new_cert.as_ref().filter(|p| p.starts_with('/') && !p.contains("/../") && certificate_file(p)) {
                 // Only meaningful live (the file exists on this host); harmless in replays.
                 if let Some(hash) = crate::digest::tlsa_311(&self.cfg.digest.openssl, path) {
                     message += &format!(". New DANE TLSA record: 3 1 1 {hash} - publish it (next to the old one) before switching");
@@ -166,6 +189,12 @@ impl Pipeline {
             ));
         }
         actions
+    }
+
+    /// An event observed outside the logs (a honeypot listener's connection), as if parsed.
+    pub fn event(&mut self, ev: Event) -> Vec<Action> {
+        self.engine.count_record(ev.signal.source(), ev.ts);
+        self.engine.on_event(&ev)
     }
 
     pub fn tick(&mut self, now: Micros) -> Vec<Action> {
@@ -210,6 +239,7 @@ mod tests {
                 pid: 1,
                 msg: "2026-10-10 01:43:43.687 [warning] Certificate in /acme/live/879798 (at line: 1) for conference.example.org, example.org and 3 more hosts will expire in a week".into(),
                 cursor: None,
+                sender: None,
             })
         };
         // no certificate data yet: stays a warning
@@ -225,6 +255,50 @@ mod tests {
     use crate::engine::{Severity, Topic};
 
     #[test]
+    fn privilege_and_custom_lines() {
+        let cfg = Config::from_toml(
+            "[[patterns]]\nname = \"web\"\nidentifier = \"nginx\"\nuid = 33\nkind = \"probe\"\nweight = 60\nregex = '^(?P<ip>\\S+) .*GET /\\.env'",
+        )
+        .unwrap();
+        let mut p = Pipeline::new(Arc::new(cfg), 0);
+        let mut y = crate::record::YearGuess::new(2026);
+        let mut feed = |p: &mut Pipeline, line: &str| p.feed(&crate::record::parse_syslog_line(line, &mut y).unwrap());
+        let a = feed(&mut p, "Oct 24 10:00:00 h su[77]: FAILED SU (to root) gateway on pts/0");
+        assert_eq!((a.len(), a[0].severity, a[0].topic), (1, Severity::High, Some(Topic::Compromise)));
+        assert!(a[0].message.starts_with("su to root failed for gateway on pts/0"), "{}", a[0].message);
+        let a = feed(&mut p, "Oct 24 10:00:20 h su[78]: (to root) gateway on pts/0");
+        assert!(a[0].message.contains("succeeded after 1 failed attempts"), "{}", a[0].message);
+        let a = feed(&mut p, "Oct 24 11:00:00 h su[79]: (to root) gateway on pts/0");
+        assert_eq!((a[0].severity, a[0].topic), (Severity::Info, None), "the admin's own way in: logged, not sent");
+        // a line of a pattern of your own; other lines of no parser are dropped uncounted
+        let a = feed(&mut p, "Oct 24 11:00:01 h nginx[5]: 198.51.100.7 - - \"GET /.env HTTP/1.1\" 404");
+        assert!(a.is_empty(), "60 points: no ban yet");
+        let a = feed(&mut p, "Oct 24 11:00:02 h nginx[5]: 198.51.100.7 - - \"GET /.env.bak HTTP/1.1\" 404");
+        assert_eq!(a.iter().filter(|a| a.kind == crate::engine::ActionKind::Ban).count(), 1, "{a:?}");
+        assert_eq!(a[0].category.as_deref(), Some("custom"));
+        assert!(feed(&mut p, "Oct 24 11:00:03 h cron[6]: (root) CMD (x)").is_empty());
+        assert_eq!(p.engine.stats.records.get(&Source::Custom), Some(&2));
+        // a match whose group ip holds no address: counted for the Patterns tab only
+        assert!(feed(&mut p, "Oct 24 11:00:04 h nginx[5]: unknown - - \"GET /.env HTTP/1.1\" 404").is_empty());
+        assert_eq!(p.engine.stats.records.get(&Source::Custom), Some(&2));
+        let snap = p.snapshot(50);
+        let st = &snap.patterns[0].stats;
+        assert_eq!((st.name.as_str(), st.matches, st.no_address, snap.patterns[0].addresses), ("web", 2, 1, 1));
+        assert_eq!(st.lines, 3, "lines from nginx's uid, matched or not");
+        assert_eq!((st.ips[0].ip.to_string(), st.ips[0].lines), ("198.51.100.7".to_string(), 2));
+        assert!(st.no_address_lines[0].1.starts_with("unknown - - "), "{:?}", st.no_address_lines);
+
+        // kept across restarts, for the patterns still configured
+        let saved = p.engine.export(None);
+        let mut again = Pipeline::new(Arc::clone(&p.cfg), 0);
+        again.engine.restore(saved.clone());
+        assert_eq!(again.snapshot(50).patterns[0].stats, *st);
+        let mut other = Pipeline::new(Arc::new(Config::default()), 0);
+        other.engine.restore(saved);
+        assert!(other.snapshot(50).patterns.is_empty() && other.engine.export(None).patterns.is_empty());
+    }
+
+    #[test]
     fn oom_kills_become_system_alerts() {
         let mut p = Pipeline::new(std::sync::Arc::new(crate::config::Config::default()), 0);
         let rec = |pid: u32, name: &str| Record {
@@ -233,6 +307,7 @@ mod tests {
             pid: 0,
             msg: format!("Out of memory: Killed process {pid} ({name}) total-vm:970112kB, anon-rss:920752kB, file-rss:68kB"),
             cursor: None,
+            sender: None,
         };
         let a = p.feed(&rec(1, "clamscan"));
         assert_eq!(a.len(), 1);
