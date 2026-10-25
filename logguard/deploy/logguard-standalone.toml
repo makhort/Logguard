@@ -68,7 +68,7 @@ burst = 20
 nets = [
   "127.0.0.0/8",
   "::1",
-  "11.43.43.31",
+  "11.42.43.31",
   # Upstream DNS used by this host and by VPN clients (WG_DEFAULT_DNS). UDP sources can be spoofed:
   # a forged flood "from" these resolvers must never get them banned, or DNS breaks for everyone.
   "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
@@ -97,7 +97,7 @@ enabled = false           # needs ejabberdctl on this host
 enabled = true
 node_id = "standalone"
 listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
-peers = ["11.25.39.236:7946"]           # xmpp; peers are never banned here
+peers = ["11.24.39.236:7946"]           # xmpp; peers are never banned here
 key_file = "/etc/logguard/cluster.key"
 rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
 sync_interval = "10s"
@@ -107,7 +107,7 @@ accept = ["bans", "unbans", "reports", "trust", "notices"]
 # Optional: a Telegram relay node (deploy/logguard-tg.toml), which gets this node's relayed
 # admin messages. Add it to `peers` above and let it hand over notices only (the limit goes by
 # its address). 203.0.113.10 = its address.
-#peers = ["11.25.39.236:7946", "203.0.113.10:7946"]   # xmpp, tg
+#peers = ["11.24.39.236:7946", "203.0.113.10:7946"]   # xmpp, tg
 #peer_accept = { "203.0.113.10:7946" = ["notices"] }
 # Bans learned from peers last at most this long here. The built-in default (1d) limits what a
 # compromised or mistaken node can do to the others; both nodes here are equally trusted, so

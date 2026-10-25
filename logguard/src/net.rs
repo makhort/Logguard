@@ -155,8 +155,8 @@ impl Net {
         self.contains_net(other) || other.contains_net(self)
     }
 
-    /// The narrowest network holding both (of the same family): `11.18.91.0/24` and
-    /// `11.18.89.7` -> `11.18.88.0/22`.
+    /// The narrowest network holding both (of the same family): `11.17.59.0/24` and
+    /// `11.17.57.7` -> `11.17.56.0/22`.
     pub fn common(&self, other: &Net) -> Net {
         let shared = match (self.addr, other.addr) {
             (IpAddr::V4(a), IpAddr::V4(b)) => (u32::from(a) ^ u32::from(b)).leading_zeros(),
@@ -239,19 +239,19 @@ mod tests {
     #[test]
     fn mapped_addresses_become_v4() {
         assert_eq!(parse_ip("::ffff:1.2.3.4"), Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(parse_ip_port("[::ffff:11.40.25.27]:59195"), Some(("11.40.25.27".parse().unwrap(), Some(59195))));
-        assert_eq!(parse_ip_port("11.18.111.110:50735"), Some(("11.18.111.110".parse().unwrap(), Some(50735))));
+        assert_eq!(parse_ip_port("[::ffff:11.39.25.27]:59195"), Some(("11.39.25.27".parse().unwrap(), Some(59195))));
+        assert_eq!(parse_ip_port("11.17.79.110:50735"), Some(("11.17.79.110".parse().unwrap(), Some(50735))));
         assert_eq!(parse_ip_port("[2001:db8::1]:443").unwrap().1, Some(443));
         assert_eq!(parse_ip_port("2001:db8::1").unwrap().1, None);
     }
 
     #[test]
     fn subnet_math() {
-        let n: Net = "11.43.43.99/24".parse().unwrap();
-        assert_eq!(n.to_string(), "11.43.43.0/24");
-        assert!(n.contains("11.43.43.31".parse().unwrap()));
-        assert!(!n.contains("11.43.44.31".parse().unwrap()));
-        assert!(n.contains_net(&"11.43.43.31".parse().unwrap()));
+        let n: Net = "11.42.43.99/24".parse().unwrap();
+        assert_eq!(n.to_string(), "11.42.43.0/24");
+        assert!(n.contains("11.42.43.31".parse().unwrap()));
+        assert!(!n.contains("11.42.44.31".parse().unwrap()));
+        assert!(n.contains_net(&"11.42.43.31".parse().unwrap()));
         let v6: Net = "2001:db8:1:2::5/64".parse().unwrap();
         assert_eq!(v6.to_string(), "2001:db8:1:2::/64");
         assert!(!v6.contains("1.2.3.4".parse().unwrap()));
@@ -261,19 +261,20 @@ mod tests {
     #[test]
     fn common_network() {
         let common = |a: &str, b: &str| a.parse::<Net>().unwrap().common(&b.parse().unwrap()).to_string();
-        assert_eq!(common("11.18.91.0/24", "11.18.89.7"), "11.18.88.0/22");
-        assert_eq!(common("11.18.91.0/24", "11.18.90.0/24"), "11.18.90.0/23");
-        assert_eq!(common("11.18.91.0/24", "11.18.91.9"), "11.18.91.0/24", "already inside");
-        assert_eq!(common("11.18.88.0/22", "11.18.0.0/16"), "11.18.0.0/16", "the wider one");
-        assert_eq!(common("11.18.91.0/24", "11.19.1.1"), "11.17.0.0/11");
+        assert_eq!(common("11.17.59.0/24", "11.17.57.7"), "11.17.56.0/22");
+        assert_eq!(common("11.17.59.0/24", "11.17.58.0/24"), "11.17.58.0/23");
+        assert_eq!(common("11.17.59.0/24", "11.17.59.9"), "11.17.59.0/24", "already inside");
+        assert_eq!(common("11.17.56.0/22", "11.17.0.0/16"), "11.17.0.0/16", "the wider one");
+        // (across /16s: addresses the public mirror keeps as they are, see make_public_mirror.zsh)
+        assert_eq!(common("5.7.123.0/24", "5.8.1.1"), "5.0.0.0/12");
         assert_eq!(common("8.8.8.8", "8.8.8.8"), "8.8.8.8");
         assert_eq!(common("2001:db8:1::/64", "2001:db8:2::5"), "2001:db8::/46");
     }
 
     #[test]
     fn host_addresses_from_fib_trie() {
-        let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 0.0.0.0\n        /0 universe UNICAST\n     +-- 11.25.39.0/24 2 0 2\n        |-- 11.25.39.0\n           /24 link UNICAST\n        |-- 11.25.39.236\n           /32 host LOCAL\n     |-- 127.0.0.1\n        /32 host LOCAL\n";
-        assert_eq!(parse_fib_trie(trie), vec!["11.25.39.236".parse::<IpAddr>().unwrap(), "127.0.0.1".parse().unwrap()]);
+        let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 0.0.0.0\n        /0 universe UNICAST\n     +-- 11.24.39.0/24 2 0 2\n        |-- 11.24.39.0\n           /24 link UNICAST\n        |-- 11.24.39.236\n           /32 host LOCAL\n     |-- 127.0.0.1\n        /32 host LOCAL\n";
+        assert_eq!(parse_fib_trie(trie), vec!["11.24.39.236".parse::<IpAddr>().unwrap(), "127.0.0.1".parse().unwrap()]);
     }
 
     #[test]
@@ -289,11 +290,11 @@ mod tests {
 
     #[test]
     fn collapse_overlaps() {
-        let nets: Vec<Net> = ["127.0.0.0/8", "11.43.43.31", "127.0.0.1", "8.8.8.8", "8.8.8.8", "::1", "2001:db8::/32", "2001:db8::5"]
+        let nets: Vec<Net> = ["127.0.0.0/8", "11.42.43.31", "127.0.0.1", "8.8.8.8", "8.8.8.8", "::1", "2001:db8::/32", "2001:db8::5"]
             .iter()
             .map(|s| s.parse().unwrap())
             .collect();
         let got: Vec<String> = collapse(&nets).iter().map(|n| n.to_string()).collect();
-        assert_eq!(got, vec!["2001:db8::/32", "::1", "127.0.0.0/8", "8.8.8.8", "11.43.43.31"]);
+        assert_eq!(got, vec!["2001:db8::/32", "::1", "127.0.0.0/8", "8.8.8.8", "11.42.43.31"]);
     }
 }

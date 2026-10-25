@@ -41,5 +41,5 @@
 # on the relay node, send its own report to the merging server only, and wait this long for
 # the merged one (the merging server waits for its peers first, then looks up the mailboxes;
 # if none comes, the relay node merges itself):
-#ABUSE_REPORT_SEND_TO="11.25.39.236:7946"
+#ABUSE_REPORT_SEND_TO="11.24.39.236:7946"
 #ABUSE_REPORT_RELAY_WAIT_MIN=60

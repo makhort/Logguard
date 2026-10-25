@@ -450,25 +450,25 @@ mod tests {
     #[test]
     fn sanitizing_is_optional() {
         let alert = "To: admin\nSubject: [xmpp] logguard: account under attack\n\n\
-                     account alice@example.org under attack from 11.21.45.233; peer 11.25.39.236:7946 failing";
+                     account alice@example.org under attack from 11.20.45.233; peer 11.24.39.236:7946 failing";
         let dir = tmp("sanitize");
         // off (the default): the mail carries the names, encrypted
         std::fs::write(dir.join("alert-1.msg"), alert).unwrap();
         let (mut b, secret) = bot(&dir);
         b.deliver_alerts(&AtomicBool::new(false));
         let plain = decoded_body(&inner(&secret, &b.out.sent[0].1));
-        assert!(plain.contains("alice@example.org") && plain.contains("11.25.39.236"), "{plain}");
+        assert!(plain.contains("alice@example.org") && plain.contains("11.24.39.236"), "{plain}");
         // on: as on Telegram; attackers' addresses stay
         std::fs::write(dir.join("alert-2.msg"), alert).unwrap();
         b.cfg.sanitize = Some(Sanitize {
             names: Pseudonyms::new([7; 32], vec!["example.org".into()]),
-            servers: ServerNames::parse("xmpp=11.25.39.236,example.org").unwrap(),
+            servers: ServerNames::parse("xmpp=11.24.39.236,example.org").unwrap(),
         });
         b.deliver_alerts(&AtomicBool::new(false));
         let inner = inner(&secret, &b.out.sent[1].1);
         let text = decoded_body(&inner);
-        assert!(!text.contains("alice") && !text.contains("11.25.39.236"), "{text}");
-        assert!(text.contains("[acct:") && text.contains("peer xmpp:7946") && text.contains("11.21.45.233"), "{text}");
+        assert!(!text.contains("alice") && !text.contains("11.24.39.236"), "{text}");
+        assert!(text.contains("[acct:") && text.contains("peer xmpp:7946") && text.contains("11.20.45.233"), "{text}");
         assert!(inner.contains("\r\nSubject: [xmpp] logguard: account under attack\r\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }

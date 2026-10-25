@@ -72,7 +72,7 @@ mod tests {
             (Signal::WebProbe, "11.7.32.142".into(), "denied: /var/www/html/config/aws.yml")
         );
         assert_eq!(crate::time::fmt_ts(e[0].ts), "2026-10-05 06:48:49");
-        let e = parse("2026-10-11T17:49:18.123456789Z [Sun Oct 11 17:49:18 2026] [error] [client: 11.37.52.117] [AH10244: invalid URI path (/../.env)] [UA]");
+        let e = parse("2026-10-11T17:49:18.123456789Z [Sun Oct 11 17:49:18 2026] [error] [client: 11.36.52.117] [AH10244: invalid URI path (/../.env)] [UA]");
         assert_eq!(e[0].detail, "path traversal: /../.env");
         let e = parse("[Tue Oct 06 08:27:23.123 2026] [authz_core:error] [pid 9] [client 203.0.113.9:51234] AH01630: client denied by server configuration: /var/www/html/.git");
         assert_eq!(e[0].ip.to_string(), "203.0.113.9");
@@ -97,9 +97,9 @@ mod tests {
         assert!(parse(r#"{"time":"2026-10-11T19:16:25+00:00","remoteAddr":"198.51.100.4","message":"Trusted domain error"}"#).is_empty());
         // real line from the server (Nextcloud 34.0.4)
         let e = parse(
-            r#"{"reqId":"WVnDVHYg2lFh0z5kmXVC","level":2,"time":"2026-10-11T19:54:01+00:00","remoteAddr":"11.28.37.110","user":"--","app":"no app in context","method":"POST","url":"/login","scriptName":"/index.php","message":"Login failed: admin (Remote IP: 11.28.37.110)","userAgent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0","version":"11.6.4.1","data":[]}"#,
+            r#"{"reqId":"WVnDVHYg2lFh0z5kmXVC","level":2,"time":"2026-10-11T19:54:01+00:00","remoteAddr":"11.27.37.110","user":"--","app":"no app in context","method":"POST","url":"/login","scriptName":"/index.php","message":"Login failed: admin (Remote IP: 11.27.37.110)","userAgent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0","version":"11.6.4.1","data":[]}"#,
         );
-        assert_eq!((e[0].signal, e[0].ip.to_string(), e[0].account.as_deref()), (Signal::NcAuthFail, "11.28.37.110".into(), Some("admin")));
+        assert_eq!((e[0].signal, e[0].ip.to_string(), e[0].account.as_deref()), (Signal::NcAuthFail, "11.27.37.110".into(), Some("admin")));
         assert_eq!(crate::time::fmt_ts(e[0].ts), "2026-10-11 19:54:01");
         // real line from the server: the updater's own "../" path, no remote address
         assert!(parse(r#"{"reqId":"K2G5HUQ5mwhjHWlRkmIw","level":1,"time":"2026-09-06T15:23:53+00:00","remoteAddr":"","user":"--","app":"updater","method":"","url":"--","scriptName":"/var/www/html/updater/../occ","message":"\OC\Updater::updateEnd: Update successful","userAgent":"--","version":"11.6.3.2","occ_command":["/var/www/html/updater/../occ","upgrade"],"data":{"app":"updater"}}"#).is_empty());

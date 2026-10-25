@@ -770,7 +770,7 @@ fn classify(
     }
 }
 
-/// "11.33.48.86", "3 sources": who some rules let in.
+/// "11.32.48.86", "3 sources": who some rules let in.
 fn sources<'a>(from: impl Iterator<Item = &'a str>) -> String {
     let distinct: std::collections::BTreeSet<&str> = from.collect();
     match distinct.iter().next() {
@@ -977,7 +977,7 @@ mod tests {
    0: 00000000:4651 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1001 1 0000000000000000 100 0 0 10 0
    1: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   101        0 1002 1 0000000000000000 100 0 0 10 0
    2: 00000000:CA6D 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1003 1 0000000000000000 100 0 0 10 0
-   3: ECC7284E:4651 0B4B74B0:A1F2 01 00000000:00000000 00:00000000 00000000     0        0 1004 1 0000000000000000 100 0 0 10 0
+   3: 0A0200C0:4651 0B6433C6:A1F2 01 00000000:00000000 00:00000000 00000000     0        0 1004 1 0000000000000000 100 0 0 10 0
 ";
     const UDP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
   1: 00000000000000000000000000000000:D471 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 2001 2 0000000000000000 0
@@ -992,8 +992,8 @@ To                         Action      From
 49152:65535/udp            ALLOW       Anywhere                   # relay
 5349/tcp                   ALLOW       Anywhere                   # TURNS
 OpenSSH                    ALLOW       Anywhere
-Anywhere                   DENY        11.30.0.0/16              # blocked
-Anywhere                   ALLOW       11.43.43.31
+Anywhere                   DENY        11.29.0.0/16              # blocked
+Anywhere                   ALLOW       11.42.43.31
 2222/tcp (v6)             LIMIT       Anywhere (v6)              # SSH
 ";
 
@@ -1070,9 +1070,9 @@ Anywhere                   ALLOW       11.43.43.31
         let ufw = "Status: active\n\nTo                         Action      From\n--                         ------      ----\n\
             9847/tcp                   LIMIT IN    Anywhere                   # SSH\n\
             443/tcp                    ALLOW IN    Anywhere                   # Nextcloud\n\
-            7946/tcp                   ALLOW IN    11.33.48.86               # logguard cluster\n\
+            7946/tcp                   ALLOW IN    11.32.48.86               # logguard cluster\n\
             7946/tcp                   ALLOW IN    11.5.39.73                # logguard cluster\n\
-            7946/tcp                   ALLOW IN    11.25.39.236              # logguard cluster\n\
+            7946/tcp                   ALLOW IN    11.24.39.236              # logguard cluster\n\
             9847/tcp (v6)              LIMIT IN    Anywhere (v6)              # SSH\n";
         let key = |port, proto| ListenerKey { addr: "0.0.0.0".parse().unwrap(), port, proto };
         let sockets = vec![(key(7946, Proto::Tcp), 1), (key(443, Proto::Tcp), 2), (key(8443, Proto::Tcp), 2), (key(5355, Proto::Tcp), 3)];
@@ -1094,10 +1094,10 @@ Anywhere                   ALLOW       11.43.43.31
         assert_eq!((docker(443).as_deref(), docker(8443).as_deref()), (Some("ALLOW 443/tcp"), Some("none: containers blocked")));
         assert_eq!(get(5355), (Exposure::Firewalled, None, "blocked by ufw".into()));
         assert_eq!(r.dead_rules, ["9847/tcp"], "no sshd in this test; rules for some sources are never dead");
-        let one = parse_ufw_status(&ufw.replace("11.5.39.73", "11.33.48.86").replace("11.25.39.236", "11.33.48.86")).1;
+        let one = parse_ufw_status(&ufw.replace("11.5.39.73", "11.32.48.86").replace("11.24.39.236", "11.32.48.86")).1;
         let r = build_report(0, vec![(key(7946, Proto::Tcp), 1)], &owners, &FirewallView { ufw: Some(ufw), ..Default::default() }, &[]);
         assert!(r.listeners[0].rule.as_deref().is_some_and(|x| x.ends_with("3 sources")));
-        assert_eq!(sources(one.iter().filter_map(|r| r.from.as_deref())), "11.33.48.86");
+        assert_eq!(sources(one.iter().filter_map(|r| r.from.as_deref())), "11.32.48.86");
 
         // the same with iptables: an ACCEPT for the peers' set, closed by the policy otherwise
         let ipt = "-P INPUT DROP\n-A INPUT -p tcp -m tcp --dport 7946 -m set --match-set peers src -j ACCEPT\n-A INPUT -p tcp --dport 22 -j ACCEPT\n";

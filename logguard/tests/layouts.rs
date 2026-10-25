@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ATTACKER_SSH: &str = "11.21.45.233";
-const ATTACKER_XMPP: &str = "11.47.50.7";
-const ATTACKER_VPN: &str = "11.29.63.115";
+const ATTACKER_SSH: &str = "11.20.45.233";
+const ATTACKER_XMPP: &str = "11.46.50.7";
+const ATTACKER_VPN: &str = "11.28.63.115";
 const USER: &str = "bob@example.org";
 const ADMIN: &str = "admin@example.org";
 const KEY: &str = "Zm9yIHRlc3RzIG9ubHk6IGEgMzItYnl0ZSBrZXkhISE=";
@@ -49,7 +49,7 @@ fn xmpp_attack(ip: &str, jid: &str) -> Vec<String> {
     let ts = logguard::time::fmt_ts(logguard::time::now());
     let line = |msg: String| journal("ejabberd", "ejabberd.service", &format!("{ts}.000 {msg}"));
     let login =
-        line(format!("[info] (tls|<0.4000.0>) Accepted c2s SCRAM-SHA-256 authentication for {jid} by sql backend from ::ffff:11.43.43.31"));
+        line(format!("[info] (tls|<0.4000.0>) Accepted c2s SCRAM-SHA-256 authentication for {jid} by sql backend from ::ffff:11.42.43.31"));
     let failures = (1..=5).map(|i| {
         line(format!(
             "[warning] (tls|<0.{}.0>) Failed c2s SCRAM-SHA-256 authentication for {jid} from ::ffff:{ip}: Invalid username or password",

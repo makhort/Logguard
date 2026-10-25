@@ -65,10 +65,10 @@ leaves the server.
 ## The servers appear by their node ids
 
 `SERVER_NAMES` lists each server's own addresses and host names under its node id (logguard's
-`[cluster] node_id`): `xmpp=11.25.39.236,example.org; vpn=11.33.48.86; tg=203.0.113.10`.
+`[cluster] node_id`): `xmpp=11.24.39.236,example.org; vpn=11.32.48.86; tg=203.0.113.10`.
 In alerts and digests, after the account names:
 
-- an address becomes the node id: `cluster peer 11.33.48.86:7946 failing` → `cluster peer
+- an address becomes the node id: `cluster peer 11.32.48.86:7946 failing` → `cluster peer
   vpn:7946 failing`. IPv4 matches as any run of digits and dots, wherever it is (`dead:…`,
   `::ffff:…:7946`); IPv6 as a run of hex digits and colons that is the address (brackets and
   IPv4-mapped too), or, when the run is no valid address, starts with it before a colon

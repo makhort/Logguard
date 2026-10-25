@@ -584,9 +584,9 @@ pub(crate) mod tests {
     pub(crate) fn sample() -> GeoDb {
         let mut db = GeoDb::default();
         let country = "0.0.0.0,0.255.255.255,ZZ\n1.0.0.0,1.0.0.255,AU\n5.9.0.0,5.9.127.255,DE\n5.9.128.0,5.9.255.255,DE\n\
-                       11.36.0.0,11.36.255.255,FI\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
+                       11.35.0.0,11.35.255.255,FI\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
         let asn = "1.0.0.0,1.0.0.255,13335,\"Cloudflare, Inc.\"\n5.9.0.0,5.9.255.255,24940,\"Hetzner Online GmbH\"\n\
-                   11.36.0.0,11.36.255.255,24940,\"Hetzner Online GmbH\"\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
+                   11.35.0.0,11.35.255.255,24940,\"Hetzner Online GmbH\"\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
         assert_eq!(db.read(country.as_bytes(), true).unwrap(), 4, "ZZ dropped, adjacent DE blocks merged");
         assert_eq!(db.read(asn.as_bytes(), false).unwrap(), 4);
         db
@@ -597,34 +597,34 @@ pub(crate) mod tests {
         let db = sample();
         let l = |ip: &str| db.label(ip.parse().unwrap());
         assert_eq!(l("5.9.200.1").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
-        assert_eq!(l("11.36.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
+        assert_eq!(l("11.35.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.0.1").as_deref(), Some("Australia / Cloudflare, Inc. (AS13335)"));
         assert_eq!(l("3fff:100:1:2::3").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.1.1"), None);
         assert_eq!(l("0.1.2.3"), None);
-        assert_eq!(db.asn("11.36.3.4".parse().unwrap()), Some(24940));
+        assert_eq!(db.asn("11.35.3.4".parse().unwrap()), Some(24940));
     }
 
     #[test]
     fn one_network() {
         let mut db = GeoDb::default();
-        let asn = "11.18.88.0,11.18.89.255,64501,\"Other\"\n11.18.90.0,11.18.91.127,64500,\"Provider\"\n\
-                   11.18.91.128,11.18.95.255,64500,\"Provider (DE)\"\n3fff:100::,3fff:100:0:ffff:ffff:ffff:ffff:ffff,24940,\"H\"\n\
+        let asn = "11.17.56.0,11.17.57.255,64501,\"Other\"\n11.17.58.0,11.17.59.127,64500,\"Provider\"\n\
+                   11.17.59.128,11.17.63.255,64500,\"Provider (DE)\"\n3fff:100::,3fff:100:0:ffff:ffff:ffff:ffff:ffff,24940,\"H\"\n\
                    3fff:100:1::,3fff:100:1:ffff:ffff:ffff:ffff:ffff,64502,\"V\"\n";
         db.read(asn.as_bytes(), false).unwrap();
         let one = |n: &str| db.one_network(&n.parse().unwrap());
-        assert!(one("11.18.90.0/23") && one("11.18.92.0/22"), "one ASN over several ranges");
-        assert!(!one("11.18.88.0/22") && !one("11.18.0.0/16"), "two providers");
-        assert!(one("11.18.89.7") && one("11.19.0.0/16"), "unknown addresses don't count");
+        assert!(one("11.17.58.0/23") && one("11.17.60.0/22"), "one ASN over several ranges");
+        assert!(!one("11.17.56.0/22") && !one("11.17.0.0/16"), "two providers");
+        assert!(one("11.17.57.7") && one("11.18.0.0/16"), "unknown addresses don't count");
         assert!(one("3fff:100::/48") && one("3fff:100:0:5::/64") && !one("3fff:100::/47"));
-        assert!(GeoDb::default().one_network(&"11.18.0.0/16".parse().unwrap()), "no network database");
+        assert!(GeoDb::default().one_network(&"11.17.0.0/16".parse().unwrap()), "no network database");
     }
 
     #[test]
     fn networks_of_asns() {
         let db = sample();
         let nets: Vec<String> = db.networks_of(&[24940].into_iter().collect()).iter().map(|n| n.to_string()).collect();
-        assert_eq!(nets, ["5.9.0.0/16", "11.36.0.0/16", "3fff:100::/32"]);
+        assert_eq!(nets, ["5.9.0.0/16", "11.35.0.0/16", "3fff:100::/32"]);
         assert!(db.networks_of(&[64999].into_iter().collect()).is_empty());
     }
 

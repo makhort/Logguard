@@ -2570,7 +2570,7 @@ impl Engine {
     }
 
     /// The latest lines of what these addresses did, so the actions log keeps proof for a
-    /// network ban too: "10-11 05:03:08 11.48.29.77 block TCP/23".
+    /// network ban too: "10-11 05:03:08 11.47.29.77 block TCP/23".
     fn members_evidence(&self, ips: impl Iterator<Item = IpAddr>) -> Vec<String> {
         let mut out = Vec::new();
         for ip in ips {
@@ -3000,7 +3000,7 @@ mod tests {
 
     fn engine() -> Engine {
         let mut cfg = Config::default();
-        cfg.allowlist.nets.push("11.43.43.31".parse().unwrap());
+        cfg.allowlist.nets.push("11.42.43.31".parse().unwrap());
         Engine::new(Arc::new(cfg), 0)
     }
 
@@ -3049,8 +3049,8 @@ mod tests {
         assert!(!e.snapshot(0, 10).world.geo);
         e.geo = Some(Arc::new(crate::geo::tests::sample()));
         e.on_event(&ev(1, "5.9.1.1", Signal::FwTripwire).port(Some(23))); // DE, banned
-        e.on_event(&ev(2, "11.36.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
-        e.on_event(&ev(3, "11.36.1.1", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(2, "11.35.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
+        e.on_event(&ev(3, "11.35.1.1", Signal::FwBlock).port(Some(3389)));
         e.on_event(&ev(4, "8.8.8.8", Signal::FwBlock).port(Some(22))); // no geo data
         e.on_event(&ev(5, "1.0.0.5", Signal::XmppAuthOk)); // AU user
         let w = e.snapshot(0, 10).world;
@@ -3085,7 +3085,7 @@ mod tests {
         assert_eq!(w2.ports, vec![(3389, 1)], "halved; counters reaching 0 are dropped");
         assert!(w2.by_country.get("DE").is_none_or(|d| d.ports.is_empty()));
         // most offenders first, whatever the bans
-        e.on_event(&ev(6, "11.36.1.2", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(6, "11.35.1.2", Signal::FwBlock).port(Some(3389)));
         let w = e.snapshot(0, 10).world;
         assert_eq!(w.countries.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), ["FI", "DE"]);
     }
@@ -3147,7 +3147,7 @@ mod tests {
         assert!(a.iter().any(|a| a.severity == Severity::Critical && a.topic == Some(Topic::Compromise)), "{a:?}");
         assert!(e.protection("11.15.9.8".parse().unwrap()).is_none(), "a canary login earns no trust");
         // your own (allowlisted) address mistyping a name: alert, no ban
-        let a = e.on_event(&ev(3, "11.43.43.31", Signal::SshCanary).account(Some("root")));
+        let a = e.on_event(&ev(3, "11.42.43.31", Signal::SshCanary).account(Some("root")));
         assert!(bans(&a).is_empty());
         assert!(a.iter().any(|a| a.topic == Some(Topic::Protected)));
     }
@@ -3374,7 +3374,7 @@ mod tests {
         let ccfg = ClusterCfg::default();
         let fact = |body| Fact { origin: "vpn".into(), seq: 1, created: 1000 * SEC, hops: 1, body };
         let mut e = engine();
-        e.enable_sharing(vec!["11.33.48.86".parse().unwrap()]);
+        e.enable_sharing(vec!["11.32.48.86".parse().unwrap()]);
         e.now = 1000 * SEC;
 
         // remote ban: applied, capped to max_remote_ban, tagged with its origin, not re-shared as ours
@@ -3389,7 +3389,7 @@ mod tests {
         assert!(e.take_outbox(10.0).is_empty());
 
         // protected addresses: home (allowlist) and cluster peers are never banned by peers
-        for ip in ["11.43.43.31", "11.33.48.86"] {
+        for ip in ["11.42.43.31", "11.32.48.86"] {
             assert!(e
                 .apply_peer_fact(
                     &fact(FactBody::Ban { net: ip.parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
@@ -3593,13 +3593,13 @@ mod tests {
     #[test]
     fn three_tls_failures_ban() {
         let mut e = engine();
-        assert!(e.on_event(&ev(0, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
-        assert!(e.on_event(&ev(5, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
-        let a = e.on_event(&ev(9, "11.50.40.218", Signal::XmppTlsFail));
-        assert_eq!(bans(&a), vec!["11.50.40.218"]);
+        assert!(e.on_event(&ev(0, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(5, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
+        let a = e.on_event(&ev(9, "11.49.40.218", Signal::XmppTlsFail));
+        assert_eq!(bans(&a), vec!["11.49.40.218"]);
         assert_eq!(a[0].until, Some(9 * SEC + 3600 * SEC));
         // no duplicate ban while active
-        assert!(e.on_event(&ev(10, "11.50.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(10, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
     }
 
     #[test]
@@ -3622,7 +3622,7 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for i in 0..10 {
-            all.extend(e.on_event(&ev(i, "11.43.43.31", Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(i, "11.42.43.31", Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty());
         assert!(all.iter().any(|a| a.kind == ActionKind::Alert));
@@ -3706,7 +3706,7 @@ mod tests {
     #[test]
     fn port_spread_scanner() {
         let mut e = engine();
-        let ip = "11.42.253.221";
+        let ip = "11.41.253.221";
         let mut all = vec![];
         for (i, port) in [5222u16, 5269, 5280, 5443].iter().enumerate() {
             all.extend(e.on_event(&ev(i as i64, ip, Signal::XmppConn).port(Some(*port))));
@@ -3743,23 +3743,23 @@ mod tests {
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i, &format!("11.18.91.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i, &format!("11.17.59.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
         let b = bans(&all);
-        assert!(b.contains(&"11.18.91.0/24".to_string()));
+        assert!(b.contains(&"11.17.59.0/24".to_string()));
         let sub = all.iter().find(|a| a.target.map(|t| t.prefix) == Some(24)).unwrap();
         assert_eq!(sub.superseded.len(), 3, "host bans inside the subnet are replaced");
-        assert!(e.banned_by("11.18.91.200".parse().unwrap()).is_some());
+        assert!(e.banned_by("11.17.59.200".parse().unwrap()).is_some());
 
         // A subnet that contains a trusted address is never banned wholesale.
         let mut e = engine();
-        e.on_event(&Event::new(0, "11.24.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        e.on_event(&Event::new(0, "11.23.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i + 1, &format!("11.24.44.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i + 1, &format!("11.23.44.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
@@ -3771,11 +3771,11 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for host in 1..=6 {
-            all.extend(e.on_event(&ev(host, &format!("11.32.48.{host}"), Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(host, &format!("11.31.48.{host}"), Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty(), "one probe per address is not a ban on its own");
         all.extend(e.tick(120 * SEC));
-        assert_eq!(bans(&all), vec!["11.32.48.0/24"]);
+        assert_eq!(bans(&all), vec!["11.31.48.0/24"]);
     }
 
     /// Three failed TLS handshakes within 3 s: a host ban.
@@ -3787,41 +3787,42 @@ mod tests {
 
     #[test]
     fn subnet_bans_grow_step_by_step() {
+        // (across /19s and /16s: addresses the public mirror keeps as they are, see make_public_mirror.zsh)
         let mut e = engine();
         for host in [10, 11, 12] {
-            attack(&mut e, 0, &format!("11.18.91.{host}"));
+            attack(&mut e, 0, &format!("5.8.123.{host}"));
         }
-        assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.18.91.0/24"], "the first subnet ban is a /24");
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["5.8.123.0/24"], "the first subnet ban is a /24");
 
         // 5 prefix bits away (common network /19): more than one step, so it stays a host ban
-        attack(&mut e, 200, "11.18.68.5");
+        attack(&mut e, 200, "5.8.100.5");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
 
         // in the same /22: the ban grows to the /22 and takes both in
-        attack(&mut e, 400, "11.18.89.7");
+        attack(&mut e, 400, "5.8.121.7");
         let a = e.tick(500 * SEC);
-        assert_eq!(bans(&a), vec!["11.18.88.0/22"]);
+        assert_eq!(bans(&a), vec!["5.8.120.0/22"]);
         let grown = a.iter().find(|a| a.kind == ActionKind::Ban).unwrap();
         assert_eq!(grown.superseded.len(), 2, "{:?}", grown.superseded);
-        assert!(grown.message.contains("grown from 11.18.91.0/24, banned nearby: 11.18.89.7"), "{}", grown.message);
-        assert!(grown.evidence.iter().any(|l| l.contains(" 11.18.89.7 ")), "what it did: {:?}", grown.evidence);
-        assert_eq!(e.banned_by("11.18.90.200".parse().unwrap()).unwrap().net.to_string(), "11.18.88.0/22");
-        assert!(e.banned_by("11.18.92.1".parse().unwrap()).is_none(), "the rest of the /16 stays reachable");
+        assert!(grown.message.contains("grown from 5.8.123.0/24, banned nearby: 5.8.121.7"), "{}", grown.message);
+        assert!(grown.evidence.iter().any(|l| l.contains(" 5.8.121.7 ")), "what it did: {:?}", grown.evidence);
+        assert_eq!(e.banned_by("5.8.122.200".parse().unwrap()).unwrap().net.to_string(), "5.8.120.0/22");
+        assert!(e.banned_by("5.8.124.1".parse().unwrap()).is_none(), "the rest of the /16 stays reachable");
 
-        // /22 -> /20 (11.18.81.1), which brings 11.18.68.5 within one step: /19, as one ban
-        attack(&mut e, 600, "11.18.81.1");
+        // /22 -> /20 (5.8.113.1), which brings 5.8.100.5 within one step: /19, as one ban
+        attack(&mut e, 600, "5.8.113.1");
         let a = e.tick(700 * SEC);
-        assert_eq!(bans(&a), vec!["11.18.64.0/19"]);
+        assert_eq!(bans(&a), vec!["5.8.96.0/19"]);
         let grown = a.iter().find(|a| a.kind == ActionKind::Ban).unwrap();
-        assert!(grown.message.contains("grown from 11.18.88.0/22, banned nearby: 11.18.68.5, 11.18.81.1"), "{}", grown.message);
+        assert!(grown.message.contains("grown from 5.8.120.0/22, banned nearby: 5.8.100.5, 5.8.113.1"), "{}", grown.message);
 
         // never past v4_wide_prefix (/16), never into the next /16
-        attack(&mut e, 800, "11.18.104.1");
-        attack(&mut e, 800, "11.19.0.1");
+        attack(&mut e, 800, "5.8.200.1");
+        attack(&mut e, 800, "5.9.0.1");
         assert!(bans(&e.tick(900 * SEC)).is_empty(), "3 bits from the /19: too far");
-        attack(&mut e, 1000, "11.18.32.9");
-        assert_eq!(bans(&e.tick(1100 * SEC)), vec!["11.18.0.0/16"], "/18, then 11.18.104.1 is one step away");
-        assert_eq!(e.banned_by("11.19.0.1".parse().unwrap()).unwrap().net.to_string(), "11.19.0.1");
+        attack(&mut e, 1000, "5.8.64.9");
+        assert_eq!(bans(&e.tick(1100 * SEC)), vec!["5.8.0.0/16"], "/18, then 5.8.200.1 is one step away");
+        assert_eq!(e.banned_by("5.9.0.1".parse().unwrap()).unwrap().net.to_string(), "5.9.0.1");
         assert!(bans(&e.tick(1200 * SEC)).is_empty());
         let cover = subnet_coverage(&e.export(None).bans);
         assert_eq!(cover, SubnetCoverage { subnets: 1, v4_addresses: 65_536, widest_v4: Some(16) });
@@ -3831,49 +3832,49 @@ mod tests {
     fn subnet_growth_limits() {
         let seed = |e: &mut Engine| {
             for host in [10, 11, 12] {
-                attack(e, 0, &format!("11.18.91.{host}"));
+                attack(e, 0, &format!("11.17.59.{host}"));
             }
-            assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.18.91.0/24"]);
+            assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.17.59.0/24"]);
         };
         // a user who logged in from the next /24 keeps it out of the ban
         let mut e = engine();
-        e.on_event(&Event::new(0, "11.18.90.50".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        e.on_event(&Event::new(0, "11.17.58.50".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
         seed(&mut e);
-        attack(&mut e, 200, "11.18.89.7");
+        attack(&mut e, 200, "11.17.57.7");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
 
         // two banned /24s side by side make exactly their /23
         let mut e = engine();
         seed(&mut e);
         for host in [20, 21, 22] {
-            attack(&mut e, 200, &format!("11.18.90.{host}"));
+            attack(&mut e, 200, &format!("11.17.58.{host}"));
         }
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.90.0/24", "11.18.90.0/23"]);
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.58.0/24", "11.17.58.0/23"]);
 
         // with a network database: never into another provider's addresses
         let mut e = engine();
         let mut db = crate::geo::GeoDb::default();
-        db.read("11.18.88.0,11.18.89.255,64501,\"Other\"\n11.18.90.0,11.18.95.255,64500,\"Provider\"\n".as_bytes(), false).unwrap();
+        db.read("11.17.56.0,11.17.57.255,64501,\"Other\"\n11.17.58.0,11.17.63.255,64500,\"Provider\"\n".as_bytes(), false).unwrap();
         e.geo = Some(Arc::new(db));
         seed(&mut e);
-        attack(&mut e, 200, "11.18.89.7");
-        attack(&mut e, 200, "11.18.90.9");
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.90.0/23"], "the /22 would hold AS64501's 11.18.88.0/23");
+        attack(&mut e, 200, "11.17.57.7");
+        attack(&mut e, 200, "11.17.58.9");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.58.0/23"], "the /22 would hold AS64501's 11.17.56.0/23");
 
         // a larger step: one ban anywhere within it is enough (here 5 bits, /24 -> /19)
         let mut cfg = Config::default();
         cfg.subnets.wide_max_step = 8;
         let mut e = Engine::new(Arc::new(cfg), 0);
         seed(&mut e);
-        attack(&mut e, 200, "11.18.68.5");
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.18.64.0/19"]);
+        attack(&mut e, 200, "11.17.36.5");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.32.0/19"]);
 
         // growth off: /24 bans stay /24
         let mut cfg = Config::default();
         cfg.subnets.wide_enabled = false;
         let mut e = Engine::new(Arc::new(cfg), 0);
         seed(&mut e);
-        attack(&mut e, 200, "11.18.89.7");
+        attack(&mut e, 200, "11.17.57.7");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
 
         // IPv6 /64 bans grow too, 4 bits at a time, up to /48
@@ -3921,12 +3922,12 @@ mod tests {
     #[test]
     fn own_address_is_never_scored_and_wall_alerts_have_real_time() {
         let mut e = engine();
-        e.set_own_addresses(vec!["11.25.39.236".parse().unwrap()]);
+        e.set_own_addresses(vec!["11.24.39.236".parse().unwrap()]);
         for i in 0..20 {
-            assert!(bans(&e.on_event(&ev(i, "11.25.39.236", Signal::XmppNoAuth))).is_empty());
+            assert!(bans(&e.on_event(&ev(i, "11.24.39.236", Signal::XmppNoAuth))).is_empty());
         }
-        assert_eq!(e.protection("11.25.39.236".parse().unwrap()), Some("this host"));
-        assert!(e.ips.get(&"11.25.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
+        assert_eq!(e.protection("11.24.39.236".parse().unwrap()), Some("this host"));
+        assert!(e.ips.get(&"11.24.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
         // engine clock still at the start (no log line yet): the alert gets the wall-clock time
         let mut e = engine();
         let a = e.system_alert_wall("cert:x", 86_400 * SEC, Severity::High, "expires".into(), 1_791_806_149 * SEC);
@@ -3993,7 +3994,7 @@ mod tests {
         let ok = |t: i64, ip: &str| Event::new(t * SEC, ip.parse().unwrap(), Signal::XmppAuthOk).account(Some("user5@x"));
         assert!(e.on_event(&ok(0, "5.9.1.1")).is_empty(), "learning");
         // a different /16 (and country) of the same provider: no news
-        assert!(e.on_event(&ok(8 * 86_400, "11.36.1.1")).is_empty());
+        assert!(e.on_event(&ok(8 * 86_400, "11.35.1.1")).is_empty());
         let a = e.on_event(&ok(8 * 86_400 + 60, "1.0.0.7"));
         assert_eq!(
             a[0].message,
@@ -4141,11 +4142,11 @@ mod tests {
         let a = e.operator_ban(net, 200 * SEC, "shorter".into()).unwrap();
         assert_eq!(a.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::Unban, ActionKind::Ban]);
         // refused: protected addresses, ones inside a wider ban, networks wider than own bans
-        for (target, why) in [("11.43.43.31", "allowlisted"), ("203.0.113.9", "cluster peer"), ("10.0.0.1", "private")] {
+        for (target, why) in [("11.42.43.31", "allowlisted"), ("203.0.113.9", "cluster peer"), ("10.0.0.1", "private")] {
             let err = e.operator_ban(target.parse().unwrap(), 300 * SEC, "x".into()).unwrap_err();
             assert!(err.contains(why), "{target}: {err}");
         }
-        assert!(e.operator_ban("11.43.43.0/24".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("protected"));
+        assert!(e.operator_ban("11.42.43.0/24".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("protected"));
         assert!(e.operator_ban("11.9.0.0/12".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("wider"));
         e.operator_ban("11.15.9.0/24".parse().unwrap(), 300 * SEC, "range".into()).unwrap();
         assert!(e

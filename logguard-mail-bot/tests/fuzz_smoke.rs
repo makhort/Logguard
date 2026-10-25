@@ -38,7 +38,7 @@ fn inputs(with_rsa: bool) -> Vec<(&'static str, Vec<u8>)> {
         10.1.2.3  40 pts  banned (2)  Germany / Example (AS64496)\n\nExposed: 22 sshd, [2001:db8::10]:5223 ejabberd\n\
         Certificates: example.org:5223 85d, nextcloud.example.org:443 5d";
     let report = "Abuse report from xmpp (192.0.2.10) and vpn (198.51.100.20)\nPeriod: 2026-10-12 to 2026-10-19 UTC.\n\n\
-        Hello, abuse@example.net,\n\n2026-10-18T11:00:01Z  11.21.45.233  sshd  Invalid user probe1\n"
+        Hello, abuse@example.net,\n\n2026-10-18T11:00:01Z  11.20.45.233  sshd  Invalid user probe1\n"
         .repeat(20);
     let mut v = vec![
         ("alert_mail", message("admin", "[xmpp] logguard daily digest", digest)),

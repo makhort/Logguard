@@ -72,13 +72,13 @@ mod tests {
 
     #[test]
     fn tcp_udp_v6_and_limit() {
-        let tcp = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.4 DST=11.25.39.236 LEN=44 TOS=0x00 PREC=0x00 TTL=242 ID=54321 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0");
+        let tcp = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.4 DST=11.24.39.236 LEN=44 TOS=0x00 PREC=0x00 TTL=242 ID=54321 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0");
         assert_eq!((tcp[0].signal, tcp[0].port), (Signal::FwBlock, Some(23)));
-        let udp = parse("[12.3] [UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.5 DST=11.25.39.236 LEN=50 TOS=0x00 PREC=0x00 TTL=50 ID=1 PROTO=UDP SPT=5 DPT=161 LEN=30");
+        let udp = parse("[12.3] [UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.5 DST=11.24.39.236 LEN=50 TOS=0x00 PREC=0x00 TTL=50 ID=1 PROTO=UDP SPT=5 DPT=161 LEN=30");
         assert_eq!((udp[0].port, udp[0].proto), (Some(161), Proto::Udp));
         let v6 = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=2001:db8::1 DST=2001:db8::2 LEN=80 TC=0 HOPLIMIT=50 FLOWLBL=0 PROTO=TCP SPT=1 DPT=22 WINDOW=1 RES=0x00 SYN URGP=0");
         assert_eq!(v6[0].ip.to_string(), "2001:db8::1");
-        let lim = parse("[UFW LIMIT BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.6 DST=11.25.39.236 LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=1 DF PROTO=TCP SPT=5 DPT=9843 WINDOW=1 RES=0x00 SYN URGP=0");
+        let lim = parse("[UFW LIMIT BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.6 DST=11.24.39.236 LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=1 DF PROTO=TCP SPT=5 DPT=9843 WINDOW=1 RES=0x00 SYN URGP=0");
         assert_eq!(lim[0].signal, Signal::FwLimit);
         assert!(parse("[UFW AUDIT] IN=eth0 SRC=1.1.1.1 DPT=1").is_empty());
     }

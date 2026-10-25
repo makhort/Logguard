@@ -107,10 +107,10 @@ burst = 60
 nets = [
   "127.0.0.0/8",
   "::1",
-  "11.33.48.86",
-  "11.43.43.31",
-  "11.46.237.68",
-  "11.26.32.162",
+  "11.32.48.86",     # VPN
+  "11.42.43.31",
+  "11.45.237.68",    # eu.prod.push.monal-im.org
+  "11.25.32.162",
 ]
 # An address that logs in successfully (XMPP or SSH) gets a "protected" alert instead of a ban
 # for that service's noise and typos, for trust_ttl after its last login, and blocked packets
@@ -263,7 +263,7 @@ bot_stuck_after = "1h"            # warn when the weekly abuse report waits long
 enabled = true
 node_id = "xmpp"
 listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
-peers = ["11.33.48.86:7946"]           # vpn; peers are never banned here
+peers = ["11.32.48.86:7946"]           # vpn; peers are never banned here
 key_file = "/etc/logguard/cluster.key"
 rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
 sync_interval = "10s"
@@ -274,7 +274,7 @@ accept = ["bans", "unbans", "reports", "trust", "notices"]
 # reach Telegram without this server talking to Telegram. Add it to `peers` above, let it hand
 # over only notices and the abuse report's input (never bans or trust: the limit goes by its
 # address), and relay this node's own admin messages to it. 203.0.113.10 = its address.
-#peers = ["11.33.48.86:7946", "203.0.113.10:7946"]   # vpn, tg
+#peers = ["11.32.48.86:7946", "203.0.113.10:7946"]   # vpn, tg
 #peer_accept = { "203.0.113.10:7946" = ["notices", "files"] }
 #relay_notices = true
 # Bans learned from peers last at most this long here. The built-in default (1d) limits what a

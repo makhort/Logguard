@@ -367,11 +367,12 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
 mod tests {
     use super::*;
 
+    // (documentation addresses, which the public mirror keeps: it can't remap them in hex)
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1001 1 0 100 0 0 10 0
-   1: ECC7284E:0016 0B4B74B0:A1F2 01 00000000:00000000 00:00000000 00000000     0        0 1002 1 0 100 0 0 10 0
-   2: ECC7284E:C350 08080808:01BB 01 00000000:00000000 00:00000000 00000000     0        0 1003 1 0 100 0 0 10 0
-   3: ECC7284E:C351 0B4B74B0:115C 02 00000000:00000000 00:00000000 00000000     0        0 1004 1 0 100 0 0 10 0
+   1: 0A0200C0:0016 0B6433C6:A1F2 01 00000000:00000000 00:00000000 00000000     0        0 1002 1 0 100 0 0 10 0
+   2: 0A0200C0:C350 08080808:01BB 01 00000000:00000000 00:00000000 00000000     0        0 1003 1 0 100 0 0 10 0
+   3: 0A0200C0:C351 0B6433C6:115C 02 00000000:00000000 00:00000000 00000000     0        0 1004 1 0 100 0 0 10 0
 ";
 
     #[test]
@@ -381,7 +382,7 @@ mod tests {
         let out: Vec<(u16, String, u16)> = conns.iter().map(|(lp, ip, rp, _)| (*lp, ip.to_string(), *rp)).collect();
         assert_eq!(
             out,
-            vec![(22, "11.43.43.11".into(), 41458), (50000, "8.8.8.8".into(), 443), (50001, "11.43.43.11".into(), 4444)],
+            vec![(22, "198.51.100.11".into(), 41458), (50000, "8.8.8.8".into(), 443), (50001, "198.51.100.11".into(), 4444)],
             "the first is a connection to sshd, not an outbound one"
         );
     }

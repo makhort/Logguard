@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn scripts() {
-        let allow: Vec<Net> = vec!["11.43.43.31".parse().unwrap(), "2001:db8::/32".parse().unwrap()];
+        let allow: Vec<Net> = vec!["11.42.43.31".parse().unwrap(), "2001:db8::/32".parse().unwrap()];
         let ports: Vec<PortSpec> = ["51820/udp", "51821/tcp", "443"].iter().map(|p| p.parse().unwrap()).collect();
         let s = nft_setup_script("logguard", &allow, &ports, &[], None);
         assert!(s.contains("chain bans { type filter hook prerouting priority mangle - 1; policy accept; }"), "after conntrack");
@@ -889,13 +889,13 @@ mod tests {
             "flush set inet logguard feed4\nflush set inet logguard feed6\nadd element inet logguard feed4 { 11.1.16.0/20 }\nadd element inet logguard feed6 { 3fff:110::/29 }\n"
         );
         assert_eq!(nft_allow_script("t", &"8.8.8.8".parse().unwrap(), 60), "add element inet t oper4 { 8.8.8.8 timeout 60s }\n");
-        assert!(s.contains("add element inet logguard allow4 { 11.43.43.31 }"));
+        assert!(s.contains("add element inet logguard allow4 { 11.42.43.31 }"));
         assert!(s.contains("add element inet logguard allow6 { 2001:db8::/32 }"));
         // the host's own 127.0.0.1 next to the configured 127.0.0.0/8 must not break the set
-        let overlapping: Vec<Net> = ["127.0.0.0/8", "127.0.0.1", "11.43.43.31"].iter().map(|n| n.parse().unwrap()).collect();
-        assert!(nft_setup_script("t", &overlapping, &[], &[], None).contains("add element inet t allow4 { 127.0.0.0/8, 11.43.43.31 }"));
-        let net: Net = "11.18.91.0/24".parse().unwrap();
-        assert_eq!(nft_add_script("logguard", &net, 3600), "add element inet logguard ban4 { 11.18.91.0/24 timeout 3600s }\n");
+        let overlapping: Vec<Net> = ["127.0.0.0/8", "127.0.0.1", "11.42.43.31"].iter().map(|n| n.parse().unwrap()).collect();
+        assert!(nft_setup_script("t", &overlapping, &[], &[], None).contains("add element inet t allow4 { 127.0.0.0/8, 11.42.43.31 }"));
+        let net: Net = "11.17.59.0/24".parse().unwrap();
+        assert_eq!(nft_add_script("logguard", &net, 3600), "add element inet logguard ban4 { 11.17.59.0/24 timeout 3600s }\n");
         let v6: Net = "2001:db8::1".parse().unwrap();
         assert_eq!(nft_delete_script("t", &v6), "delete element inet t ban6 { 2001:db8::1 }\n");
     }
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn iptables_rules() {
-        let allow: Vec<Net> = ["11.43.43.31", "127.0.0.0/8", "127.0.0.1", "2001:db8::/32"].iter().map(|n| n.parse().unwrap()).collect();
+        let allow: Vec<Net> = ["11.42.43.31", "127.0.0.0/8", "127.0.0.1", "2001:db8::/32"].iter().map(|n| n.parse().unwrap()).collect();
         let ports: Vec<PortSpec> = ["51820/udp", "443"].iter().map(|p| p.parse().unwrap()).collect();
         let lines: Vec<String> = iptables_static_rules("logguard", &allow, &ports)
             .iter()
@@ -939,7 +939,7 @@ mod tests {
             [
                 "iptables -F logguard",
                 "iptables -A logguard -s 127.0.0.0/8 -j RETURN",
-                "iptables -A logguard -s 11.43.43.31 -j RETURN",
+                "iptables -A logguard -s 11.42.43.31 -j RETURN",
                 "iptables -A logguard -p tcp -m multiport --dports 443 -j RETURN",
                 "iptables -A logguard -p udp -m multiport --dports 443,51820 -j RETURN",
                 "iptables -A logguard -m conntrack --ctdir REPLY -j RETURN",
@@ -957,16 +957,16 @@ mod tests {
         let rules = iptables_static_rules("c", &[], &many);
         assert_eq!(rules.iter().filter(|(v6, a)| !v6 && a.contains(&"multiport".to_string())).count(), 2);
 
-        let v4: Net = "11.18.91.0/24".parse().unwrap();
+        let v4: Net = "11.17.59.0/24".parse().unwrap();
         let v6: Net = "2001:db8::1".parse().unwrap();
         assert_eq!(
             iptables_ban_rule("logguard", &v4, "-A"),
-            (false, ["-A", "logguard-ban", "-s", "11.18.91.0/24", "-j", "DROP"].iter().map(|s| s.to_string()).collect())
+            (false, ["-A", "logguard-ban", "-s", "11.17.59.0/24", "-j", "DROP"].iter().map(|s| s.to_string()).collect())
         );
         assert!(iptables_ban_rule("logguard", &v6, "-D").0, "IPv6 goes to ip6tables");
         let top = iptables_allow_rule("logguard", &v4, "-I").1;
-        assert_eq!(top, ["-I", "logguard-ban", "1", "-s", "11.18.91.0/24", "-j", "RETURN"], "operator allows above the bans");
-        assert_eq!(iptables_allow_rule("logguard", &v4, "-D").1, ["-D", "logguard-ban", "-s", "11.18.91.0/24", "-j", "RETURN"]);
+        assert_eq!(top, ["-I", "logguard-ban", "1", "-s", "11.17.59.0/24", "-j", "RETURN"], "operator allows above the bans");
+        assert_eq!(iptables_allow_rule("logguard", &v4, "-D").1, ["-D", "logguard-ban", "-s", "11.17.59.0/24", "-j", "RETURN"]);
     }
 
     /// The iptables backend builds its chains in the mangle table (after conntrack), and

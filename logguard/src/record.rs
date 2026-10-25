@@ -354,7 +354,7 @@ mod tests {
     fn syslog_ejabberd_line_uses_inner_iso_timestamp() {
         let mut y = YearGuess::new(2020);
         let r = parse_syslog_line(
-            "Aug 16 21:20:19 example.org ejabberdctl[26427]: 2026-08-16 21:20:19.107 [info] (#PID<0.28856.0>) Accepted connection [::ffff:11.40.25.27]:59195 -> [::ffff:11.25.39.236]:5223",
+            "Aug 16 21:20:19 example.org ejabberdctl[26427]: 2026-08-16 21:20:19.107 [info] (#PID<0.28856.0>) Accepted connection [::ffff:11.39.25.27]:59195 -> [::ffff:11.24.39.236]:5223",
             &mut y,
         )
         .unwrap();

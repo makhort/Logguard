@@ -2600,10 +2600,10 @@ mod tests {
     fn sample() -> Snapshot {
         let mut pipe = Pipeline::new(Arc::new(Config::default()), 0);
         let mut years = YearGuess::new(2026);
-        for (i, ip) in ["11.50.40.218", "11.50.40.218", "11.50.40.218", "9.9.9.9"].iter().enumerate() {
+        for (i, ip) in ["11.49.40.218", "11.49.40.218", "11.49.40.218", "9.9.9.9"].iter().enumerate() {
             let pid = format!("0.{i}.0");
             for line in [
-                format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.000 [info] (#PID<{pid}>) Accepted connection [::ffff:{ip}]:1 -> [::ffff:11.25.39.236]:5223"),
+                format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.000 [info] (#PID<{pid}>) Accepted connection [::ffff:{ip}]:1 -> [::ffff:11.24.39.236]:5223"),
                 format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.100 [info] (tls|<{pid}>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000102:SSL routines::unsupported protocol"),
             ] {
                 pipe.feed(&parse_syslog_line(&line, &mut years).unwrap());
@@ -2702,8 +2702,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("11.50.40.218") && text.contains("banned "), "{text}");
-        assert!(!text.contains("banned 11.50.40.218"), "a host ban doesn't repeat the address");
+        assert!(text.contains("11.49.40.218") && text.contains("banned "), "{text}");
+        assert!(!text.contains("banned 11.49.40.218"), "a host ban doesn't repeat the address");
         assert!(text.contains("xmpp ENFORCE") || text.contains("xmpp SHADOW"), "node and mode in the footer");
 
         // commands need the daemon; a saved snapshot says so before asking anything
@@ -2715,10 +2715,10 @@ mod tests {
         app.start_unban();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("Unban 11.50.40.218") && text.contains("Active bans"), "confirm dialog over the list");
+        assert!(text.contains("Unban 11.49.40.218") && text.contains("Active bans"), "confirm dialog over the list");
         app.modal_key(KeyCode::Char('y'));
-        assert_eq!(app.outbox, ["unban 11.50.40.218"], "sent from the background thread, not the key handler");
-        assert_eq!(app.flash.as_ref().map(|f| f.text.as_str()), Some("sent: unban 11.50.40.218"));
+        assert_eq!(app.outbox, ["unban 11.49.40.218"], "sent from the background thread, not the key handler");
+        assert_eq!(app.flash.as_ref().map(|f| f.text.as_str()), Some("sent: unban 11.49.40.218"));
         let cmd = app.outbox.remove(0);
         let socket = std::env::temp_dir().join("logguard-no-such-socket");
         app.replied(&cmd, crate::daemon::control_command(&socket, &cmd));
@@ -2859,12 +2859,12 @@ mod tests {
         app.switch(1);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("11.50.40.218 ") && text.contains("9.9.9.9"), "whole addresses: {text}");
+        assert!(text.contains("11.49.40.218 ") && text.contains("9.9.9.9"), "whole addresses: {text}");
         assert!(text.contains("2Offenders"), "current tab named");
         let ips = |app: &App| offender_rows(app, app.snap.as_ref().unwrap()).iter().map(|v| v.ip.to_string()).collect::<Vec<_>>();
         let by_danger = ips(&app);
         press(&mut app, "oo");
-        assert_eq!(ips(&app), ["9.9.9.9", "11.50.40.218"], "sorted by address");
+        assert_eq!(ips(&app), ["9.9.9.9", "11.49.40.218"], "sorted by address");
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert!(screen(&term).contains("· by address"));
         press(&mut app, "o");
@@ -2887,7 +2887,7 @@ mod tests {
         assert!(app.editing);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("filter: 9.9") && text.contains("(1 of 2 match \"9.9\")") && !text.contains("11.50.40.218"), "{text}");
+        assert!(text.contains("filter: 9.9") && text.contains("(1 of 2 match \"9.9\")") && !text.contains("11.49.40.218"), "{text}");
         app.key(KeyEvent::from(KeyCode::Enter));
         assert!(!app.editing && app.filter == "9.9");
         assert!(app.key(KeyEvent::from(KeyCode::Char('q'))), "q quits once the filter is typed");

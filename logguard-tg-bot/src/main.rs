@@ -52,7 +52,7 @@ struct Args {
     #[arg(long, env = "XMPP_DOMAINS", default_value = "", global = true)]
     xmpp_domains: String,
     /// The servers' own addresses and host names, replaced by their node ids in alerts:
-    /// `xmpp=11.25.39.236,example.org; vpn=11.33.48.86` (subdomains included).
+    /// `xmpp=11.24.39.236,example.org; vpn=11.32.48.86` (subdomains included).
     #[arg(long, env = "SERVER_NAMES", default_value = "", global = true)]
     server_names: String,
     /// The admin's OpenPGP public key (armored or binary, v4: RSA or Curve25519). Files go out

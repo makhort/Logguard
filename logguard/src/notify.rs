@@ -1297,9 +1297,9 @@ mod tests {
             user_note: Some(body.into()),
             ..attack(ts_s, &[])
         };
-        assert_eq!(p.plan(&relayed(0, "[High] ban 11.21.45.233 for 1h")).len(), 1);
-        assert_eq!(p.plan(&relayed(10, "[High] ban 11.29.63.115 for 1h")).len(), 1, "another ban from the same server");
-        assert!(p.plan(&relayed(20, "[High] ban 11.29.63.115 for 1h")).is_empty(), "the same one again: cooldown");
+        assert_eq!(p.plan(&relayed(0, "[High] ban 11.20.45.233 for 1h")).len(), 1);
+        assert_eq!(p.plan(&relayed(10, "[High] ban 11.28.63.115 for 1h")).len(), 1, "another ban from the same server");
+        assert!(p.plan(&relayed(20, "[High] ban 11.28.63.115 for 1h")).is_empty(), "the same one again: cooldown");
     }
 
     #[test]

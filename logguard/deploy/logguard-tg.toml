@@ -67,7 +67,7 @@ burst = 6
 nets = [
   "127.0.0.0/8",
   "::1",
-  "11.43.43.31",
+  "11.42.43.31",
   # Upstream DNS (UDP sources can be spoofed: a forged flood "from" a resolver must never ban it).
   "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
 ]
@@ -103,7 +103,7 @@ bot_stuck_after = "1h"            # then a system alert, relayed to the XMPP adm
 enabled = true
 node_id = "tg"
 listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
-peers = ["11.25.39.236:7946", "11.33.48.86:7946"]   # xmpp, vpn; peers are never banned here
+peers = ["11.24.39.236:7946", "11.32.48.86:7946"]   # xmpp, vpn; peers are never banned here
 key_file = "/etc/logguard/cluster.key"
 rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
 sync_interval = "10s"

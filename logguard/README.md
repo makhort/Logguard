@@ -144,9 +144,9 @@ Bonuses: **+60** when one address touches **3 or more XMPP ports** within 10 min
 
 **Subnets.** Every 60 s a /24 (or IPv6 /64) is banned in either of two cases:
 - 3 or more of its addresses are individually bad (concentrated attack).
-- 5 or more addresses together reach a summed score of 100 (distributed scanning, e.g. `11.32.48.0/24` probing once per IP).
+- 5 or more addresses together reach a summed score of 100 (distributed scanning, e.g. `11.31.48.0/24` probing once per IP).
 
-A banned /24 then grows step by step, up to a /16 (`v4_wide_prefix`). It grows to the narrowest network that also holds the next ban nearby, either an address or another subnet, and at most 2 prefix bits at a time (`wide_max_step`). For example, `11.18.91.0/24` plus a banned `11.18.89.7` becomes `11.18.88.0/22`, and that /22 grows to a /20 with the next ban inside the /20. An address 5 bits away (`11.18.68.5`, common network /19) stays a host ban until the range has grown close enough. Growth stops before any network with a protected address. With the `[geo]` network database loaded, it also stops before a network that holds another provider's (ASN's) addresses. The rest of a cloud provider's /16 stays reachable: other customers, VPN exits. The TUI's status and the daily digest show how many addresses the subnet bans cover, and the widest one. This replaces the earlier single step from 12 bad addresses over 4 /24s straight to the whole /16. `wide_min_bad_ips` and `wide_min_subnets` are still accepted in old config files, but they are ignored, and `config-diff` lists them.
+A banned /24 then grows step by step, up to a /16 (`v4_wide_prefix`). It grows to the narrowest network that also holds the next ban nearby, either an address or another subnet, and at most 2 prefix bits at a time (`wide_max_step`). For example, `11.17.59.0/24` plus a banned `11.17.57.7` becomes `11.17.56.0/22`, and that /22 grows to a /20 with the next ban inside the /20. An address 5 bits away (`11.17.36.5`, common network /19) stays a host ban until the range has grown close enough. Growth stops before any network with a protected address. With the `[geo]` network database loaded, it also stops before a network that holds another provider's (ASN's) addresses. The rest of a cloud provider's /16 stays reachable: other customers, VPN exits. The TUI's status and the daily digest show how many addresses the subnet bans cover, and the widest one. This replaces the earlier single step from 12 bad addresses over 4 /24s straight to the whole /16. `wide_min_bad_ips` and `wide_min_subnets` are still accepted in old config files, but they are ignored, and `config-diff` lists them.
 
 IPv6 /64 bans grow the same way, up to `v6_wide_prefix` (/48), `wide_max_step_v6` (4) bits at a time: providers hand out /64s, /60s, /56s and /48s, and an attacker rotating through a /56 shows up as /64 after /64. `3fff:100:1:2::/64` plus a ban in `3fff:100:1:3::/64` becomes `3fff:100:1:2::/63`; a ban in `3fff:100:1:8::/64` then takes it to the /60. `v6_wide_prefix = 64` keeps IPv6 bans at /64. A peer's IPv6 ban wider than this node's own widest is ignored, as for IPv4.
 
@@ -186,7 +186,7 @@ Whitelisted ports (`PORT/udp`, `PORT/tcp`, or a bare `PORT` for both) work as fo
 - **`tail -F` of `nextcloud.log`** (`/var/lib/docker/volumes/nextcloud_aio_nextcloud/_data/data/nextcloud.log`; `occ log:file` shows the path inside the container) for `Login failed: user (Remote IP: …)`. This is the same file AIO's own fail2ban container reads; failures count per account like XMPP and SSH ones.
 - **Restarts lose nothing:** the time of the last line read from each of the two is kept in the state file. After a restart, `docker logs` resumes from that moment and `nextcloud.log` is re-read from its last 2,000 lines; lines already seen are skipped by their timestamps. Login names from these logs are attacker-chosen: control characters are removed before they reach alerts or a terminal.
 
-On the Oct 2–11 Apache log this bans each Google-Cloud `.env`/`aws.yml`/`config.js` prober on its third request. The daily `11.37.52.117` escalates 1h → 6h → 1d → 7d. Docker-published ports bypass UFW, but logguard's nftables chain sits in prerouting, so these bans apply to Nextcloud too.
+On the Oct 2–11 Apache log this bans each Google-Cloud `.env`/`aws.yml`/`config.js` prober on its third request. The daily `11.36.52.117` escalates 1h → 6h → 1d → 7d. Docker-published ports bypass UFW, but logguard's nftables chain sits in prerouting, so these bans apply to Nextcloud too.
 
 ## Patterns of your own
 
@@ -277,7 +277,7 @@ except = ["admin", "<gateway user>"]     # real accounts are never canaries, wha
 | a switch within 30 minutes after failures | warning: `su to root by gateway succeeded after 2 failed attempts` |
 | any other switch | info, on record (TUI, actions log), not sent |
 
-Each alert names the account's latest SSH login, with its place: `(gateway's last SSH login: 11.43.43.31 (Ukraine / ...), 2m ago)`. Where root is reached only through one SSH account and `su`, a failed `su` is the moment someone holding that account's key tries the second factor. The Sep–Oct month's export of sshd's unit had 5 failed and 26 successful `su` to root.
+Each alert names the account's latest SSH login, with its place: `(gateway's last SSH login: 11.42.43.31 (Ukraine / ...), 2m ago)`. Where root is reached only through one SSH account and `su`, a failed `su` is the moment someone holding that account's key tries the second factor. The Sep–Oct month's export of sshd's unit had 5 failed and 26 successful `su` to root.
 
 ## Exposure watch
 
@@ -390,7 +390,7 @@ Every `[patches] interval` (6 h): pending upgrades (`apt-get -s dist-upgrade`, a
 ```bash
 logguard -c /etc/logguard/logguard.toml abuse-report                          # last 7 days, top 50 sources
 logguard -c /etc/logguard/logguard.toml abuse-report --since 30d --contacts -o /root/abuse.txt
-logguard -c /etc/logguard/logguard.toml abuse-report --ip 11.48.36.0/24 --json
+logguard -c /etc/logguard/logguard.toml abuse-report --ip 11.47.36.0/24 --json
 ```
 
 - **Per source:** first and last time seen, the number of incidents, the activity in plain words ("connection attempts to closed ports of commonly attacked services: TCP/23 (Telnet)", "SSH probing / login attempts"), and up to 25 log lines with full UTC timestamps. With `[geo]` on, it also gives the country and network owner. A network ban lists the addresses involved and what each did. Bans from now on keep the latest evidence lines of a network's worst members; older network bans recorded only the member addresses.
@@ -408,7 +408,7 @@ logguard -c /etc/logguard/logguard.toml abuse-report --json --all --min-events 1
 logguard -c /etc/logguard/logguard.toml abuse-report --merge /root/abuse-xmpp.json /root/abuse-vpn.json --contacts -o /root/abuse.txt
 ```
 
-The merged report has one entry per source: incidents are added up, and every log line says which server it hit (`(to 11.33.48.86) connection attempt to closed port TCP/23 (Telnet)`). `--min-events`, `--top`, `--ip` and `--contacts` apply after merging, so a source seen a little on each server still counts in full. The same report given twice (same server and period) is skipped with a warning instead of doubling every count.
+The merged report has one entry per source: incidents are added up, and every log line says which server it hit (`(to 11.32.48.86) connection attempt to closed port TCP/23 (Telnet)`). `--min-events`, `--top`, `--ip` and `--contacts` apply after merging, so a source seen a little on each server still counts in full. The same report given twice (same server and period) is skipped with a warning instead of doubling every count.
 
 **Weekly, to the admin's phone.** `logguard-abuse-report.timer` (Mondays 06:00 UTC, installed and enabled by `install.sh`) does the above on its own: the VPN server sends its JSON report to its cluster peers with `logguard cluster-send-report` (gzip-compressed, one message over the encrypted cluster link, never stored or forwarded as a fact; the peer writes it to `[cluster] inbox`, default `/var/lib/logguard/inbox`, mode 0600, and never parses it), and the XMPP server waits for it (up to 15 minutes), merges it with its own and puts the text report in the admin bot's outbox. The bot sends it to the admin as an OMEMO-encrypted file (logguard-xmpp-bot's README, "Weekly abuse report"); logguard-tg-bot, as a file encrypted to the admin's OpenPGP key. `ABUSE_REPORT_ROLE=auto` in `/etc/default/logguard-abuse-report` picks the role: `relay` on a Telegram relay node (below), else `merge` where a bot's outbox exists (`[notify] bot_outbox`, else `/opt/logguard-xmpp-bot/outbox`, and `[notify] tg_outbox`), else `send` when there are cluster peers, else `off`; `off` also turns the timer off. A server without peers merges at once (just its own report). Nothing stays behind: work files are in `/run` and removed on exit, the peer's report is deleted once merged (an unmerged one after 7 days; on a `send` node, which never merges, at its next run), and the bot deletes the outbox file once sent. A missing peer report is named in the job's output (`journalctl -u logguard-abuse-report`) and the report then covers the servers it has; add `logguard-abuse-report.service` to `[sources] services` to be told when the job fails.
 
@@ -528,7 +528,7 @@ Relayed notices live an hour: if the relay node is down longer, what was relayed
 ## Operator controls: unban and temporary allowlist
 
 ```bash
-logguard unban 11.20.51.11                       # or a subnet: logguard unban 11.20.51.0/24
+logguard unban 11.19.51.11                       # or a subnet: logguard unban 11.19.51.0/24
 logguard ban 198.51.100.7 --for 30d --note "mail scanner"   # or a subnet; 1d by default
 logguard allow 203.0.113.7 --for 7d --note "temporary access"
 logguard allowed                                  # list entries with time left
@@ -820,7 +820,7 @@ sudo ./install.sh                                # installs and starts logguard 
    The table hooks at prerouting right after connection tracking (`priority mangle - 1`), so it runs **before** UFW's chains and Docker's DNAT; your ALLOW rules can no longer shadow the bans. Allowlisted networks get an explicit accept in that table too, and so do replies to the server's own connections.
    Rollback: set `mode = "shadow"`, restart, then `nft delete table inet logguard`.
 4. **Retire the Python pipeline:** remove `/etc/cron.d/log_analyzer` and `/etc/cron.d/daily_log_analyzer`. Keep `daily_cleanup` (ejabberd DB maintenance). Done on both servers in 2026-10; the Python files are gone from this repo too (see the git history).
-5. **Delete, never reorder, the old auto-generated UFW deny rules** (`blocked_*`, `ejabberd_*`). They sit below the ALLOW rules, so they never matched traffic to open ports: in Sep–Oct 2026, 4,438 XMPP connections and 106 SSH sessions came from addresses they "deny". Several of them also cover your own users. In that month, people logged in from `11.39.15.0/24`, `11.45.62.0/24`, `11.49.62.0/24`, `11.22.47.0/24`, and `11.31.56.0/24`. Making those rules effective would lock those users out.
+5. **Delete, never reorder, the old auto-generated UFW deny rules** (`blocked_*`, `ejabberd_*`). They sit below the ALLOW rules, so they never matched traffic to open ports: in Sep–Oct 2026, 4,438 XMPP connections and 106 SSH sessions came from addresses they "deny". Several of them also cover your own users. In that month, people logged in from `11.38.15.0/24`, `11.44.62.0/24`, `11.48.62.0/24`, `11.21.47.0/24`, and `11.30.56.0/24`. Making those rules effective would lock those users out.
 
 ## Restarts, reboots and upgrades
 

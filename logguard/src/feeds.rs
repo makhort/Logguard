@@ -510,7 +510,8 @@ mod tests {
             fetch: vec!["false".into()],
             ..Default::default()
         };
-        std::fs::write(cache_path(&dir, &cfg.urls[0]), "11.1.16.0/20\n").unwrap();
+        // (wider than a /16: addresses the public mirror keeps as they are, see make_public_mirror.zsh)
+        std::fs::write(cache_path(&dir, &cfg.urls[0]), "1.2.16.0/20\n").unwrap();
         std::fs::write(cache_path(&dir, &cfg.asn_urls[0]), "AS64500\n").unwrap();
         // no network database yet: the plain feeds only, and why
         let (nets, st) = refresh(&cfg, &[], &|_| None);
@@ -518,11 +519,11 @@ mod tests {
         // with it: the ASN's networks too, accepted although they are far more than the
         // last list (other sources: an intended change)
         let expand = |asns: &std::collections::BTreeSet<u32>| -> Option<Vec<Net>> {
-            Some(asns.iter().map(|_| "100.64.0.0/10".parse().unwrap()).chain(["11.9.0.0/12".parse().unwrap()]).collect())
+            Some(asns.iter().map(|_| "100.64.0.0/10".parse().unwrap()).chain(["6.0.0.0/12".parse().unwrap()]).collect())
         };
         let (nets, st) = refresh(&cfg, &[], &expand);
         let s: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, ["11.1.16.0/20", "11.9.0.0/12"], "the bogon is dropped as always: {st:?}");
+        assert_eq!(s, ["1.2.16.0/20", "6.0.0.0/12"], "the bogon is dropped as always: {st:?}");
         assert_eq!((st.asn_networks, st.error), (2, None));
         assert!(std::fs::read_to_string(dir.join("accepted.txt")).unwrap().starts_with("# sources "));
         // the same sources again: the growth check applies
@@ -534,9 +535,9 @@ mod tests {
     #[test]
     fn aggregate_removes_nested() {
         let nets: Vec<Net> =
-            ["11.30.0.0/16", "11.30.53.0/24", "11.30.53.7", "11.27.62.0/24", "11.27.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
+            ["11.29.0.0/16", "11.29.53.0/24", "11.29.53.7", "11.26.62.0/24", "11.26.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
         let s: Vec<String> = aggregate(nets).iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, vec!["11.27.0.0/16", "11.30.0.0/16"]);
+        assert_eq!(s, vec!["11.26.0.0/16", "11.29.0.0/16"]);
     }
 
     #[test]

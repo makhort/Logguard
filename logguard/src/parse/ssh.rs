@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn auth_lines() {
         let ev = run(&[
-            "Accepted publickey for user6 from 11.33.48.86 port 50022 ssh2: ED25519 SHA256:abc",
+            "Accepted publickey for user6 from 11.32.48.86 port 50022 ssh2: ED25519 SHA256:abc",
             "Failed password for root from 1.2.3.4 port 40000 ssh2",
             "Connection closed by authenticating user root 1.2.3.4 port 40000 [preauth]",
             "Failed password for invalid user oracle from 1.2.3.5 port 40001 ssh2",
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(
             sigs,
             vec![
-                (Signal::SshAuthOk, "11.33.48.86".into()),
+                (Signal::SshAuthOk, "11.32.48.86".into()),
                 (Signal::SshAuthFail, "1.2.3.4".into()),
                 (Signal::SshInvalidUser, "1.2.3.5".into()),
                 (Signal::SshInvalidUser, "1.2.3.6".into()),
@@ -264,17 +264,17 @@ mod tests {
             p.feed(&Record { ts: 0, source: Source::Ssh, pid, msg: msg.into(), cursor: None, sender: None }, out)
         };
         feed(10, "error: kex_exchange_identification: read: Connection reset by peer", &mut out);
-        feed(10, "Connection reset by 11.24.67.78 port 13822", &mut out);
+        feed(10, "Connection reset by 11.23.67.78 port 13822", &mut out);
         feed(11, "Connection closed by 11.8.51.54 port 1", &mut out);
-        feed(12, "Accepted publickey for user6 from 11.33.48.86 port 50022 ssh2: ED25519 SHA256:x", &mut out);
-        feed(12, "Connection closed by 11.33.48.86 port 50022", &mut out);
+        feed(12, "Accepted publickey for user6 from 11.32.48.86 port 50022 ssh2: ED25519 SHA256:x", &mut out);
+        feed(12, "Connection closed by 11.32.48.86 port 50022", &mut out);
         let got: Vec<_> = out.iter().map(|e| (e.signal, e.ip.to_string())).collect();
         assert_eq!(
             got,
             vec![
-                (Signal::SshPreauth, "11.24.67.78".into()),
+                (Signal::SshPreauth, "11.23.67.78".into()),
                 (Signal::SshPreauth, "11.8.51.54".into()),
-                (Signal::SshAuthOk, "11.33.48.86".into()),
+                (Signal::SshAuthOk, "11.32.48.86".into()),
             ]
         );
     }
@@ -287,8 +287,8 @@ mod tests {
             "Unable to negotiate with 9.9.9.3 port 3: no matching key exchange method found.",
             "banner exchange: Connection from 9.9.9.4 port 4: invalid format",
             "error: kex_exchange_identification: Connection closed by remote host",
-            "Connection closed by 11.33.48.86 port 50022",
-            "drop connection #0 from [9.9.9.5]:5 on [11.25.39.236]:9843 penalty: failed authentication",
+            "Connection closed by 11.32.48.86 port 50022",
+            "drop connection #0 from [9.9.9.5]:5 on [11.24.39.236]:9843 penalty: failed authentication",
             "srclimit_penalise: ipv4: new 9.9.9.6/32 deferred penalty of 10 seconds for reason: penalty: connections without attempting authentication",
         ]);
         let ips: Vec<_> = ev.iter().map(|e| e.ip.to_string()).collect();

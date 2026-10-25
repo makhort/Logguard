@@ -1030,7 +1030,7 @@ mod tests {
             r#"
             mode = "enforce"
             [allowlist]
-            nets = ["11.43.43.31", "11.33.48.86/32"]
+            nets = ["11.42.43.31", "11.32.48.86/32"]
             [scoring.weights]
             fw_block = 0.5
             "#,
