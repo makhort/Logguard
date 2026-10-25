@@ -3,7 +3,7 @@
 **How logguard compares with the open-source and commercial tools you might use instead:
 a briefing for teams thinking about adopting it.**
 
-The state is as of 2026-10-25: logguard 0.2.0 (commit `62135b4`), compared with the releases and
+The state is as of 2026-10-25: logguard 0.2.0 (commit `26a575c`), compared with the releases and
 documentation of the other tools at that date. Feature claims about logguard come from its
 [README](logguard/README.md) and code. Claims about the other tools come from their documentation,
 release pages and advisories (see [Sources](#20-method-and-sources)). Products change, so check a
