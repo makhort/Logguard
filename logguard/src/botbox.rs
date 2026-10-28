@@ -109,7 +109,15 @@ pub fn parse(text: &str) -> Option<Notice> {
 /// check), and at most `MAX_MESSAGE` (a huge one would exhaust the daemon's memory).
 fn read_message(path: &Path) -> Option<String> {
     use std::io::Read;
-    const O_NOFOLLOW: i32 = if cfg!(target_os = "linux") { 0o400000 } else { 0x0100 };
+    // Linux numbers the flag per architecture: arm, aarch64 and powerpc have 0o100000 where
+    // x86, riscv, s390x and loongarch have 0o400000 (CI's arm64 runner caught the difference).
+    const O_NOFOLLOW: i32 = if !cfg!(target_os = "linux") {
+        0x0100
+    } else if cfg!(any(target_arch = "arm", target_arch = "aarch64", target_arch = "powerpc", target_arch = "powerpc64")) {
+        0o100000
+    } else {
+        0o400000
+    };
     const O_NONBLOCK: i32 = if cfg!(target_os = "linux") { 0o4000 } else { 0x0004 };
     const O_NOCTTY: i32 = if cfg!(target_os = "linux") { 0o400 } else { 0x20000 };
     let f = fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY).open(path).ok()?;

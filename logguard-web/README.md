@@ -414,7 +414,7 @@ The package puts the same files in the same places as `install.sh` (`/opt/loggua
 ./deploy/deploy.sh <host>    # ci.sh, then the files over SFTP and the command for a root shell
 ```
 
-`node --test web/tests/` (in `ci.sh` when Node is installed) tests the page's patching against a
+`node --test web/tests/*.test.mjs` (in `ci.sh` when Node is installed) tests the page's patching against a
 small fake DOM, and the abuse e-mail, mail links, RDAP parsing, CSV, address links and link
 filters. `tests/end_to_end.rs` runs an agent and a console against a fake logguard socket and logs in
 over TLS like a browser (it listens on 127.0.0.1 and a Unix socket). The fuzz targets in

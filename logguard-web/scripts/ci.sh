@@ -13,7 +13,8 @@ step "tests (tests/end_to_end.rs listens on 127.0.0.1 and on a Unix socket)"
 cargo test --quiet
 step "the page's tests (node --test web/tests: the patching, the abuse e-mail, CSV, links)"
 if command -v node > /dev/null; then
-    node --test web/tests/
+    # the files, not the directory: Node 22's --test takes patterns, not directories
+    node --test web/tests/*.test.mjs
 else
     echo "node is not installed: skipped (any Node 20 or newer runs them)"
 fi

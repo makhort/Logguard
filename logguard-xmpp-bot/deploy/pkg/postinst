@@ -198,6 +198,7 @@ fi
 # the bot's log rotated as its user; in admin mode ejabberd's own logs too, 14 days at most
 # like the rest (/privacy), unless another rule already covers them (logrotate refuses
 # duplicate entries).
+install -d -m 0755 /etc/logrotate.d   # missing where logrotate isn't installed (a container)
 sed "s/^\([[:space:]]*su\) ejabberd ejabberd\$/\1 $BOT $BOT/" "$SHARE/$NAME.logrotate" > /etc/logrotate.d/$NAME
 chmod 0644 /etc/logrotate.d/$NAME
 if [ "$MODE" = admin ]; then
