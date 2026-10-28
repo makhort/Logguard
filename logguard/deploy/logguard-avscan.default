@@ -1,4 +1,4 @@
-# Settings for /usr/local/sbin/logguard-avscan (run daily by logguard-avscan.timer).
+# Settings for logguard-avscan (run daily by logguard-avscan.timer).
 # Change the time with:  systemctl edit logguard-avscan.timer
 
 # What to scan (space-separated; shell wildcards like /home/*/www work). Keep it to places where software and uploads live:

@@ -25,6 +25,21 @@ link, and may limit what it hands them to notices (it can't ban or allowlist any
 logguard's README, "A Telegram relay node", has the cluster side. It can also run on the XMPP
 server itself: then that server talks to Telegram.
 
+## Contents
+
+1. [What it sends](#what-it-sends)
+2. [Account names become pseudonyms](#account-names-become-pseudonyms)
+3. [The servers appear by their node ids](#the-servers-appear-by-their-node-ids)
+4. [Files go out encrypted, as a whole](#files-go-out-encrypted-as-a-whole)
+5. [How logguard and the bot meet](#how-logguard-and-the-bot-meet)
+6. [Install from a release bundle](#install-from-a-release-bundle)
+7. [Install from a package](#install-from-a-package)
+8. [Setup](#setup)
+9. [Settings](#settings)
+10. [Retention and what the bot keeps](#retention-and-what-the-bot-keeps)
+11. [Why not a Telegram crate](#why-not-a-telegram-crate)
+12. [Build and test](#build-and-test)
+
 ## What it sends
 
 | From logguard | In Telegram |
@@ -65,22 +80,22 @@ leaves the server.
 ## The servers appear by their node ids
 
 `SERVER_NAMES` lists each server's own addresses and host names under its node id (logguard's
-`[cluster] node_id`): `xmpp=11.24.39.236,example.org; vpn=11.32.48.86; tg=203.0.113.10`.
+`[cluster] node_id`): `node1=192.0.2.10,example.org; vpn=198.51.100.20; tg=203.0.113.10`.
 In alerts and digests, after the account names:
 
-- an address becomes the node id: `cluster peer 11.32.48.86:7946 failing` → `cluster peer
+- an address becomes the node id: `cluster peer 198.51.100.20:7946 failing` → `cluster peer
   vpn:7946 failing`. IPv4 matches as any run of digits and dots, wherever it is (`dead:…`,
   `::ffff:…:7946`); IPv6 as a run of hex digits and colons that is the address (brackets and
   IPv4-mapped too), or, when the run is no valid address, starts with it before a colon
   (`…: refused`, a port). A run that is another valid address stays: attackers' addresses,
   also `2001:db8::7:5` next to a server's `2001:db8::7`;
 - a host name becomes the node id, subdomains keeping their first labels:
-  `example.org:5223` → `xmpp:5223`, `nextcloud.example.org:443` → `nextcloud.xmpp:443`.
+  `example.org:5223` → `node1:5223`, `nextcloud.example.org:443` → `nextcloud.node1:443`.
   `notexample.org` and `example.org.example.net` are left alone.
 
 List every public IPv4 and IPv6 address of each server. Loopback and unspecified addresses
 (`127.0.0.1`, `::`, `0.0.0.0`) are refused: they are no server's address and appear in many
-lines. A node id needs a letter other than a to f (`xmpp`, `vpn`, `tg`, `node1`): one of hex
+lines. A node id needs a letter other than a to f (`node1`, `vpn`, `tg`, `relay`): one of hex
 digits only would join the colons and digits around it into a new address. Without `SERVER_NAMES` the bot warns
 at startup and sends the names as they are. The subjects say which server already (`[xmpp]`).
 
@@ -163,27 +178,43 @@ in the outbox and waits until logguard-tg-bot has sent it.
 
 ## Install from a release bundle
 
-Instead of `deploy.sh` (step 2 below), without a Rust toolchain: every version tag `logguard-tg-bot-v<version>` gets its bundle, `logguard-tg-bot-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit, `config.env.example`, `SHA256SUMS` and `install.sh`.
+Instead of `deploy.sh` (step 2 below), without a Rust toolchain: every version tag `logguard-tg-bot-v<version>` gets its bundle, `logguard-tg-bot-<version>-<commit>-<arch>.zip` for each architecture (`x86_64-linux-musl`, `aarch64-linux-musl` for arm64, `armv7-linux-musleabihf` for 32-bit ARMv7 with hardware floating point), as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit, `config.env.example`, `SHA256SUMS` and `install.sh`.
 
-**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip for the server's architecture (`uname -m`: `x86_64`, `aarch64`, or `armv7l` for armv7) from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the [Releases page](https://github.com/makhort/Logguard/releases) (each crate's releases are tagged `logguard-tg-bot-v<version>`):
 
 ```bash
-gh release download logguard-tg-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
-sha256sum -c logguard-tg-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-tg-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-tg-bot-v0.2.0
+arch=x86_64-linux-musl     # the server's: aarch64-linux-musl (arm64), armv7-linux-musleabihf (32-bit ARM)
+gh release download logguard-tg-bot-v0.4.0 --repo makhort/Logguard --pattern "*-$arch.zip*"   # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-tg-bot-*-$arch.zip.sha256              # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-tg-bot-*-$arch.zip --repo makhort/Logguard --source-ref refs/tags/logguard-tg-bot-v0.4.0
 ```
 
-`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-tg-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-tg-bot-*-$arch.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
 
-On the server (`apt install unzip` if needed):
+On the server (`apt install unzip` or `dnf install unzip` if needed):
 
 ```bash
-unzip logguard-tg-bot-*-x86_64-linux-musl.zip && cd logguard-tg-bot-*-x86_64-linux-musl
+arch=x86_64-linux-musl     # as above: aarch64-linux-musl, armv7-linux-musleabihf on ARM
+unzip logguard-tg-bot-*-$arch.zip && cd logguard-tg-bot-*-$arch
 sudo ./install.sh          # install or upgrade; the first time also /opt/logguard-tg-bot/config.env
 sudo ./install.sh rollback # back to the previous version
 ```
 
 The first install, as with `deploy.sh`, doesn't start the bot while the token and admin id are placeholders: continue with step 3. `install.sh` checks every file against `SHA256SUMS` in a copy only root can write, then runs the same installer as `deploy.sh` (`./install.sh --check` only checks the files).
+
+## Install from a package
+
+The same release has a package per architecture, for the distribution's package manager instead of `install.sh`: `logguard-tg-bot_<version>-1_<arch>.deb` (`amd64`, `arm64`, `armhf`; Debian, Ubuntu and their derivatives) and `logguard-tg-bot-<version>-1.<arch>.rpm` (`x86_64`, `aarch64`, `armv7hl`; Fedora, RHEL and its rebuilds), each with its `.sha256` and `.sigstore.json`, downloaded and verified as the bundle above (`--pattern "*.deb*"` or `"*.rpm*"`). CI keeps them for every commit as workflow artifacts, and `scripts/package.sh` builds them locally (`cargo install cargo-deb cargo-generate-rpm --locked` once; neither needs dpkg or rpm, so it runs on macOS too; `--target aarch64-unknown-linux-musl` or `armv7-unknown-linux-musleabihf` for the ARM ones). The package is for one host at a time: there is no apt or dnf repository.
+
+```bash
+sudo apt install ./logguard-tg-bot_0.4.0-1_amd64.deb     # Fedora, RHEL:  sudo dnf install ./logguard-tg-bot-0.4.0-1.x86_64.rpm
+sudoedit /opt/logguard-tg-bot/config.env                 # the first install put the template there
+sudo systemctl enable --now logguard-tg-bot
+```
+
+The package puts the same files in the same places as `install.sh` (`/opt/logguard-tg-bot` with the binary and `config.env.example`, the user `logguard-tg-bot`, `/var/log/logguard-tg-bot`, the logrotate rule), except the unit, which is in `/usr/lib/systemd/system`. Its post-install step does what `install.sh` does apart from copying files: the user, `config.env` from the template the first time, the owners and modes, the outbox and the log directory; and it prints what is left to do (step 3 of "Setup": the token and `ADMIN_CHAT_ID` from `pair`, your OpenPGP key). `dpkg-reconfigure logguard-tg-bot` (rpm: `dnf reinstall ./logguard-tg-bot-*.rpm`) runs that step again, e.g. after copying a key there. `apt remove logguard-tg-bot` (`dnf remove`) stops the bot and keeps `/opt/logguard-tg-bot`; `apt purge logguard-tg-bot` removes it with the state and keys (rpm: by hand).
+
+**Nothing starts on its own.** The first install puts the template in place and prints what to fill in; you enable the service once it is filled in. An upgrade keeps the config and restarts the service only if it was running and the config is filled in. **Over a bundle or `deploy.sh` install** the package takes over: the config, state and keys stay; the bundle's unit in `/etc/systemd/system` (it would shadow the package's) and its rollback files go, and the service is enabled again on the package's unit if it was (logguard's integrity watch reports the removed unit as a warning once). **Replacing the config:** when a terminal is there, the install asks whether to replace the config with the new template (the old one kept with the suffix `.old`); Enter, a timeout of a minute, no terminal or `DEBIAN_FRONTEND=noninteractive` keep it. `LOGGUARD_PACKAGE_CONFIG=replace` (or `keep`) answers without asking: `sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./<file>.deb`. **Rollback** is installing the previous version's package (`apt install ./<old>.deb --allow-downgrades`, `dnf downgrade ./<old>.rpm`): there is no `.prev` file.
 
 ## Setup
 
@@ -193,7 +224,7 @@ The first install, as with `deploy.sh`, doesn't start the bot while the token an
    relay node: first logguard (`../logguard/deploy/deploy.sh tg deploy/logguard-tg.toml`, after
    setting the peers and `peer_accept` on the other nodes), then the bot:
    ```bash
-   ./deploy/deploy.sh          # copies to tg:/tmp/logguard-tg-bot-deploy, prints the root command ("xmpp" as argument for the XMPP server)
+   ./deploy/deploy.sh          # copies to tg:/tmp/logguard-tg-bot-deploy, prints the root command (the XMPP server's ssh alias as argument for that server)
    ```
    The first install creates the `logguard-tg-bot` user, `/opt/logguard-tg-bot` and `config.env` (from
    `deploy/config.env.example`, every option with a reasonable value). It doesn't start the
@@ -217,7 +248,7 @@ The first install, as with `deploy.sh`, doesn't start the bot while the token an
    The weekly abuse report job reads `tg_outbox` from there too. On a server with ejabberd,
    leaving `admins` empty sends admin messages to Telegram only (users are still warned over
    XMPP). For a relay node, in `/etc/default/logguard-abuse-report`:
-   `ABUSE_REPORT_SEND_TO=<xmpp>:7946` there, and on the XMPP server
+   `ABUSE_REPORT_SEND_TO=<the XMPP server>:7946` there, and on the XMPP server
    `ABUSE_REPORT_PEERS="vpn tg"` and `ABUSE_REPORT_FORWARD_TO=<tg>:7946`.
    Then `systemctl restart logguard` and run the `notify-test --telegram` check above. Adding
    `logguard-tg-bot.service` to logguard's `[sources] services` gets an alert when the bot fails.
@@ -325,7 +356,7 @@ line can change how a message displays.
 ./scripts/ci.sh            # fmt, clippy, tests, cargo audit, static Linux binary
 ```
 
-The static build needs `rustup target add x86_64-unknown-linux-musl` and
+The static build needs `rustup target add x86_64-unknown-linux-musl` (for ARM: `aarch64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`, built with `TARGET=... ./deploy/deploy.sh`) and
 `rustup component add llvm-tools` (see `.cargo/config.toml`, the same as logguard-xmpp-bot's).
 `tests/fake_telegram.rs` runs the delivery code against a fake Bot API server on 127.0.0.1:
 an alert with account names and server addresses replaced, the report held back without a
@@ -365,5 +396,5 @@ address with junk after a colon, two addresses touching (`a@x{@y`), an `ejabberd
 wasn't a pseudonym hiding the name after it, brackets alone taken for an `ejabberd:` name, a hex-only node id rebuilding an address, an address glued to another
 (`198.51.100.20db8::`, now replaced until nothing changes), a long subject cut on a blank. The smoke test found the first of these within a second.
 Later the same day, logguard-mail-bot's fuzzing of the same code found a server address that,
-replaced by its node id, completed an address (`admin@::ffff:192.0.2.10` → `admin@xmpp`): the
+replaced by its node id, completed an address (`admin@::ffff:192.0.2.10` → `admin@node1`): the
 account pass now runs again after the server pass (`regression-server-makes-address`).

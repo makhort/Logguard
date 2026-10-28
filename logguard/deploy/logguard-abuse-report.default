@@ -1,11 +1,11 @@
-# Settings for /usr/local/sbin/logguard-abuse-report (run weekly by
+# Settings for logguard-abuse-report (run weekly by
 # logguard-abuse-report.timer). Change the time with:  systemctl edit logguard-abuse-report.timer
 # (keep it the same on every server).
 
-# auto: relay on a node with [notify] xmpp = false and cluster peers (a relay node for Telegram or
-# mail), else merge where a bot's outbox exists (any server with logguard-xmpp-bot, logguard-tg-bot or
-# logguard-mail-bot; one without cluster peers merges at once), else send to the cluster peers if
-# there are any (the VPN server), else off. Or send, merge, relay, off.
+# auto: relay on a node with [notify] xmpp = false and cluster peers (a relay node for Telegram,
+# mail, Signal, Matrix or the XMPP client bot), else merge where a bot's outbox exists (any
+# server with logguard-xmpp-bot or a copy bot; one without cluster peers merges at once), else
+# send to the cluster peers if there are any (the VPN server), else off. Or send, merge, relay, off.
 #ABUSE_REPORT_ROLE=auto
 
 # The window of each report.
@@ -34,6 +34,25 @@
 #ABUSE_REPORT_MAIL_OUTBOX=/opt/logguard-mail-bot/outbox
 #ABUSE_REPORT_MAIL_OWNER=logguard-mail-bot
 
+# merge and relay: the Signal bot's outbox (logguard-signal-bot), which sends the report as a
+# Signal attachment (as an OpenPGP file while the admin's safety number isn't the pinned one).
+# Default: logguard's [notify] signal_outbox and signal_user; empty: no copy.
+#ABUSE_REPORT_SIGNAL_OUTBOX=/opt/logguard-signal-bot/outbox
+#ABUSE_REPORT_SIGNAL_OWNER=logguard-signal-bot
+
+# merge and relay: the Matrix bot's outbox (logguard-matrix-bot), which sends the report as an
+# end-to-end encrypted attachment (as an OpenPGP file when that isn't possible). Default:
+# logguard's [notify] matrix_outbox and matrix_user; empty: no copy.
+#ABUSE_REPORT_MATRIX_OUTBOX=/opt/logguard-matrix-bot/outbox
+#ABUSE_REPORT_MATRIX_OWNER=logguard-matrix-bot
+
+# merge and relay: the XMPP client bot's outbox (logguard-xmpp-bot with BOT_MODE=client), which
+# sends the report as OMEMO media (as an OpenPGP file when OMEMO can't reach the admin). Default:
+# logguard's [notify] xmpp_outbox and xmpp_user; empty: no copy. When it is set, the admin bot's
+# outbox (ABUSE_REPORT_OUTBOX, [notify] bot_outbox) has no default: the path is the same.
+#ABUSE_REPORT_XMPP_OUTBOX=/opt/logguard-xmpp-bot/outbox
+#ABUSE_REPORT_XMPP_OWNER=logguard-xmpp-bot
+
 # With a Telegram relay node (deploy/logguard-tg.toml; role relay there, picked by auto):
 # on the XMPP server (merge), wait for its report too and send it the merged text report:
 #ABUSE_REPORT_PEERS="vpn tg"
@@ -41,5 +60,5 @@
 # on the relay node, send its own report to the merging server only, and wait this long for
 # the merged one (the merging server waits for its peers first, then looks up the mailboxes;
 # if none comes, the relay node merges itself):
-#ABUSE_REPORT_SEND_TO="11.24.39.236:7946"
+#ABUSE_REPORT_SEND_TO="11.29.39.236:7946"
 #ABUSE_REPORT_RELAY_WAIT_MIN=60

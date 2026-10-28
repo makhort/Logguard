@@ -1,0 +1,239 @@
+name: logguard-matrix-bot
+
+# Two kinds of push run this:
+#   - a branch push that changes these paths: the tests, then the bundles and the .deb and .rpm
+#     packages as workflow artifacts
+#   - a push of this crate's version tag, e.g. logguard-matrix-bot-v0.2.0 (the version must be
+#     Cargo.toml's): the same, then the release job attaches them to the GitHub Release
+#     of that tag. GitHub doesn't evaluate paths for tag pushes; other crates' tags don't match.
+on:
+  push:
+    branches: ["**"]
+    paths: ["logguard-matrix-bot/**", ".github/workflows/logguard-matrix-bot.yml"]
+    tags: ["logguard-matrix-bot-v[0-9]*"]
+  pull_request:
+    paths: ["logguard-matrix-bot/**", ".github/workflows/logguard-matrix-bot.yml"]
+
+permissions:
+  contents: read
+
+# Actions are pinned to commits (the tag or branch in the comment): a tag can be moved, and
+# the check job builds the bundles the release job attests and publishes.
+
+jobs:
+  # One bundle per architecture. x86_64 and aarch64 (arm64) run on runners of their own (GitHub's
+  # arm64 runners are free in public repositories): every check, then the bundle's installer as
+  # root. 32-bit ARM (armv7, hard-float) has no runner: it is cross-built on x86_64 and linted
+  # for its target, and its binary started under qemu.
+  check:
+    name: check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 from 2026-10-19
+            native: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            native: true
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-24.04
+            native: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30         # a hung test fails the job instead of running for 6 h
+    env:
+      TARGET: ${{ matrix.target }}   # what ci.sh and bundle.sh build
+    defaults:
+      run:
+        working-directory: logguard-matrix-bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: ./scripts/bundle.sh --check-tag "$GITHUB_REF_NAME"
+      # llvm-tools: scripts/llvm-ar, the archiver .cargo/config.toml sets for ring's C code
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable   # pinned to a commit, it can't take it from the ref name
+          components: rustfmt, clippy, llvm-tools
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: logguard-matrix-bot
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        if: matrix.native
+        with:
+          tool: cargo-audit
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.1   # scripts/package.sh
+      - if: matrix.native
+        run: ./scripts/ci.sh
+      # armv7: the tests ran on x86_64 and aarch64; what differs on a 32-bit target is linted
+      - name: Lint and build for the target (cross)
+        if: ${{ !matrix.native }}
+        run: |
+          cargo clippy --all-targets --target "$TARGET" --quiet -- -D warnings
+          cargo build --release --quiet --target "$TARGET"
+      # The release bundle (scripts/bundle.sh): binary, deploy files, installer. Its installer is
+      # tried as root on this throwaway runner, then the zip is published as it is (not zipped
+      # again), with its .sha256 for the release job to check it against.
+      - name: Bundle
+        run: |
+          out=$(./scripts/bundle.sh --target "$TARGET")
+          zip=${out##*$'\n'}                      # its last line: the zip's path
+          cd "${zip%/*}" && sha256sum "${zip##*/}" > "${zip##*/}.sha256"
+      # The distribution packages (scripts/package.sh): the same binary and deploy files as a
+      # .deb and an .rpm, each with its .sha256. Below, the .deb is installed on this runner
+      # over the bundle's install (the package takes it over), upgraded and purged; the .rpm
+      # in a Fedora container (no systemd there: the scriptlets must get by without it).
+      - name: Package
+        run: ./scripts/package.sh --target "$TARGET"
+      - name: Install the bundle on the runner
+        if: matrix.native
+        run: |
+          d=$(mktemp -d) && unzip -q target/bundle/*.zip -d "$d" && cd "$d"/logguard-matrix-bot-*
+          ./install.sh --check
+          sudo ./install.sh                                 # first install: config.env from the template
+          sudo test -f /opt/logguard-matrix-bot/config.env
+          if systemctl is-active -q logguard-matrix-bot; then exit 1; fi             # not started until it is filled in
+          /opt/logguard-matrix-bot/logguard-matrix-bot --version
+      - name: Install the .deb on the runner
+        if: matrix.native
+        run: |
+          deb=$(ls target/package/*.deb)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "./$deb"     # over the bundle's install: taken over
+          test ! -e /etc/systemd/system/logguard-matrix-bot.service && sudo test ! -e /opt/logguard-matrix-bot/install.sh
+          sudo test -f /opt/logguard-matrix-bot/config.env                                      # the bundle's, kept
+          if systemctl is-active -q logguard-matrix-bot; then exit 1; fi                        # not started: placeholders
+          id logguard-matrix-bot && /opt/logguard-matrix-bot/logguard-matrix-bot --version
+          sudo DEBIAN_FRONTEND=noninteractive dpkg -i "$deb"                            # an upgrade: config kept
+          sudo apt-get purge -y -q logguard-matrix-bot
+          sudo test ! -e /opt/logguard-matrix-bot
+      - name: Install the .rpm in a Fedora container
+        if: matrix.native
+        run: |
+          docker run --rm -v "$PWD/target/package:/pkg:ro" fedora:44 bash -ec '
+            dnf install -y -q /pkg/*.rpm
+            rpm -q logguard-matrix-bot && /opt/logguard-matrix-bot/logguard-matrix-bot --version
+            id logguard-matrix-bot && test -f /opt/logguard-matrix-bot/config.env                     # no systemd in a container: nothing started
+            rpm -V logguard-matrix-bot
+            dnf remove -y -q logguard-matrix-bot
+            test ! -e /opt/logguard-matrix-bot/logguard-matrix-bot && test -f /opt/logguard-matrix-bot/config.env'
+      - name: Check the packages (cross)
+        if: ${{ !matrix.native }}
+        run: |
+          sudo apt-get update -q > /dev/null && sudo apt-get install -y -q rpm > /dev/null
+          dpkg-deb -I target/package/*.deb | grep -q '^ Architecture: armhf'
+          dpkg-deb -c target/package/*.deb | grep -q '/opt/logguard-matrix-bot/logguard-matrix-bot$'
+          rpm -qpi --nosignature target/package/*.rpm | grep -q '^Architecture: armv7hl'
+          rpm -qpl --nosignature target/package/*.rpm | grep -q '^/opt/logguard-matrix-bot/logguard-matrix-bot$'
+      - name: Start the binary under qemu
+        if: ${{ !matrix.native }}
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q qemu-user-static
+          d=$(mktemp -d) && unzip -q target/bundle/*.zip -d "$d" && cd "$d"/logguard-matrix-bot-*
+          ./install.sh --check
+          file files/logguard-matrix-bot | grep -q 'ARM, EABI5'
+          qemu-arm-static files/logguard-matrix-bot --version
+      # upload-artifact names each artifact after its file (archive: false: one file each)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/bundle/*.zip
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/bundle/*.zip.sha256
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/package/*.deb
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/package/*.deb.sha256
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/package/*.rpm
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: logguard-matrix-bot/target/package/*.rpm.sha256
+          archive: false
+          if-no-files-found: error
+
+  # Tag pushes only, once every architecture passed: the bundles and packages check built (and,
+  # on x86_64 and aarch64, installed), their .sha256, and (in a public repository: GitHub offers attestations
+  # for private ones only with Enterprise Cloud) one signed build provenance attestation for all
+  # of them (as each bundle's .sigstore.json), attached to the GitHub Release of the tag.
+  release:
+    needs: check
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write           # create the Release, upload its assets
+      id-token: write           # the attestation: an OIDC token for the Sigstore certificate
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
+          skip-decompress: true   # the bundles are themselves zips: keep them as they are
+      - name: Check the bundles against their .sha256
+        working-directory: dist
+        run: |
+          ls -l
+          for f in "*-x86_64-linux-musl.zip" "*-aarch64-linux-musl.zip" "*-armv7-linux-musleabihf.zip" \
+                   "*_amd64.deb" "*_arm64.deb" "*_armhf.deb" "*.x86_64.rpm" "*.aarch64.rpm" "*.armv7hl.rpm"; do
+              n=$(find . -maxdepth 1 -type f -name "$f" | wc -l)
+              [ "$n" = 1 ] || { echo "$n files $f, not 1"; exit 1; }
+          done
+          [ "$(find . -type f | wc -l)" = 18 ] || { echo "unexpected files"; exit 1; }
+          sha256sum -c ./*.sha256                 # the very files check built
+      - id: attest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+      - name: Attach to the GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          assets=(./*.zip ./*.deb ./*.rpm ./*.sha256)
+          if [ -n "$ATTESTATION" ]; then
+              for z in ./*.zip ./*.deb ./*.rpm; do        # one attestation covers every file
+                  cp -- "$ATTESTATION" "$z.sigstore.json"
+                  assets+=("$z.sigstore.json")
+              done
+          fi
+          if gh release view "$tag" > /dev/null 2>&1; then
+              gh release upload "$tag" "${assets[@]}" --clobber    # a re-run: replace them
+          else
+              printf '%s\n' \
+                  "Install: $GITHUB_SERVER_URL/$GH_REPO/blob/$tag/logguard-matrix-bot/README.md#install-from-a-release-bundle" "" \
+                  "One bundle per architecture: \`x86_64-linux-musl\` (amd64), \`aarch64-linux-musl\` (arm64)," \
+                  "\`armv7-linux-musleabihf\` (32-bit ARM, ARMv7 with hardware floating point). Static binaries: any distribution." "" \
+                  "Or a package: \`apt install ./<name>_<version>-1_<amd64|arm64|armhf>.deb\` (Debian, Ubuntu)," \
+                  "\`dnf install ./<name>-<version>-1.<x86_64|aarch64|armv7hl>.rpm\` (Fedora, RHEL): $GITHUB_SERVER_URL/$GH_REPO/blob/$tag/logguard-matrix-bot/README.md#install-from-a-package" "" \
+                  "Verify: \`sha256sum -c <file>.sha256\`" \
+                  "and \`gh attestation verify <file> --repo $GH_REPO --source-ref refs/tags/$tag\`" |
+                  gh release create "$tag" "${assets[@]}" --verify-tag --title "$tag" --notes-file -
+          fi

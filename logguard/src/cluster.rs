@@ -11,11 +11,20 @@
 //! XChaCha20-Poly1305 under a pre-shared 256-bit cluster key (random 192-bit nonce per
 //! message). Anyone without the key can neither read nor inject facts. Messages older
 //! than `max_clock_skew` are rejected (replays are idempotent anyway, as facts are
-//! de-duplicated). All members are equally trusted: protect the key like a root password,
-//! except peers named in `peer_accept`: what arrives over a connection from such a peer's
-//! address (its own facts and those it forwards) is limited to the kinds listed there. The
-//! limit goes by the connection's source address, not the node name in the message, which
-//! any key holder can write; so it needs `allow_only_peers`.
+//! de-duplicated). Without node identities, all members are equally trusted: protect the
+//! key like a root password, except peers named in `peer_accept`: what arrives over a
+//! connection from such a peer's address (its own facts and those it forwards) is limited to
+//! the kinds listed there. The limit goes by the connection's source address, not the node
+//! name in the message, which any key holder can write; so it needs `allow_only_peers`.
+//!
+//! **Node identities** (`identity_file`, `nodes`, `require_signatures`): each node signs the
+//! facts it originates and the files it sends with an Ed25519 key of its own; the signature
+//! covers `(origin, seq, created, body)` and travels with the fact through forwarding (`hops`
+//! stays outside it). A fact or file whose origin has a key pinned in `nodes` is taken only
+//! with a valid signature from that key, so a broken-into node, or anyone with a stolen
+//! cluster key, can speak only for itself; with `require_signatures`, origins without a
+//! pinned key are refused, and removing a node's key drops it without a new cluster key.
+//! The shared key still encrypts every message.
 //!
 //! **Wire format**: `"LGC1"` | u32 big-endian length | 24-byte nonce | ciphertext of a
 //! JSON `Envelope`. One envelope per TCP connection; no reply.
@@ -120,6 +129,17 @@ pub struct ClusterCfg {
     /// itself ([notify] enabled), e.g. to a node that forwards them to Telegram. Without
     /// it, only nodes with [notify] off relay theirs.
     pub relay_notices: bool,
+    /// This node's own signing key (`logguard cluster-identity --out <file>`, mode 0600):
+    /// the facts it originates and the files it sends are signed with it. Empty = unsigned.
+    pub identity_file: PathBuf,
+    /// Public keys pinned by node name (what `cluster-identity` prints), e.g.
+    /// `{ xmpp = "...", vpn = "..." }`: a fact or file from a node listed here is taken only
+    /// with a valid signature by its key. Its own entry, if any, must match `identity_file`
+    /// (so one list can be copied to every node).
+    pub nodes: BTreeMap<String, String>,
+    /// Refuse facts and files from nodes not in `nodes` (and unsigned ones): then removing a
+    /// node's key drops it from the cluster without rotating the cluster key.
+    pub require_signatures: bool,
 }
 
 impl Default for ClusterCfg {
@@ -146,6 +166,9 @@ impl Default for ClusterCfg {
             inbox: PathBuf::from("/var/lib/logguard/inbox"),
             peer_accept: BTreeMap::new(),
             relay_notices: false,
+            identity_file: PathBuf::new(),
+            nodes: BTreeMap::new(),
+            require_signatures: false,
         }
     }
 }
@@ -195,6 +218,10 @@ impl ClusterCfg {
         }
         if !self.peer_accept.is_empty() && !self.allow_only_peers {
             bail!("[cluster] peer_accept needs allow_only_peers = true: the limit goes by the connection's address");
+        }
+        NodeKeys::new(self)?;
+        if self.require_signatures && self.nodes.is_empty() {
+            bail!("[cluster] require_signatures needs the nodes' public keys in `nodes` (`logguard cluster-identity` prints them)");
         }
         Ok(())
     }
@@ -268,6 +295,124 @@ pub fn decode_key(b64: &str) -> Result<[u8; 32]> {
 
 pub fn generate_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(XChaCha20Poly1305::generate_key(&mut OsRng))
+}
+
+// ------------------------------------------------------------------ node identities
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// A node's own signing key (`[cluster] identity_file`): base64 of the 32-byte Ed25519 seed.
+pub struct Identity(ed25519_dalek::SigningKey);
+
+impl Identity {
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&XChaCha20Poly1305::generate_key(&mut OsRng));
+        Identity(ed25519_dalek::SigningKey::from_bytes(&seed))
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let raw = B64.decode(text.trim()).with_context(|| format!("{} is not base64", path.display()))?;
+        let seed: [u8; 32] =
+            raw.try_into().map_err(|_| anyhow!("{} must hold 32 bytes (use `logguard cluster-identity --out`)", path.display()))?;
+        Ok(Identity(ed25519_dalek::SigningKey::from_bytes(&seed)))
+    }
+
+    /// Writes a new key to `path` (mode 0600) unless one is there already; returns the key in
+    /// the file and whether it is new.
+    pub fn create(path: &Path) -> Result<(Self, bool)> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if path.exists() {
+            return Ok((Identity::load(path)?, false));
+        }
+        let id = Identity::generate();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(format!("{}\n", B64.encode(id.0.to_bytes())).as_bytes())?;
+        f.sync_all()?;
+        Ok((id, true))
+    }
+
+    /// The public key, as `[cluster] nodes` takes it.
+    pub fn public(&self) -> String {
+        B64.encode(self.0.verifying_key().to_bytes())
+    }
+
+    fn sign(&self, msg: &[u8]) -> String {
+        use ed25519_dalek::Signer;
+        B64.encode(self.0.sign(msg).to_bytes())
+    }
+}
+
+/// A public key as `cluster-identity` prints it.
+pub fn decode_public(b64: &str) -> Result<ed25519_dalek::VerifyingKey> {
+    let raw = B64.decode(b64.trim()).context("node key is not valid base64")?;
+    let raw: [u8; 32] =
+        raw.try_into().map_err(|_| anyhow!("node key must be exactly 32 bytes (what `logguard cluster-identity` prints)"))?;
+    ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|_| anyhow!("not an Ed25519 public key"))
+}
+
+/// The pinned node keys (`[cluster] nodes`) and `require_signatures`.
+#[derive(Clone, Debug, Default)]
+pub struct NodeKeys {
+    keys: BTreeMap<String, ed25519_dalek::VerifyingKey>,
+    require: bool,
+}
+
+impl NodeKeys {
+    pub fn new(cfg: &ClusterCfg) -> Result<Self> {
+        let mut keys = BTreeMap::new();
+        for (node, k) in &cfg.nodes {
+            if !node_name_ok(node) {
+                bail!("[cluster] nodes: '{node}' is not a node name");
+            }
+            keys.insert(node.clone(), decode_public(k).with_context(|| format!("[cluster] nodes.{node}"))?);
+        }
+        Ok(NodeKeys { keys, require: cfg.require_signatures })
+    }
+
+    /// Whether `node` may say what it signed with `sig` (base64) over `msg`: `Ok(true)` when
+    /// the signature is valid for its pinned key, `Ok(false)` for a node without one (taken
+    /// unchecked unless `require_signatures`), else why not. `msg` is built only when needed.
+    pub fn check(&self, node: &str, sig: &str, msg: impl FnOnce() -> Vec<u8>) -> Result<bool, &'static str> {
+        let Some(key) = self.keys.get(node) else {
+            return if self.require { Err("not in [cluster] nodes (require_signatures)") } else { Ok(false) };
+        };
+        if sig.is_empty() {
+            return Err("unsigned, but its key is pinned in [cluster] nodes");
+        }
+        let sig = B64.decode(sig).ok().and_then(|s| ed25519_dalek::Signature::from_slice(&s).ok()).ok_or("signature malformed")?;
+        key.verify_strict(&msg(), &sig).map(|_| true).map_err(|_| "signature does not match its pinned key")
+    }
+}
+
+/// What a fact's signature covers: everything but `hops` (forwarders change it).
+fn fact_message(origin: &str, seq: u64, created: Micros, body: &FactBody) -> Vec<u8> {
+    let mut m = b"logguard-fact-v1\0".to_vec();
+    m.extend_from_slice(&(origin.len() as u32).to_be_bytes());
+    m.extend_from_slice(origin.as_bytes());
+    m.extend_from_slice(&seq.to_be_bytes());
+    m.extend_from_slice(&created.to_be_bytes());
+    // serde_json writes the fields in their declared order: the same bytes on every node
+    m.extend_from_slice(&serde_json::to_vec(body).unwrap_or_default());
+    m
+}
+
+/// What a peer file's signature covers: its sender, when it was sent, its name and content.
+fn file_message(from: &str, sent: Micros, name: &str, gz: &str) -> Vec<u8> {
+    let mut m = b"logguard-file-v1\0".to_vec();
+    for s in [from, name] {
+        m.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        m.extend_from_slice(s.as_bytes());
+    }
+    m.extend_from_slice(&sent.to_be_bytes());
+    m.extend_from_slice(gz.as_bytes());
+    m
 }
 
 // ------------------------------------------------------------------ facts
@@ -373,6 +518,10 @@ pub struct Fact {
     pub hops: u8,
     #[serde(flatten)]
     pub body: FactBody,
+    /// The origin's signature over [`fact_message`] (base64), when it has `identity_file`.
+    /// Older nodes ignore it, and leave it out when they forward the fact.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -404,19 +553,30 @@ pub struct PeerFile {
     pub name: String,
     /// The content, gzip-compressed, in base64.
     pub gz: String,
+    /// The sender's signature over [`file_message`] (base64), when it has `identity_file`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
 }
 
 /// A frame carrying `content` as the file `name` (gzip-compressed: a week's JSON abuse
-/// report shrinks ~10x, and a frame holds at most 1 MB).
-pub fn file_frame(key: &[u8; 32], from: &str, name: &str, content: &[u8], now: Micros) -> Result<Vec<u8>> {
+/// report shrinks ~10x, and a frame holds at most 1 MB), signed with `identity` if any.
+pub fn file_frame(key: &[u8; 32], identity: Option<&Identity>, from: &str, name: &str, content: &[u8], now: Micros) -> Result<Vec<u8>> {
     if !PEER_FILES.contains(&name) {
         bail!("unknown file name '{name}' (known: {})", PEER_FILES.join(", "));
     }
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     gz.write_all(content)?;
     let gz = base64::engine::general_purpose::STANDARD.encode(gz.finish()?);
-    let env = Envelope { v: 1, from: from.into(), sent: now, facts: vec![], file: Some(PeerFile { name: name.into(), gz }) };
+    let sig = identity.map(|id| id.sign(&file_message(from, now, name, &gz))).unwrap_or_default();
+    let env = Envelope { v: 1, from: from.into(), sent: now, facts: vec![], file: Some(PeerFile { name: name.into(), gz, sig }) };
     seal(key, &env)
+}
+
+/// Whether a peer file's sender is who it says (see [`NodeKeys::check`]): `Ok(true)` when
+/// signed by the key pinned for that name, which then needs no [`Senders`] check.
+pub fn file_signed(keys: &NodeKeys, env: &Envelope) -> Result<bool, &'static str> {
+    let file = env.file.as_ref().ok_or("no file in the message")?;
+    keys.check(&env.from, &file.sig, || file_message(&env.from, env.sent, &file.name, &file.gz))
 }
 
 /// Most files the inbox holds: two per peer (its report, a merged one) leave plenty of room,
@@ -427,7 +587,8 @@ const MAX_INBOX_FILES: usize = 32;
 /// sender's node name, which any key holder can write, and the abuse report job trusts that
 /// name: so a peer limited by `peer_accept` keeps the one name it first sent under, and may
 /// not use one an unlimited peer uses. (Right after a restart, before the other peers' first
-/// heartbeats, a limited peer could still claim one of their names once.)
+/// heartbeats, a limited peer could still claim one of their names once.) A file signed by
+/// the key pinned for its sender's name ([`file_signed`]) needs none of this.
 #[derive(Clone, Debug, Default)]
 pub struct Senders(Arc<std::sync::Mutex<SenderNames>>);
 
@@ -622,6 +783,15 @@ pub struct ClusterView {
     /// When the key file was installed or last rotated.
     #[serde(default)]
     pub key_since: Option<Micros>,
+    /// This node's public key (`identity_file`); empty when it signs nothing.
+    #[serde(default)]
+    pub identity: String,
+    /// Nodes with a pinned key (`nodes`).
+    #[serde(default)]
+    pub pinned: usize,
+    /// Facts refused for their signature: missing, wrong, or from an unpinned node.
+    #[serde(default)]
+    pub refused_signature: u64,
 }
 
 pub struct Cluster {
@@ -639,6 +809,12 @@ pub struct Cluster {
     pub limits: PeerLimits,
     /// (sender, kind) pairs already logged as refused.
     refused_logged: std::collections::HashSet<(String, FactKind)>,
+    /// Signs this node's facts (`identity_file`).
+    identity: Option<Identity>,
+    /// Checks the others' (`nodes`).
+    pub node_keys: NodeKeys,
+    /// Origins already logged as refused for their signature.
+    unsigned_logged: std::collections::HashSet<String>,
 }
 
 impl Cluster {
@@ -646,6 +822,13 @@ impl Cluster {
         let key = cfg.load_key()?;
         let extra: Vec<[u8; 32]> = cfg.load_extra_keys()?.into_iter().map(|(_, k)| k).filter(|k| *k != key).collect();
         let node_id = cfg.node_name();
+        let identity = (!cfg.identity_file.as_os_str().is_empty()).then(|| Identity::load(&cfg.identity_file)).transpose()?;
+        let node_keys = NodeKeys::new(cfg)?;
+        if let (Some(id), Some(pinned)) = (&identity, cfg.nodes.get(&node_id)) {
+            if decode_public(pinned)?.to_bytes() != id.0.verifying_key().to_bytes() {
+                bail!("[cluster] nodes.{node_id} is not the public key of {} ({})", cfg.identity_file.display(), id.public());
+            }
+        }
         let peers = cfg.peers.iter().map(|p| PeerView { addr: p.clone(), ..Default::default() }).collect();
         Ok(Cluster {
             cfg: cfg.clone(),
@@ -656,6 +839,8 @@ impl Cluster {
                 key_id: key_id(&key),
                 extra_key_ids: extra.iter().map(key_id).collect(),
                 key_since: cfg.key_since(),
+                identity: identity.as_ref().map(Identity::public).unwrap_or_default(),
+                pinned: cfg.nodes.len(),
                 ..Default::default()
             },
             node_id,
@@ -666,7 +851,15 @@ impl Cluster {
             notice_bytes: 0,
             limits: PeerLimits::new(cfg),
             refused_logged: Default::default(),
+            identity,
+            node_keys,
+            unsigned_logged: Default::default(),
         })
+    }
+
+    /// Signs this node's files (`cluster-send-report`).
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
     }
 
     pub fn key(&self) -> &[u8; 32] {
@@ -689,13 +882,16 @@ impl Cluster {
 
     /// Records a fact produced by this node. Sequence numbers are time-based, so they stay
     /// unique across restarts without persistence.
-    pub fn originate(&mut self, body: FactBody, now: Micros) {
+    pub fn originate(&mut self, mut body: FactBody, now: Micros) {
         if !self.cfg.share.contains(&body.kind()) {
             return;
         }
         let seq = self.last_seq.saturating_add(1).max(time::now().max(now) as u64);
         self.last_seq = seq;
-        let fact = Fact { origin: self.node_id.clone(), seq, created: now, hops: 0, body };
+        // as the peers will keep it: what they forward must still match the signature
+        body.tidy();
+        let sig = self.identity.as_ref().map(|id| id.sign(&fact_message(&self.node_id, seq, now, &body))).unwrap_or_default();
+        let fact = Fact { origin: self.node_id.clone(), seq, created: now, hops: 0, body, sig };
         let expires = fact.body.expires(now);
         self.notice_bytes += fact.body.notice_len();
         self.known.insert((fact.origin.clone(), seq), Stored { fact, expires, learned: now });
@@ -735,6 +931,14 @@ impl Cluster {
             }
             if self.known.len() >= MAX_KNOWN {
                 self.view.rejected += 1;
+                continue;
+            }
+            // before `tidy`: the signature covers the body as its origin sent it
+            if let Err(why) = self.node_keys.check(&f.origin, &f.sig, || fact_message(&f.origin, f.seq, f.created, &f.body)) {
+                self.view.refused_signature += 1;
+                if self.unsigned_logged.len() < 100 && self.unsigned_logged.insert(f.origin.clone()) {
+                    eprintln!("logguard: cluster: facts from '{}' (received from '{}') refused: {why}", f.origin, env.from);
+                }
                 continue;
             }
             f.hops += 1;
@@ -1101,7 +1305,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lg-inbox-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let report = br#"{"servers":[],"from":0,"to":1,"offenders":[]}"#.repeat(1000);
-        let frame = file_frame(&key, "vpn", "abuse", &report, now).unwrap();
+        let frame = file_frame(&key, None, "vpn", "abuse", &report, now).unwrap();
         assert!(frame.len() < report.len() / 4, "compressed: {} bytes", frame.len());
         let env = open(&key, &read_frame(&mut frame.as_slice()).unwrap()).unwrap();
         assert!(env.facts.is_empty());
@@ -1113,11 +1317,11 @@ mod tests {
         flate2::read::GzDecoder::new(std::fs::File::open(&path).unwrap()).read_to_end(&mut back).unwrap();
         assert_eq!(back, report);
         // a newer one replaces it; no temporary file is left behind
-        let env2 = open(&key, &read_frame(&mut file_frame(&key, "vpn", "abuse", b"{}", now).unwrap().as_slice()).unwrap()).unwrap();
+        let env2 = open(&key, &read_frame(&mut file_frame(&key, None, "vpn", "abuse", b"{}", now).unwrap().as_slice()).unwrap()).unwrap();
         store_file(&dir, &env2, skew, now).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 
-        assert!(file_frame(&key, "vpn", "passwd", b"x", now).is_err(), "only known names are sent");
+        assert!(file_frame(&key, None, "vpn", "passwd", b"x", now).is_err(), "only known names are sent");
         let refused = |e: &Envelope, dir: &Path| store_file(dir, e, skew, now).unwrap_err().to_string();
         assert!(refused(&env, Path::new("")).contains("refused"));
         let stale = Envelope { sent: now - 3600 * SEC, ..env.clone() };
@@ -1172,7 +1376,7 @@ mod tests {
             facts: Vec<Fact>,
         }
         let key = decode_key(&generate_key()).unwrap();
-        let frame = file_frame(&key, "vpn", "abuse", b"{}", 7).unwrap();
+        let frame = file_frame(&key, None, "vpn", "abuse", b"{}", 7).unwrap();
         let body = read_frame(&mut frame.as_slice()).unwrap();
         let plain =
             XChaCha20Poly1305::new((&key).into()).decrypt(XNonce::from_slice(&body[..24]), Payload { msg: &body[24..], aad: AAD }).unwrap();
@@ -1274,6 +1478,7 @@ mod tests {
                     created: at,
                     hops: 0,
                     body: FactBody::Notice { subject: "s".into(), body: "x".repeat(100 * 1024) },
+                    sig: String::new(),
                 })
                 .collect(),
             file: None,
@@ -1285,7 +1490,14 @@ mod tests {
         assert_eq!(a.view.rejected, 73);
         // other facts still get in
         let ban = Envelope {
-            facts: vec![Fact { origin: "tg".into(), seq: 999, created: now, hops: 0, body: ban("9.9.9.9", now / SEC + 60) }],
+            facts: vec![Fact {
+                origin: "tg".into(),
+                seq: 999,
+                created: now,
+                hops: 0,
+                body: ban("9.9.9.9", now / SEC + 60),
+                sig: String::new(),
+            }],
             ..notices(now, 0, 0)
         };
         assert_eq!(a.ingest(ban, None, now).len(), 1);
@@ -1300,7 +1512,7 @@ mod tests {
         let k = generate_key();
         let now = time::now();
         let mut a = cluster("a", &k, vec![]);
-        let fact = |body| Fact { origin: "x".into(), seq: 1, created: now, hops: 0, body };
+        let fact = |body| Fact { origin: "x".into(), seq: 1, created: now, hops: 0, body, sig: String::new() };
         let stale =
             Envelope { v: 1, from: "x".into(), sent: now - 3600 * SEC, facts: vec![fact(ban("9.9.9.9", now / SEC + 60))], file: None };
         assert!(a.ingest(stale, None, now).is_empty());
@@ -1325,7 +1537,7 @@ mod tests {
         let k = generate_key();
         let now = time::now();
         let mut a = cluster("a", &k, vec![]);
-        let fact = |origin: &str, seq, body| Fact { origin: origin.into(), seq, created: now, hops: 0, body };
+        let fact = |origin: &str, seq, body| Fact { origin: origin.into(), seq, created: now, hops: 0, body, sig: String::new() };
         let env = |from: &str, facts| Envelope { v: 1, from: from.into(), sent: now, facts, file: None };
         assert!(
             a.ingest(env("x\u{1b}]52;c;", vec![]), None, now).is_empty() && a.view.rejected == 1,
@@ -1437,6 +1649,211 @@ mod tests {
             got += b.ingest(open(a.key(), &body).unwrap(), None, now).len();
         }
         assert_eq!(got, 20_000);
+    }
+
+    /// A node that signs with its own key, and one that checks against `pinned` keys.
+    fn signer(name: &str, key: &str, peers: Vec<String>) -> Cluster {
+        let mut c = cluster(name, key, peers);
+        c.identity = Some(Identity::generate());
+        c
+    }
+
+    fn pin(c: &mut Cluster, pinned: &[(&str, String)], require: bool) {
+        c.cfg.nodes = pinned.iter().map(|(n, k)| (n.to_string(), k.clone())).collect();
+        c.cfg.require_signatures = require;
+        c.node_keys = NodeKeys::new(&c.cfg).unwrap();
+    }
+
+    fn deliver(from: &mut Cluster, to: &mut Cluster, now: Micros) -> Vec<Fact> {
+        let frames = from.outgoing(now);
+        to.ingest(open(from.key(), &frames[0].1[8..]).unwrap(), None, now)
+    }
+
+    /// A key holder can't make facts under another node's name once that name's key is pinned.
+    #[test]
+    fn forged_origin_is_refused() {
+        let k = generate_key();
+        let now = time::now();
+        let mut a = signer("a", &k, vec!["b:1".into()]);
+        let mut m = signer("m", &k, vec!["b:1".into()]);
+        let mut b = cluster("b", &k, vec![]);
+        pin(&mut b, &[("a", a.identity().unwrap().public())], false);
+        let forged = |origin: &str, seq, sig: String| Envelope {
+            v: 1,
+            from: "m".into(),
+            sent: now,
+            facts: vec![Fact { origin: origin.into(), seq, created: now, hops: 0, body: ban("10.1.1.1", now / SEC + 60), sig }],
+            file: None,
+        };
+        // unsigned, signed by another key, or a valid signature moved onto another fact
+        assert!(b.ingest(forged("a", 1, String::new()), None, now).is_empty());
+        let m_sig = m.identity().unwrap().sign(&fact_message("a", 2, now, &ban("10.1.1.1", now / SEC + 60)));
+        assert!(b.ingest(forged("a", 2, m_sig), None, now).is_empty());
+        a.originate(ban("10.2.2.2", now / SEC + 60), now);
+        let genuine = a.known.values().next().unwrap().fact.clone();
+        assert!(b.ingest(forged("a", 3, genuine.sig.clone()), None, now).is_empty(), "the signature covers the body");
+        let mut moved = genuine.clone();
+        moved.created -= SEC;
+        assert!(b.ingest(Envelope { facts: vec![moved], ..forged("a", 0, String::new()) }, None, now).is_empty());
+        assert_eq!(b.view.refused_signature, 4);
+        // a refused forgery doesn't take the real fact's place
+        assert_eq!(deliver(&mut a, &mut b, now).len(), 1);
+        // m still speaks for itself: it isn't pinned, and signatures aren't required here
+        m.originate(ban("10.3.3.3", now / SEC + 60), now);
+        assert_eq!(deliver(&mut m, &mut b, now).len(), 1);
+    }
+
+    /// Forwarders change `hops` (and clean the text): the origin's signature still holds.
+    #[test]
+    fn forwarded_fact_still_verifies() {
+        let k = generate_key();
+        let now = time::now();
+        let mut a = signer("a", &k, vec!["b:1".into()]);
+        let mut b = cluster("b", &k, vec!["c:1".into()]);
+        let mut c = cluster("c", &k, vec![]);
+        let a_pub = a.identity().unwrap().public();
+        pin(&mut b, &[("a", a_pub.clone())], true);
+        pin(&mut c, &[("a", a_pub)], true);
+        a.originate(
+            FactBody::Ban {
+                net: "10.4.4.4".parse().unwrap(),
+                until: now + 3600 * SEC,
+                reason: "r\u{1b}[0m\u{202e}".into(),
+                forgeable: true,
+            },
+            now,
+        );
+        a.originate(FactBody::Notice { subject: "s".into(), body: "x\u{7}".repeat(20_000) }, now);
+        assert_eq!(deliver(&mut a, &mut b, now).len(), 2);
+        let got = deliver(&mut b, &mut c, now);
+        assert_eq!(got.len(), 2, "refused: {}", c.view.refused_signature);
+        assert!(got.iter().all(|f| f.hops == 2 && !f.sig.is_empty()));
+        // and on a full sync later, one hop further
+        let mut d = cluster("d", &k, vec![]);
+        pin(&mut d, &[("a", a.identity().unwrap().public())], true);
+        let mut c2 = cluster("c", &k, vec!["d:1".into()]);
+        pin(&mut c2, &[("a", a.identity().unwrap().public())], true);
+        assert!(b.delivered(0, Err("lost".into()), now).is_none(), "a failed delivery: everything again");
+        assert_eq!(deliver(&mut b, &mut c2, now).len(), 2);
+        assert_eq!(deliver(&mut c2, &mut d, now).len(), 2);
+    }
+
+    /// With `require_signatures`, removing a node's key drops it; without, unsigned facts from
+    /// unpinned nodes are taken as before (a rollout, or nodes without identities).
+    #[test]
+    fn revoked_and_unsigned_nodes() {
+        let k = generate_key();
+        let now = time::now();
+        let mut a = signer("a", &k, vec!["c:1".into()]);
+        let mut old = cluster("old", &k, vec!["c:1".into()]);
+        let mut c = cluster("c", &k, vec![]);
+        a.originate(ban("10.5.5.5", now / SEC + 60), now);
+        old.originate(ban("10.6.6.6", now / SEC + 60), now);
+        let (fa, fo) = (a.outgoing(now).remove(0).1, old.outgoing(now).remove(0).1);
+        let key = *c.key();
+        let env = |f: &[u8]| open(&key, &f[8..]).unwrap();
+        // nothing pinned: both taken, signed or not
+        assert_eq!(c.ingest(env(&fa), None, now).len() + c.ingest(env(&fo), None, now).len(), 2);
+        // a pinned, the unsigned node not: still taken unless signatures are required
+        let mut c = cluster("c", &k, vec![]);
+        pin(&mut c, &[("a", a.identity().unwrap().public())], false);
+        assert_eq!(c.ingest(env(&fa), None, now).len() + c.ingest(env(&fo), None, now).len(), 2);
+        let mut c = cluster("c", &k, vec![]);
+        pin(&mut c, &[("a", a.identity().unwrap().public())], true);
+        assert_eq!(c.ingest(env(&fa), None, now).len(), 1);
+        assert!(c.ingest(env(&fo), None, now).is_empty(), "unpinned, with require_signatures");
+        // a's key removed: a, though it still has the cluster key, is out
+        let mut c = cluster("c", &k, vec![]);
+        pin(&mut c, &[("b", Identity::generate().public())], true);
+        assert!(c.ingest(env(&fa), None, now).is_empty());
+        assert_eq!(c.view.refused_signature, 1);
+    }
+
+    /// Older nodes read facts with signatures (and ignore them); this one reads theirs.
+    #[test]
+    fn signatures_are_ignored_by_older_nodes() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldFact {
+            origin: String,
+            seq: u64,
+            created: Micros,
+            hops: u8,
+            #[serde(flatten)]
+            body: FactBody,
+        }
+        let now = time::now();
+        let mut a = signer("a", &generate_key(), vec![]);
+        a.originate(ban("10.7.7.7", now / SEC + 60), now);
+        let json = serde_json::to_string(&a.known.values().next().unwrap().fact).unwrap();
+        assert!(json.contains("\"sig\""));
+        let old: OldFact = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.body, ban("10.7.7.7", now / SEC + 60));
+        let unsigned: Fact =
+            serde_json::from_str(r#"{"origin":"x","seq":1,"created":1,"hops":0,"kind":"trust","ip":"192.0.2.1"}"#).unwrap();
+        assert!(unsigned.sig.is_empty());
+        assert!(!serde_json::to_string(&unsigned).unwrap().contains("sig"), "nothing new on the wire without a key");
+    }
+
+    /// A signed file is its sender's whatever peer it comes from; a forged one is refused.
+    #[test]
+    fn peer_files_are_signed() {
+        let key = decode_key(&generate_key()).unwrap();
+        let (vpn, other) = (Identity::generate(), Identity::generate());
+        let now = time::now();
+        let cfg = ClusterCfg { nodes: [("vpn".to_string(), vpn.public())].into(), ..Default::default() };
+        let keys = NodeKeys::new(&cfg).unwrap();
+        let env = |id: Option<&Identity>, from: &str| open(&key, &file_frame(&key, id, from, "abuse", b"{}", now).unwrap()[8..]).unwrap();
+        assert_eq!(file_signed(&keys, &env(Some(&vpn), "vpn")), Ok(true));
+        assert!(file_signed(&keys, &env(None, "vpn")).is_err(), "unsigned under a pinned name");
+        assert!(file_signed(&keys, &env(Some(&other), "vpn")).is_err(), "another node's key");
+        let mut tampered = env(Some(&vpn), "vpn");
+        tampered.file.as_mut().unwrap().name = "abuse-report".into();
+        assert!(file_signed(&keys, &tampered).is_err());
+        let late = Envelope { sent: now + SEC, ..env(Some(&vpn), "vpn") };
+        assert!(file_signed(&keys, &late).is_err(), "the time it was sent is signed too");
+        assert_eq!(file_signed(&keys, &env(None, "tg")), Ok(false), "unpinned: left to Senders");
+        let strict = NodeKeys { require: true, ..keys };
+        assert!(file_signed(&strict, &env(Some(&other), "tg")).is_err());
+    }
+
+    #[test]
+    fn identity_file_and_pinned_keys() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lg-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        let (id, new) = Identity::create(&path).unwrap();
+        assert!(new);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let (again, new) = Identity::create(&path).unwrap();
+        assert!(!new && again.public() == id.public(), "an existing key is kept");
+        let ok = ClusterCfg {
+            enabled: true,
+            node_id: "a".into(),
+            key: generate_key(),
+            identity_file: path.clone(),
+            nodes: [("a".to_string(), id.public()), ("b".to_string(), Identity::generate().public())].into(),
+            require_signatures: true,
+            ..Default::default()
+        };
+        ok.validate().unwrap();
+        let c = Cluster::new(&ok).unwrap();
+        assert_eq!(c.view.identity, id.public());
+        assert_eq!(c.view.pinned, 2);
+        let wrong_own = ClusterCfg { node_id: "b".into(), ..ok.clone() };
+        assert!(Cluster::new(&wrong_own).err().unwrap().to_string().contains("not the public key"));
+        let mut bad = ok.clone();
+        bad.nodes.insert("c".into(), "c2hvcnQ=".into());
+        assert!(bad.validate().is_err(), "short key");
+        bad = ok.clone();
+        bad.nodes.insert("c d".into(), id.public());
+        assert!(bad.validate().is_err(), "not a node name");
+        assert!(ClusterCfg { nodes: BTreeMap::new(), ..ok.clone() }.validate().is_err(), "require_signatures with no keys");
+        std::fs::write(&path, "not a key").unwrap();
+        assert!(Cluster::new(&ok).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

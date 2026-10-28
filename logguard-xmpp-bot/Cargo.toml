@@ -1,9 +1,10 @@
 [package]
 name = "logguard-xmpp-bot"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
-description = "XMPP chat bot exposing curated ejabberdctl commands"
+description = "XMPP bot for logguard: an admin bot exposing curated ejabberdctl commands, or a client bot sending logguard's admin messages OMEMO-encrypted, else as OpenPGP files"
 license = "MIT"
+repository = "https://github.com/makhort/Logguard"
 
 [dependencies]
 aes = { version = "0.8", features = ["zeroize"] }
@@ -23,8 +24,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 indexmap = { version = "2", features = ["serde"] }
 libc = "0.2"
 log = { version = "0.4", features = ["std"] }
+# OpenPGP for client mode's fallback (seal.rs, as the Signal and Matrix bots): pure Rust,
+# MIT/Apache; it takes rand 0.8's RNG traits
+pgp = { version = "0.21", default-features = false }
 prost = "0.14"
 rand = "0.9"
+rand08 = { package = "rand", version = "0.8" }
 rustls-native-certs = "0.8"
 sasl = "0.5"
 serde = { version = "1", features = ["derive"] }
@@ -42,3 +47,60 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The distribution packages (scripts/package.sh builds them with cargo-deb and
+# cargo-generate-rpm; README, "Install from a package"). The deploy files come from
+# target/package/stage/, where package.sh puts deploy/'s files; the maintainer scripts are
+# deploy/pkg/. Both tables list the same files.
+[package.metadata.deb]
+maintainer = "makhort <makhort@users.noreply.github.com>"
+copyright = "2026 The logguard contributors"
+license-file = ["target/package/stage/LICENSE", "0"]
+section = "admin"
+priority = "optional"
+depends = "systemd, ca-certificates"
+extended-description = """\
+logguard-xmpp-bot carries logguard's admin alerts, digests and abuse reports over XMPP, \
+OMEMO-encrypted. On the XMPP server (admin mode, as the user ejabberd) it also answers curated \
+ejabberdctl commands in chat; anywhere else (BOT_MODE=client, its own user) it only sends, with \
+OpenPGP-encrypted files as the fallback. It installs to /opt/logguard-xmpp-bot with config.env \
+from the template of the mode for this host; nothing is started until it is filled in."""
+maintainer-scripts = "deploy/pkg"
+assets = [
+    ["target/release/logguard-xmpp-bot", "opt/logguard-xmpp-bot/", "755"],
+    ["target/package/stage/config.env.example", "opt/logguard-xmpp-bot/", "644"],
+    ["target/package/stage/config-client.env.example", "opt/logguard-xmpp-bot/", "644"],
+    ["target/package/stage/logguard-xmpp-bot.service", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-xmpp-bot-client.service", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-xmpp-bot.logrotate", "usr/share/logguard-xmpp-bot/", "644"],
+    ["target/package/stage/ejabberd-logs.logrotate", "usr/share/logguard-xmpp-bot/", "644"],
+    ["README.md", "usr/share/doc/logguard-xmpp-bot/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "XMPP bot for logguard: ejabberd admin commands and OMEMO-encrypted admin messages"
+url = "https://github.com/makhort/Logguard"
+release = "1"
+auto-req = "no"
+post_install_script = "deploy/pkg/postinst"
+post_install_script_prog = ["/bin/bash"]
+pre_uninstall_script = "deploy/pkg/prerm"
+pre_uninstall_script_prog = ["/bin/bash"]
+post_uninstall_script = "deploy/pkg/postrm"
+post_uninstall_script_prog = ["/bin/bash"]
+assets = [
+    { source = "target/release/logguard-xmpp-bot", dest = "/opt/logguard-xmpp-bot/logguard-xmpp-bot", mode = "755" },
+    { source = "target/package/stage/config.env.example", dest = "/opt/logguard-xmpp-bot/config.env.example", mode = "644" },
+    { source = "target/package/stage/config-client.env.example", dest = "/opt/logguard-xmpp-bot/config-client.env.example", mode = "644" },
+    { source = "target/package/stage/logguard-xmpp-bot.service", dest = "/usr/lib/systemd/system/logguard-xmpp-bot.service", mode = "644" },
+    { source = "target/package/stage/logguard-xmpp-bot-client.service", dest = "/usr/lib/systemd/system/logguard-xmpp-bot-client.service", mode = "644" },
+    { source = "target/package/stage/logguard-xmpp-bot.logrotate", dest = "/usr/share/logguard-xmpp-bot/logguard-xmpp-bot.logrotate", mode = "644" },
+    { source = "target/package/stage/ejabberd-logs.logrotate", dest = "/usr/share/logguard-xmpp-bot/ejabberd-logs.logrotate", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/logguard-xmpp-bot/README.md", mode = "644", doc = true },
+    { source = "target/package/stage/LICENSE", dest = "/usr/share/doc/logguard-xmpp-bot/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+shadow-utils = "*"
+ca-certificates = "*"

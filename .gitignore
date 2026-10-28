@@ -19,3 +19,13 @@ logguard-mail-bot/target/
 
 # logguard-mail-bot's real settings hold the SMTP password; only config.env.example belongs here
 logguard-mail-bot/deploy/config.env
+logguard-signal-bot/target/
+logguard-matrix-bot/target/
+logguard-web/target/
+
+# the Signal and Matrix bots' real settings name the accounts; only config.env.example belongs here
+logguard-signal-bot/deploy/config.env
+logguard-matrix-bot/deploy/config.env
+
+# logguard-web's real settings name the nodes and consoles; only config.env.example belongs here
+logguard-web/deploy/config.env

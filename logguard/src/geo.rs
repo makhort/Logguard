@@ -30,6 +30,31 @@ pub struct GeoCfg {
     pub refresh: Dur,
     /// Download command; the URL is appended and the file is read from its stdout.
     pub fetch: Vec<String>,
+    /// Networks the database places in the wrong country, pinned to the right one: e.g.
+    /// `"198.51.100.0/24" = "GE"` (an ISO code, or a name like "Georgia"). The most specific
+    /// network wins. Places in alerts, bans, accounts' countries and the counters use it;
+    /// `[geoblock]` doesn't (its lists come from the database as it is).
+    pub places: std::collections::BTreeMap<String, String>,
+}
+
+impl GeoCfg {
+    pub fn validate(&self) -> Result<()> {
+        for (net, country) in &self.places {
+            net.parse::<Net>().map_err(|e| anyhow::anyhow!("[geo] places: '{net}': {e}"))?;
+            if parse_country(country).is_none() {
+                bail!("[geo] places: '{country}' is not a country (an ISO code like \"GE\", or a name like \"Georgia\")");
+            }
+        }
+        Ok(())
+    }
+
+    /// `places`, parsed (validated at load), most specific first.
+    fn pinned(&self) -> Vec<(Net, [u8; 2])> {
+        let mut v: Vec<(Net, [u8; 2])> =
+            self.places.iter().filter_map(|(n, c)| Some((n.parse::<Net>().ok()?, parse_country(c)?))).collect();
+        v.sort_by_key(|(n, _)| std::cmp::Reverse(n.prefix));
+        v
+    }
 }
 
 impl Default for GeoCfg {
@@ -44,6 +69,193 @@ impl Default for GeoCfg {
             fetch: ["curl", "-fsSL", "--proto-redir", "=https", "--max-time", "300", "--retry", "2", "--max-filesize", "200000000"]
                 .map(String::from)
                 .to_vec(),
+            places: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Dropping whole countries or networks (ASNs) by the same databases (`[geoblock]`): their
+/// address ranges, from what is loaded already, go into sets of their own in the firewall,
+/// next to the blocklist feeds. Lite databases misplace some addresses; this is coarse.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GeoblockCfg {
+    pub enabled: bool,
+    /// Countries whose addresses are dropped: ISO codes ("CN") or names as logguard spells
+    /// them ("China").
+    pub countries: Vec<String>,
+    /// Drop every other country's addresses: only these (and addresses the database places
+    /// nowhere) can reach the server. Together with `countries`, both apply.
+    pub only_countries: Vec<String>,
+    /// Networks (AS numbers) whose addresses are dropped, from the network database.
+    pub asns: Vec<u32>,
+    /// Refuse to load more networks than this (each is a set element in the kernel).
+    pub max_entries: usize,
+}
+
+impl Default for GeoblockCfg {
+    fn default() -> Self {
+        GeoblockCfg { enabled: false, countries: vec![], only_countries: vec![], asns: vec![], max_entries: 200_000 }
+    }
+}
+
+impl GeoblockCfg {
+    pub fn validate(&self, geo: &GeoCfg) -> Result<()> {
+        for c in self.countries.iter().chain(&self.only_countries) {
+            if parse_country(c).is_none() {
+                bail!("[geoblock]: '{c}' is not a country (an ISO code like \"CN\", or a name like \"China\")");
+            }
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.countries.is_empty() && self.only_countries.is_empty() && self.asns.is_empty() {
+            bail!("[geoblock] is enabled but lists no countries, only_countries or asns");
+        }
+        if !geo.enabled {
+            bail!("[geoblock] needs the [geo] databases: [geo] enabled = true");
+        }
+        if (!self.countries.is_empty() || !self.only_countries.is_empty()) && geo.country_url.is_empty() {
+            bail!("[geoblock] countries need the [geo] country database (country_url)");
+        }
+        if !self.asns.is_empty() && geo.asn_url.is_empty() {
+            bail!("[geoblock] asns need the [geo] network database (asn_url)");
+        }
+        if let Some(c) = self.only_countries.iter().find(|c| self.countries.iter().any(|b| parse_country(b) == parse_country(c))) {
+            bail!("[geoblock]: '{c}' is both blocked (countries) and the only one let in (only_countries)");
+        }
+        Ok(())
+    }
+
+    fn codes(list: &[String]) -> std::collections::BTreeSet<[u8; 2]> {
+        list.iter().filter_map(|c| parse_country(c)).collect()
+    }
+
+    /// The ISO codes of `countries` and of `only_countries`, sorted.
+    pub fn country_codes(&self) -> (Vec<String>, Vec<String>) {
+        let codes = |list: &[String]| Self::codes(list).iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+        (codes(&self.countries), codes(&self.only_countries))
+    }
+
+    /// "CN, RU; all but UA; 2 networks" for status lines.
+    pub fn describe(&self) -> String {
+        let show = |set: std::collections::BTreeSet<[u8; 2]>| {
+            set.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(", ")
+        };
+        let mut parts = Vec::new();
+        if !self.countries.is_empty() {
+            parts.push(show(Self::codes(&self.countries)));
+        }
+        if !self.only_countries.is_empty() {
+            parts.push(format!("all but {}", show(Self::codes(&self.only_countries))));
+        }
+        if !self.asns.is_empty() {
+            parts.push(format!("{} networks (ASNs)", self.asns.len()));
+        }
+        parts.join("; ")
+    }
+}
+
+/// What `[geoblock]` loaded, for status and the dashboard.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GeoblockStatus {
+    pub computed: crate::time::Micros,
+    /// `GeoblockCfg::describe`.
+    pub what: String,
+    pub v4: usize,
+    pub v6: usize,
+    /// In the firewall (false in shadow mode, with a backend without it, or on error).
+    pub applied: bool,
+    pub error: Option<String>,
+    /// The blocked countries' ISO codes (`countries`), and those of `only_countries` (every
+    /// other country is blocked), for the web console's map. Older daemons leave them out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub countries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only_countries: Vec<String>,
+    /// The blocked networks' AS numbers (`asns`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asns: Vec<u32>,
+}
+
+/// An ISO code ("cn", "CN") or a name as `country_name` spells it ("China"), any case.
+pub fn parse_country(s: &str) -> Option<[u8; 2]> {
+    let s = s.trim();
+    COUNTRIES.split('|').find_map(|e| {
+        let (code, name) = e.split_once(' ')?;
+        (code.len() == 2 && (code.eq_ignore_ascii_case(s) || name.eq_ignore_ascii_case(s)))
+            .then(|| [code.as_bytes()[0], code.as_bytes()[1]])
+    })
+}
+
+/// Sorted, merged intervals (touching ones join).
+fn merge_intervals(mut v: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    v.sort_unstable();
+    let mut out: Vec<(u128, u128)> = Vec::with_capacity(v.len());
+    for (lo, hi) in v {
+        match out.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// Intervals that come sorted by start (a database's ranges), merged as they come: only the
+/// merged ones are kept, not every range (all but one country is most of the database).
+fn merge_sorted(sorted: impl Iterator<Item = (u128, u128)>) -> Vec<(u128, u128)> {
+    let mut out: Vec<(u128, u128)> = Vec::new();
+    for (lo, hi) in sorted {
+        match out.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// `keep` (merged) cut out of `from` (merged).
+fn subtract_intervals(from: Vec<(u128, u128)>, keep: &[(u128, u128)]) -> Vec<(u128, u128)> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    for (mut lo, hi) in from {
+        while k < keep.len() && keep[k].1 < lo {
+            k += 1;
+        }
+        let mut j = k;
+        while lo <= hi {
+            match keep.get(j) {
+                Some(&(klo, khi)) if klo <= hi => {
+                    if klo > lo {
+                        out.push((lo, klo - 1));
+                    }
+                    match khi.checked_add(1) {
+                        Some(next) if khi < hi => lo = next,
+                        _ => break,
+                    }
+                    j += 1;
+                }
+                _ => {
+                    out.push((lo, hi));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A network as an interval of the databases' keys: IPv4 addresses, or IPv6 /64s (a
+/// network inside one /64 keeps all of it).
+fn key_interval(n: &Net) -> (bool, u128, u128) {
+    match n.addr {
+        IpAddr::V4(a) => {
+            let lo = u32::from(a);
+            (false, u128::from(lo), u128::from(lo | u32::MAX.checked_shr(u32::from(n.prefix)).unwrap_or(0)))
+        }
+        IpAddr::V6(a) => {
+            let lo = (u128::from(a) >> 64) as u64;
+            (true, u128::from(lo), u128::from(lo | u64::MAX.checked_shr(u32::from(n.prefix.min(64))).unwrap_or(0)))
         }
     }
 }
@@ -125,6 +337,8 @@ pub struct GeoDb {
     as4: Ranges<u32, AsVal>,
     as6: Ranges<u64, AsVal>,
     orgs: Vec<String>,
+    /// `[geo] places`: networks pinned to a country, most specific first.
+    places: Vec<(Net, [u8; 2])>,
     /// e.g. "country: 712345 ranges, network: 498765 ranges"
     pub summary: String,
 }
@@ -186,6 +400,16 @@ fn tidy_org(desc: &str) -> &str {
 }
 
 impl GeoDb {
+    /// Loads the databases in `[geo] dir` and pins its `places`.
+    pub fn open(cfg: &GeoCfg) -> Result<GeoDb> {
+        let mut db = GeoDb::load(&cfg.dir)?;
+        db.places = cfg.pinned();
+        if !db.places.is_empty() {
+            db.summary += &format!(", {} networks pinned by [geo] places", db.places.len());
+        }
+        Ok(db)
+    }
+
     /// Loads whichever of `<dir>/country.gz` and `<dir>/asn.gz` exist.
     pub fn load(dir: &Path) -> Result<GeoDb> {
         let mut db = GeoDb::default();
@@ -290,8 +514,10 @@ impl GeoDb {
                 (self.cc6.get(k), self.as6.get(k))
             }
         };
-        // Prefer the geolocated country; the network's registration country is a fallback.
-        let country = country.or(net.map(|n| n.0).filter(|c| *c != NO_CC));
+        // A pinned network first; then the geolocated country; the network's registration
+        // country is a fallback.
+        let pinned = self.places.iter().find(|(n, _)| n.contains(ip)).map(|(_, c)| *c);
+        let country = pinned.or(country).or(net.map(|n| n.0).filter(|c| *c != NO_CC));
         Geo { country, asn: net.map(|n| n.1), org: net.and_then(|n| self.orgs.get(n.2 as usize)).filter(|o| !o.is_empty()).cloned() }
     }
 
@@ -322,6 +548,43 @@ impl GeoDb {
                 // kept per /64: the upper 64 bits
                 for (a, p) in cidrs(u128::from(*lo), u128::from(*hi), 64) {
                     out.push(Net::new(IpAddr::V6((a << 64).into()), p));
+                }
+            }
+        }
+        out
+    }
+
+    /// The networks `[geoblock]` drops: the country ranges of `countries` (with
+    /// `only_countries`, of every other country) and the network ranges of `asns`, merged,
+    /// less `keep` (allowlisted networks, this host, the cluster peers) and special-purpose
+    /// ranges, cut out exactly; as few CIDRs as cover the rest.
+    pub fn blocked_networks(&self, cfg: &GeoblockCfg, keep: &[Net]) -> Vec<Net> {
+        let (block, only) = (GeoblockCfg::codes(&cfg.countries), GeoblockCfg::codes(&cfg.only_countries));
+        let blocked = |c: &[u8; 2]| block.contains(c) || (!only.is_empty() && !only.contains(c));
+        let asns: std::collections::BTreeSet<u32> = cfg.asns.iter().copied().collect();
+        let bogons: Vec<Net> = crate::feeds::BOGONS.iter().map(|b| b.parse().expect("valid bogon")).collect();
+        let mut out = Vec::new();
+        for v6 in [false, true] {
+            // each database's ranges are sorted and apart: merged while read, then together
+            let (countries, networks) = if v6 {
+                (
+                    merge_sorted(self.cc6.v.iter().filter(|r| blocked(&r.2)).map(|r| (u128::from(r.0), u128::from(r.1)))),
+                    merge_sorted(self.as6.v.iter().filter(|r| asns.contains(&r.2 .1)).map(|r| (u128::from(r.0), u128::from(r.1)))),
+                )
+            } else {
+                (
+                    merge_sorted(self.cc4.v.iter().filter(|r| blocked(&r.2)).map(|r| (u128::from(r.0), u128::from(r.1)))),
+                    merge_sorted(self.as4.v.iter().filter(|r| asns.contains(&r.2 .1)).map(|r| (u128::from(r.0), u128::from(r.1)))),
+                )
+            };
+            let ranges = if networks.is_empty() { countries } else { merge_intervals([countries, networks].concat()) };
+            let holes: Vec<(u128, u128)> =
+                keep.iter().chain(&bogons).map(key_interval).filter(|(is6, ..)| *is6 == v6).map(|(_, lo, hi)| (lo, hi)).collect();
+            for (lo, hi) in subtract_intervals(ranges, &merge_intervals(holes)) {
+                if v6 {
+                    out.extend(cidrs(lo, hi, 64).into_iter().map(|(a, p)| Net::new(IpAddr::V6((a << 64).into()), p)));
+                } else {
+                    out.extend(cidrs(lo, hi, 32).into_iter().map(|(a, p)| Net::new(IpAddr::V4((a as u32).into()), p)));
                 }
             }
         }
@@ -584,9 +847,9 @@ pub(crate) mod tests {
     pub(crate) fn sample() -> GeoDb {
         let mut db = GeoDb::default();
         let country = "0.0.0.0,0.255.255.255,ZZ\n1.0.0.0,1.0.0.255,AU\n5.9.0.0,5.9.127.255,DE\n5.9.128.0,5.9.255.255,DE\n\
-                       11.35.0.0,11.35.255.255,FI\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
+                       11.41.0.0,11.41.255.255,FI\n3fff:130::,3fff:130:ffff:ffff:ffff:ffff:ffff:ffff,DE\n";
         let asn = "1.0.0.0,1.0.0.255,13335,\"Cloudflare, Inc.\"\n5.9.0.0,5.9.255.255,24940,\"Hetzner Online GmbH\"\n\
-                   11.35.0.0,11.35.255.255,24940,\"Hetzner Online GmbH\"\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
+                   11.41.0.0,11.41.255.255,24940,\"Hetzner Online GmbH\"\n3fff:130::,3fff:130:ffff:ffff:ffff:ffff:ffff:ffff,24940,\"Hetzner Online GmbH\"\n";
         assert_eq!(db.read(country.as_bytes(), true).unwrap(), 4, "ZZ dropped, adjacent DE blocks merged");
         assert_eq!(db.read(asn.as_bytes(), false).unwrap(), 4);
         db
@@ -597,34 +860,58 @@ pub(crate) mod tests {
         let db = sample();
         let l = |ip: &str| db.label(ip.parse().unwrap());
         assert_eq!(l("5.9.200.1").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
-        assert_eq!(l("11.35.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
+        assert_eq!(l("11.41.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.0.1").as_deref(), Some("Australia / Cloudflare, Inc. (AS13335)"));
-        assert_eq!(l("3fff:100:1:2::3").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
+        assert_eq!(l("3fff:130:1:2::3").as_deref(), Some("Germany / Hetzner Online GmbH (AS24940)"));
         assert_eq!(l("1.0.1.1"), None);
         assert_eq!(l("0.1.2.3"), None);
-        assert_eq!(db.asn("11.35.3.4".parse().unwrap()), Some(24940));
+        assert_eq!(db.asn("11.41.3.4".parse().unwrap()), Some(24940));
+    }
+
+    #[test]
+    fn places_pin_misplaced_networks() {
+        let cfg = GeoCfg {
+            places: [("5.9.0.0/16", "GE"), ("5.9.1.0/24", "Armenia"), ("3fff:130:1::/48", "ge")]
+                .map(|(n, c)| (n.to_string(), c.to_string()))
+                .into(),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        let mut db = sample();
+        db.places = cfg.pinned();
+        let l = |ip: &str| db.label(ip.parse().unwrap());
+        assert_eq!(l("5.9.200.1").as_deref(), Some("Georgia / Hetzner Online GmbH (AS24940)"), "the owner stays");
+        assert_eq!(l("5.9.1.7").as_deref(), Some("Armenia / Hetzner Online GmbH (AS24940)"), "the most specific wins");
+        assert_eq!(l("3fff:130:1:2::3").as_deref(), Some("Georgia / Hetzner Online GmbH (AS24940)"));
+        assert_eq!(l("11.41.3.4").as_deref(), Some("Finland / Hetzner Online GmbH (AS24940)"), "others as the database says");
+        assert_eq!(l("1.0.1.1"), None);
+
+        let bad = |n: &str, c: &str| GeoCfg { places: [(n.to_string(), c.to_string())].into(), ..Default::default() }.validate();
+        assert!(bad("5.9.0.0/16", "Atlantis").unwrap_err().to_string().contains("not a country"));
+        assert!(bad("5.9.0.0/33", "GE").is_err());
+        assert!(bad("example.org", "GE").is_err());
     }
 
     #[test]
     fn one_network() {
         let mut db = GeoDb::default();
-        let asn = "11.17.56.0,11.17.57.255,64501,\"Other\"\n11.17.58.0,11.17.59.127,64500,\"Provider\"\n\
-                   11.17.59.128,11.17.63.255,64500,\"Provider (DE)\"\n3fff:100::,3fff:100:0:ffff:ffff:ffff:ffff:ffff,24940,\"H\"\n\
-                   3fff:100:1::,3fff:100:1:ffff:ffff:ffff:ffff:ffff,64502,\"V\"\n";
+        let asn = "11.20.56.0,11.20.57.255,64501,\"Other\"\n11.20.58.0,11.20.59.127,64500,\"Provider\"\n\
+                   11.20.59.128,11.20.63.255,64500,\"Provider (DE)\"\n3fff:130::,3fff:130:0:ffff:ffff:ffff:ffff:ffff,24940,\"H\"\n\
+                   3fff:130:1::,3fff:130:1:ffff:ffff:ffff:ffff:ffff,64502,\"V\"\n";
         db.read(asn.as_bytes(), false).unwrap();
         let one = |n: &str| db.one_network(&n.parse().unwrap());
-        assert!(one("11.17.58.0/23") && one("11.17.60.0/22"), "one ASN over several ranges");
-        assert!(!one("11.17.56.0/22") && !one("11.17.0.0/16"), "two providers");
-        assert!(one("11.17.57.7") && one("11.18.0.0/16"), "unknown addresses don't count");
-        assert!(one("3fff:100::/48") && one("3fff:100:0:5::/64") && !one("3fff:100::/47"));
-        assert!(GeoDb::default().one_network(&"11.17.0.0/16".parse().unwrap()), "no network database");
+        assert!(one("11.20.58.0/23") && one("11.20.60.0/22"), "one ASN over several ranges");
+        assert!(!one("11.20.56.0/22") && !one("11.20.0.0/16"), "two providers");
+        assert!(one("11.20.57.7") && one("11.21.0.0/16"), "unknown addresses don't count");
+        assert!(one("3fff:130::/48") && one("3fff:130:0:5::/64") && !one("3fff:130::/47"));
+        assert!(GeoDb::default().one_network(&"11.20.0.0/16".parse().unwrap()), "no network database");
     }
 
     #[test]
     fn networks_of_asns() {
         let db = sample();
         let nets: Vec<String> = db.networks_of(&[24940].into_iter().collect()).iter().map(|n| n.to_string()).collect();
-        assert_eq!(nets, ["5.9.0.0/16", "11.35.0.0/16", "3fff:100::/32"]);
+        assert_eq!(nets, ["5.9.0.0/16", "11.41.0.0/16", "3fff:130::/32"]);
         assert!(db.networks_of(&[64999].into_iter().collect()).is_empty());
     }
 
@@ -665,5 +952,120 @@ pub(crate) mod tests {
         assert_eq!(country_name(b"QQ"), "unknown country");
         // 2026-01-15: current and previous month
         assert_eq!(months(20_468 * 86_400 * crate::time::SEC), ["2026-01".to_string(), "2025-12".to_string()]);
+    }
+
+    #[test]
+    fn countries_by_code_or_name() {
+        assert_eq!(parse_country("CN"), Some(*b"CN"));
+        assert_eq!(parse_country(" cn "), Some(*b"CN"));
+        assert_eq!(parse_country("china"), Some(*b"CN"));
+        assert_eq!(parse_country("Côte d'Ivoire"), Some(*b"CI"));
+        assert_eq!(parse_country("XX"), None);
+        assert_eq!(parse_country("Chin"), None);
+    }
+
+    #[test]
+    fn intervals() {
+        assert_eq!(merge_intervals(vec![(5, 9), (1, 3), (4, 4), (12, 20), (15, 16)]), [(1, 9), (12, 20)], "touching ones join");
+        assert_eq!(subtract_intervals(vec![(1, 20)], &[(5, 6), (10, 10), (20, 30)]), [(1, 4), (7, 9), (11, 19)]);
+        assert_eq!(subtract_intervals(vec![(1, 4), (8, 9)], &[(0, 100)]), []);
+        assert_eq!(subtract_intervals(vec![(1, 4), (8, 9)], &[(5, 7)]), [(1, 4), (8, 9)]);
+        assert_eq!(subtract_intervals(vec![(0, u128::MAX)], &[(u128::MAX, u128::MAX)]), [(0, u128::MAX - 1)]);
+    }
+
+    #[test]
+    fn geoblock_networks() {
+        let mut db = GeoDb::default();
+        let country = "1.0.0.0,1.0.0.255,AU\n1.0.1.0,1.0.3.255,CN\n1.0.4.0,1.0.7.255,CN\n1.0.8.0,1.0.15.255,CN\n\
+                       1.0.16.0,1.0.16.255,JP\n10.0.0.0,10.255.255.255,CN\n\
+                       3fff:110::,3fff:110:ffff:ffff:ffff:ffff:ffff:ffff,CN\n3fff:100::,3fff:100:ffff:ffff:ffff:ffff:ffff:ffff,JP\n";
+        let asn = "1.0.0.0,1.0.0.255,13335,\"Cloudflare, Inc.\"\n1.0.16.0,1.0.16.255,2497,\"IIJ\"\n";
+        db.read(country.as_bytes(), true).unwrap();
+        db.read(asn.as_bytes(), false).unwrap();
+        let cfg = |countries: &[&str], only: &[&str], asns: &[u32]| GeoblockCfg {
+            enabled: true,
+            countries: countries.iter().map(|c| c.to_string()).collect(),
+            only_countries: only.iter().map(|c| c.to_string()).collect(),
+            asns: asns.to_vec(),
+            ..Default::default()
+        };
+        let names = |nets: Vec<Net>| nets.iter().map(Net::to_string).collect::<Vec<_>>();
+        // CN's three adjacent ranges as few CIDRs; 10/8 is private and never blocked; IPv6 per /64
+        assert_eq!(
+            names(db.blocked_networks(&cfg(&["China"], &[], &[]), &[])),
+            ["1.0.1.0/24", "1.0.2.0/23", "1.0.4.0/22", "1.0.8.0/21", "3fff:110::/32"]
+        );
+        // a protected address inside is cut out exactly, not the whole block
+        let kept = db.blocked_networks(&cfg(&["CN"], &[], &[]), &["1.0.2.5".parse().unwrap(), "3fff:110:0:7::1".parse().unwrap()]);
+        assert!(kept.iter().all(|n| !n.contains("1.0.2.5".parse().unwrap())), "{kept:?}");
+        for still in ["1.0.2.4", "1.0.2.6", "1.0.1.1", "1.0.15.255"] {
+            assert!(kept.iter().any(|n| n.contains(still.parse().unwrap())), "{still}: {kept:?}");
+        }
+        assert!(kept.iter().all(|n| !n.contains("3fff:110:0:7::abcd".parse().unwrap())), "its whole /64 is kept");
+        assert!(kept.iter().any(|n| n.contains("3fff:110:0:8::1".parse().unwrap())));
+        // all but AU: CN and JP, and the ranges in between merge into larger blocks
+        assert_eq!(
+            names(db.blocked_networks(&cfg(&[], &["AU"], &[]), &[])),
+            ["1.0.1.0/24", "1.0.2.0/23", "1.0.4.0/22", "1.0.8.0/21", "1.0.16.0/24", "3fff:100::/32", "3fff:110::/32"]
+        );
+        // networks by ASN, together with countries
+        assert_eq!(names(db.blocked_networks(&cfg(&[], &[], &[13335]), &[])), ["1.0.0.0/24"]);
+        assert_eq!(names(db.blocked_networks(&cfg(&["JP"], &[], &[13335]), &[])), ["1.0.0.0/24", "1.0.16.0/24", "3fff:100::/32"]);
+        assert!(db.blocked_networks(&cfg(&[], &[], &[64999]), &[]).is_empty());
+        assert_eq!(cfg(&["China", "ru"], &["UA"], &[1, 2]).describe(), "CN, RU; all but UA; 2 networks (ASNs)");
+        // for the web console's map: codes, whatever the spelling
+        assert_eq!(
+            cfg(&["ru", "China", "CN"], &["Ukraine"], &[]).country_codes(),
+            (vec!["CN".to_string(), "RU".into()], vec!["UA".to_string()])
+        );
+    }
+
+    #[test]
+    fn geoblock_config() {
+        let geo = GeoCfg { enabled: true, ..Default::default() };
+        let c = |toml: &str| toml::from_str::<GeoblockCfg>(toml).unwrap();
+        assert!(c("enabled = true\ncountries = [\"CN\", \"Russia\"]").validate(&geo).is_ok());
+        assert!(c("countries = [\"Narnia\"]").validate(&geo).unwrap_err().to_string().contains("Narnia"), "checked even while disabled");
+        assert!(c("enabled = true").validate(&geo).is_err(), "nothing listed");
+        assert!(c("enabled = true\nasns = [13335]").validate(&GeoCfg::default()).is_err(), "[geo] off");
+        assert!(c("enabled = true\nasns = [13335]").validate(&GeoCfg { asn_url: String::new(), ..geo.clone() }).is_err());
+        assert!(c("enabled = true\ncountries = [\"CN\"]\nonly_countries = [\"china\"]").validate(&geo).is_err(), "both");
+        assert_eq!(GeoblockCfg::default().max_entries, 200_000);
+    }
+
+    /// Sizes on the real databases (`LOGGUARD_GEO_DIR=<dir with country.gz, asn.gz>
+    /// cargo test --release real_geoblock_sizes -- --ignored --nocapture`). With `LOAD_ONLY=1`
+    /// it stops after loading: the peak memory of both runs (`/usr/bin/time -l` on the test
+    /// binary) tells the computation's share from the database's.
+    #[test]
+    #[ignore]
+    fn real_geoblock_sizes() {
+        let dir = std::env::var("LOGGUARD_GEO_DIR").expect("LOGGUARD_GEO_DIR");
+        let db = GeoDb::load(Path::new(&dir)).unwrap();
+        println!("{}", db.summary);
+        if std::env::var_os("LOAD_ONLY").is_some() {
+            return;
+        }
+        let cases: [(&[&str], &[&str], &[u32]); 6] = [
+            (&["CN"], &[], &[]),
+            (&["RU"], &[], &[]),
+            (&["US"], &[], &[]),
+            (&["CN", "RU", "IR", "KP"], &[], &[]),
+            (&[], &["UA"], &[]),
+            (&[], &[], &[13335, 16509]),
+        ];
+        for (countries, only, asns) in cases {
+            let cfg = GeoblockCfg {
+                enabled: true,
+                countries: countries.iter().map(|c| c.to_string()).collect(),
+                only_countries: only.iter().map(|c| c.to_string()).collect(),
+                asns: asns.to_vec(),
+                ..Default::default()
+            };
+            let start = std::time::Instant::now();
+            let nets = db.blocked_networks(&cfg, &[]);
+            let v4 = nets.iter().filter(|n| n.is_v4()).count();
+            println!("{:<40} {v4:>7} IPv4 + {:>6} IPv6 networks in {:?}", cfg.describe(), nets.len() - v4, start.elapsed());
+        }
     }
 }

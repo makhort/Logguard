@@ -1462,7 +1462,7 @@ fn health_lines(s: &Snapshot, cert_warn_days: i64) -> Vec<Line<'static>> {
             Firewall::Absent if !r.firewall_checked() => add("Firewall", warn, r.firewall_summary()),
             Firewall::Absent => add("Firewall", bad.bold(), format!("{}: every public listener is reachable", r.firewall_summary())),
             Firewall::Nftables => add("Firewall", Style::new(), r.firewall_summary()),
-            Firewall::Ufw | Firewall::Iptables => add("Firewall", ok, r.firewall_summary()),
+            Firewall::Ufw | Firewall::Firewalld | Firewall::Iptables => add("Firewall", ok, r.firewall_summary()),
         }
     }
     if let Some(c) = &s.cluster {
@@ -1486,6 +1486,24 @@ fn health_lines(s: &Snapshot, cert_warn_days: i64) -> Vec<Line<'static>> {
                 let applied = if fd.applied { "" } else { ", not applied" };
                 add("Feeds", ok, format!("{} networks, refreshed {}{applied}", grouped((fd.v4 + fd.v6) as u64), ago(now, t)));
             }
+        }
+    }
+    if let Some(w) = &s.waf {
+        let problems = w.problems();
+        let bans: usize = w.sources.iter().map(|x| x.banned).sum();
+        let list = w.list_v4 + w.list_v6;
+        let list = if list > 0 {
+            format!(", {} listed{}", grouped(list as u64), if w.applied { "" } else { " (not applied)" })
+        } else {
+            String::new()
+        };
+        match problems.first() {
+            Some(p) => add(
+                "WAF",
+                bad,
+                format!("{p}{}", if problems.len() > 1 { format!(" (+{} more)", problems.len() - 1) } else { String::new() }),
+            ),
+            None => add("WAF", ok, format!("{} sources, {bans} bans{list}, read {}", w.sources.len(), ago(now, w.refreshed))),
         }
     }
     if !s.certs.is_empty() {
@@ -1556,9 +1574,21 @@ fn health_lines(s: &Snapshot, cert_warn_days: i64) -> Vec<Line<'static>> {
         };
         add("Patches", style, p.summary());
     }
+    if let Some(a) = &s.ssh_audit {
+        let style = match a.worst() {
+            Some(crate::engine::Severity::High | crate::engine::Severity::Critical) => Style::new().fg(Color::LightRed),
+            Some(crate::engine::Severity::Warning) => warn,
+            _ => ok,
+        };
+        add("SSH", style, a.summary());
+    }
     if let Some(v) = &s.verify {
         let style = if v.mismatched > 0 { warn } else { ok };
-        add("Packages", style, format!("{} differ from dpkg, {} set-uid; checked {}", v.mismatched, v.suid, ago(now, v.last_run)));
+        add(
+            "Packages",
+            style,
+            format!("{} differ from their packages, {} set-uid; checked {}", v.mismatched, v.suid, ago(now, v.last_run)),
+        );
     }
     if let Some(p) = &s.procwatch {
         let text = if p.learning_until > now {
@@ -2265,7 +2295,7 @@ fn draw_exposure(f: &mut Frame, area: Rect, app: &mut App, s: &Snapshot) {
             "nftables",
             vec!["nftables filters incoming traffic with rules of its own, which logguard doesn't read: listeners on public addresses are shown as reachable."],
         )),
-        Firewall::Ufw | Firewall::Iptables => None,
+        Firewall::Ufw | Firewall::Firewalld | Firewall::Iptables => None,
     };
     let warning = warning.map(|(style, title, text)| (style, title, text.into_iter().map(Line::from).collect::<Vec<Line>>()));
     let warning_h = warning.as_ref().map_or(0, |(_, _, lines)| wrapped_height(lines, area.width.saturating_sub(2)).saturating_add(2));
@@ -2280,7 +2310,7 @@ fn draw_exposure(f: &mut Frame, area: Rect, app: &mut App, s: &Snapshot) {
     }
     if dead > 0 {
         let lines: Vec<Line> =
-            r.dead_rules.iter().map(|d| Line::from(format!("ufw allows {d} from anywhere, but nothing listens there"))).collect();
+            r.dead_rules.iter().map(|d| Line::from(format!("{} allows {d} from anywhere, but nothing listens there", fw.name()))).collect();
         f.render_widget(Paragraph::new(lines).style(Style::new().fg(Color::Yellow)).block(block("Dead firewall rules")), dead_area);
     }
     let mut listeners = crate::exposure::for_display(&r.listeners);
@@ -2600,10 +2630,10 @@ mod tests {
     fn sample() -> Snapshot {
         let mut pipe = Pipeline::new(Arc::new(Config::default()), 0);
         let mut years = YearGuess::new(2026);
-        for (i, ip) in ["11.49.40.218", "11.49.40.218", "11.49.40.218", "9.9.9.9"].iter().enumerate() {
+        for (i, ip) in ["11.57.40.218", "11.57.40.218", "11.57.40.218", "9.9.9.9"].iter().enumerate() {
             let pid = format!("0.{i}.0");
             for line in [
-                format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.000 [info] (#PID<{pid}>) Accepted connection [::ffff:{ip}]:1 -> [::ffff:11.24.39.236]:5223"),
+                format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.000 [info] (#PID<{pid}>) Accepted connection [::ffff:{ip}]:1 -> [::ffff:11.29.39.236]:5223"),
                 format!("Aug 16 21:53:5{i} h ejabberdctl[1]: 2026-08-16 21:53:5{i}.100 [info] (tls|<{pid}>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000102:SSL routines::unsupported protocol"),
             ] {
                 pipe.feed(&parse_syslog_line(&line, &mut years).unwrap());
@@ -2702,8 +2732,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("11.49.40.218") && text.contains("banned "), "{text}");
-        assert!(!text.contains("banned 11.49.40.218"), "a host ban doesn't repeat the address");
+        assert!(text.contains("11.57.40.218") && text.contains("banned "), "{text}");
+        assert!(!text.contains("banned 11.57.40.218"), "a host ban doesn't repeat the address");
         assert!(text.contains("xmpp ENFORCE") || text.contains("xmpp SHADOW"), "node and mode in the footer");
 
         // commands need the daemon; a saved snapshot says so before asking anything
@@ -2715,10 +2745,10 @@ mod tests {
         app.start_unban();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("Unban 11.49.40.218") && text.contains("Active bans"), "confirm dialog over the list");
+        assert!(text.contains("Unban 11.57.40.218") && text.contains("Active bans"), "confirm dialog over the list");
         app.modal_key(KeyCode::Char('y'));
-        assert_eq!(app.outbox, ["unban 11.49.40.218"], "sent from the background thread, not the key handler");
-        assert_eq!(app.flash.as_ref().map(|f| f.text.as_str()), Some("sent: unban 11.49.40.218"));
+        assert_eq!(app.outbox, ["unban 11.57.40.218"], "sent from the background thread, not the key handler");
+        assert_eq!(app.flash.as_ref().map(|f| f.text.as_str()), Some("sent: unban 11.57.40.218"));
         let cmd = app.outbox.remove(0);
         let socket = std::env::temp_dir().join("logguard-no-such-socket");
         app.replied(&cmd, crate::daemon::control_command(&socket, &cmd));
@@ -2859,12 +2889,12 @@ mod tests {
         app.switch(1);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("11.49.40.218 ") && text.contains("9.9.9.9"), "whole addresses: {text}");
+        assert!(text.contains("11.57.40.218 ") && text.contains("9.9.9.9"), "whole addresses: {text}");
         assert!(text.contains("2Offenders"), "current tab named");
         let ips = |app: &App| offender_rows(app, app.snap.as_ref().unwrap()).iter().map(|v| v.ip.to_string()).collect::<Vec<_>>();
         let by_danger = ips(&app);
         press(&mut app, "oo");
-        assert_eq!(ips(&app), ["9.9.9.9", "11.49.40.218"], "sorted by address");
+        assert_eq!(ips(&app), ["9.9.9.9", "11.57.40.218"], "sorted by address");
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert!(screen(&term).contains("· by address"));
         press(&mut app, "o");
@@ -2887,7 +2917,7 @@ mod tests {
         assert!(app.editing);
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&term);
-        assert!(text.contains("filter: 9.9") && text.contains("(1 of 2 match \"9.9\")") && !text.contains("11.49.40.218"), "{text}");
+        assert!(text.contains("filter: 9.9") && text.contains("(1 of 2 match \"9.9\")") && !text.contains("11.57.40.218"), "{text}");
         app.key(KeyEvent::from(KeyCode::Enter));
         assert!(!app.editing && app.filter == "9.9");
         assert!(app.key(KeyEvent::from(KeyCode::Char('q'))), "q quits once the filter is typed");

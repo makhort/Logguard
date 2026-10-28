@@ -52,7 +52,7 @@ if command -v "$SCANNER" > /dev/null; then
     TZ=UTC "$SCANNER" "${args[@]}" "${targets[@]}" 2>&1 | sed -u 's/^/  /' >> "$LOG"
     rc=${PIPESTATUS[0]}
 else
-    echo "logguard-avscan: $SCANNER not found (apt install clamav clamav-freshclam)" >> "$LOG"
+    echo "logguard-avscan: $SCANNER not found (apt install clamav clamav-freshclam, or dnf install clamav clamav-update)" >> "$LOG"
     rc=127
 fi
 echo "logguard-avscan end $(now) exit=$rc" >> "$LOG"

@@ -23,19 +23,65 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
-    /// nftables, falling back to UFW, then to iptables, if nftables can't be set up.
+    /// nftables, falling back to firewalld (where it runs), UFW, then iptables, if nftables
+    /// can't be set up.
     Auto,
     Nft,
+    /// firewalld's own objects (Fedora, RHEL): ipsets bound to a drop zone of logguard's.
+    Firewalld,
     Ufw,
     /// iptables and ip6tables (legacy or nf_tables flavour; works next to
     /// iptables-persistent): a chain of our own in the mangle table's PREROUTING.
     Iptables,
+    /// iptables chains as with `iptables`, matching ipset sets: bans expire in the kernel and
+    /// blocklist feeds work, with one rule however many addresses.
+    Ipset,
+}
+
+/// The host's package manager: whose database the package checks read (`[cron]` origins,
+/// `[verify]`) and which tool lists pending updates (`[patches]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    /// dpkg and apt: Debian, Ubuntu.
+    #[default]
+    #[serde(alias = "dpkg")]
+    Apt,
+    /// rpm and dnf: Fedora, RHEL and its rebuilds (AlmaLinux, Rocky).
+    #[serde(alias = "rpm")]
+    Dnf,
+}
+
+impl PackageManager {
+    /// The package database, as alerts name it.
+    pub fn db(self) -> &'static str {
+        match self {
+            PackageManager::Apt => "dpkg",
+            PackageManager::Dnf => "rpm",
+        }
+    }
+
+    pub fn upgrade_command(self) -> &'static str {
+        match self {
+            PackageManager::Apt => "apt upgrade",
+            PackageManager::Dnf => "dnf upgrade",
+        }
+    }
+
+    pub fn reinstall_command(self) -> &'static str {
+        match self {
+            PackageManager::Apt => "apt install --reinstall <package>",
+            PackageManager::Dnf => "dnf reinstall <package>",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub mode: Mode,
+    /// "apt" (dpkg's database) or "dnf" (rpm's).
+    pub package_manager: PackageManager,
     pub sources: SourcesCfg,
     pub ports: PortsCfg,
     pub state_file: PathBuf,
@@ -53,8 +99,14 @@ pub struct Config {
     pub notify: crate::notify::NotifyCfg,
     pub exposure: crate::exposure::ExposureCfg,
     pub cluster: crate::cluster::ClusterCfg,
-    pub nextcloud: NextcloudCfg,
+    /// The read-only socket for logguard-web, the web console.
+    pub console: crate::console::ConsoleCfg,
+    /// Where Nextcloud AIO's logs are (`[nextcloud_aio]`; `[nextcloud]` until 2026-10-26).
+    #[serde(alias = "nextcloud")]
+    pub nextcloud_aio: NextcloudCfg,
     pub feeds: crate::feeds::FeedsCfg,
+    /// Addresses WAFs and other security apps block (CrowdSec, ...), enforced here.
+    pub waf: crate::waf::WafCfg,
     pub digest: crate::digest::DigestCfg,
     pub canary: CanaryCfg,
     pub silence: SilenceCfg,
@@ -62,6 +114,8 @@ pub struct Config {
     pub ratelimit: Vec<RateLimitCfg>,
     /// Offline country / network-owner labels for addresses.
     pub geo: crate::geo::GeoCfg,
+    /// Whole countries or networks (ASNs) dropped, by the `[geo]` databases.
+    pub geoblock: crate::geo::GeoblockCfg,
     /// New or changed cron jobs, systemd timers and the scripts they run.
     pub cron: crate::cronwatch::CronCfg,
     /// Results of scheduled ClamAV scans.
@@ -75,8 +129,17 @@ pub struct Config {
     pub verify: crate::verify::VerifyCfg,
     /// New outbound connections and programs running from temporary or deleted files.
     pub procwatch: crate::procwatch::ProcCfg,
+    /// sshd's effective settings checked against good practice and this host's layout
+    /// (plain VPS, hosting panel, or a harden-vps.sh-style gateway).
+    pub ssh_audit: crate::sshaudit::SshAuditCfg,
     /// Log lines of your own to score (`[[patterns]]`).
     pub patterns: Vec<crate::parse::custom::PatternCfg>,
+    /// The built-in patterns of `[sources] apps`, where their logs are on this host.
+    #[serde(skip)]
+    pub app_patterns: Vec<crate::parse::custom::PatternCfg>,
+    /// Where each of their logs is, one line each, for the daemon's start.
+    #[serde(skip)]
+    pub app_logs_found: Vec<String>,
 }
 
 /// Which logs to analyse. Disable ejabberd on hosts without an XMPP server.
@@ -86,13 +149,29 @@ pub struct SourcesCfg {
     pub ejabberd: bool,
     pub ssh: bool,
     pub ufw: bool,
-    /// Nextcloud AIO: probes in Apache's error log and failed logins (see `[nextcloud]`).
-    pub nextcloud: bool,
+    /// Nextcloud AIO: probes in Apache's error log and failed logins (see `[nextcloud_aio]`). A
+    /// Nextcloud without AIO is an app (`apps = ["nextcloud"]`). Called `nextcloud` until
+    /// 2026-10-26, which is still read.
+    #[serde(alias = "nextcloud")]
+    pub nextcloud_aio: bool,
     /// Alert when the kernel kills a process for lack of memory (from the kernel log).
     pub oom: bool,
     /// `su` and `sudo`: failed attempts (someone holds an account's key or password) and
     /// switches after them, as alerts.
     pub privilege: bool,
+    /// PAM and the account tools: failed logins at the console, a desktop, polkit or Cockpit
+    /// (alerts), failed logins from the internet at services without a parser of their own
+    /// (scored), locked accounts, changed passwords, new accounts and admin group members.
+    pub pam: bool,
+    /// The audit log (the journal's audit records, or `audit_log`): the same changes as
+    /// the kernel records them, auditd stopped or auditing switched off, and `audit_keys`.
+    pub audit: bool,
+    /// auditd's log file, instead of the journal's audit records (for a journald with
+    /// `Audit=no`); empty: the journal.
+    pub audit_log: PathBuf,
+    /// Audit rule keys (`auditctl -k identity`) to alert about when one of their rules
+    /// fires; `"*"` for every key.
+    pub audit_keys: Vec<String>,
     /// systemd services to alert about when they fail (any unsuccessful end: a non-zero
     /// exit, a signal, a timeout, ...) and are not started again within
     /// `service_restart_grace`, or when systemd gives up restarting them. E.g.
@@ -101,6 +180,15 @@ pub struct SourcesCfg {
     /// How long after a failure systemd (`Restart=`, after `RestartSec`) or anyone else may
     /// start the service again before it counts as down.
     pub service_restart_grace: Dur,
+    /// Built-in sources for common services (`parse::apps`): "apache", "nginx", "haproxy",
+    /// "prosody", "nextcloud" (without AIO), "owncloud" (10), "mysql" (MariaDB too),
+    /// "postgresql", "mongodb", "redis" (Valkey, KeyDB too), "postfix", "dovecot".
+    pub apps: Vec<String>,
+    /// Where an app's log is when not in the usual places: `nginx_access = ["/srv/a.log"]`
+    /// (absolute paths, `*` in a file name) or `mysql = "mariadb.service"` (its journal).
+    pub app_logs: BTreeMap<String, crate::parse::apps::Logs>,
+    /// Points of a built-in pattern instead of its default: `nginx_limit = 0`.
+    pub app_weights: BTreeMap<String, f64>,
 }
 
 impl Default for SourcesCfg {
@@ -109,11 +197,18 @@ impl Default for SourcesCfg {
             ejabberd: true,
             ssh: true,
             ufw: true,
-            nextcloud: false,
+            nextcloud_aio: false,
             oom: true,
             privilege: true,
+            pam: true,
+            audit: true,
+            audit_log: PathBuf::new(),
+            audit_keys: vec![],
             services: vec![],
             service_restart_grace: Dur(120),
+            apps: vec![],
+            app_logs: BTreeMap::new(),
+            app_weights: BTreeMap::new(),
         }
     }
 }
@@ -125,10 +220,12 @@ impl SourcesCfg {
             Source::Ssh => self.ssh,
             Source::Ufw => self.ufw,
             Source::Peer => true,
-            Source::Nextcloud => self.nextcloud,
+            Source::Nextcloud => self.nextcloud_aio,
             Source::Kernel => self.oom,
             Source::Systemd => !self.services.is_empty(),
             Source::Privilege => self.privilege,
+            Source::Auth => self.pam,
+            Source::Audit => self.audit,
             // only lines a pattern of your own matches count (`parse::custom`)
             Source::Custom => true,
         }
@@ -299,7 +396,8 @@ pub struct CanaryCfg {
     /// SSH user names; `"*"` = every name not listed in `except` (for key-only servers
     /// that admit exactly one user).
     pub ssh: Vec<String>,
-    /// Nextcloud login names.
+    /// Nextcloud and ownCloud login names: for Nextcloud AIO (`[sources] nextcloud_aio`)
+    /// and the apps "nextcloud" and "owncloud".
     pub nextcloud: Vec<String>,
     /// Names that are never canaries, whatever the lists above say (your real accounts).
     pub except: Vec<String>,
@@ -326,7 +424,14 @@ impl CanaryCfg {
             Source::Ejabberd => &self.xmpp,
             Source::Ssh => &self.ssh,
             Source::Nextcloud => &self.nextcloud,
-            Source::Ufw | Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Custom => return false,
+            Source::Ufw
+            | Source::Peer
+            | Source::Kernel
+            | Source::Systemd
+            | Source::Privilege
+            | Source::Auth
+            | Source::Audit
+            | Source::Custom => return false,
         };
         !list.is_empty() && Self::listed(list, name, &self.except)
     }
@@ -353,12 +458,18 @@ pub struct SilenceCfg {
     pub ejabberd: Dur,
     pub ssh: Dur,
     pub ufw: Dur,
-    pub nextcloud: Dur,
+    /// Nextcloud AIO (`nextcloud` until 2026-10-26).
+    #[serde(alias = "nextcloud")]
+    pub nextcloud_aio: Dur,
     /// Alert when a source keeps logging (at least `blind_lines` lines) but none of it
     /// could be tied to an address for this long: e.g. ejabberd hiding client IPs or
     /// a changed log format.
     pub blind_after: Dur,
     pub blind_lines: u64,
+    /// Logs of `[sources] apps` (their keys in `[sources.app_logs]`) to alert about when no
+    /// line arrives for this long: `nginx_access = "2h"`, `nextcloud = "7d"`. None by
+    /// default: how long a healthy one can stay quiet depends on the service.
+    pub apps: BTreeMap<String, Dur>,
 }
 
 impl Default for SilenceCfg {
@@ -368,9 +479,10 @@ impl Default for SilenceCfg {
             ejabberd: Dur(6 * 3600),
             ssh: Dur(2 * 86_400),
             ufw: Dur(2 * 3600),
-            nextcloud: Dur(0),
+            nextcloud_aio: Dur(0),
             blind_after: Dur(6 * 3600),
             blind_lines: 200,
+            apps: BTreeMap::new(),
         }
     }
 }
@@ -381,8 +493,8 @@ impl SilenceCfg {
             Source::Ejabberd => self.ejabberd,
             Source::Ssh => self.ssh,
             Source::Ufw => self.ufw,
-            Source::Nextcloud => self.nextcloud,
-            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Custom => Dur(0),
+            Source::Nextcloud => self.nextcloud_aio,
+            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Auth | Source::Audit | Source::Custom => Dur(0),
         }
     }
 }
@@ -418,7 +530,8 @@ impl RateLimitCfg {
     }
 }
 
-/// Where Nextcloud AIO's logs are read from (only with `[sources] nextcloud = true`).
+/// Where Nextcloud AIO's logs are read from (`[nextcloud_aio]`, only with `[sources]
+/// nextcloud_aio = true`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NextcloudCfg {
@@ -582,14 +695,18 @@ pub struct EnforceCfg {
     pub ufw: PathBuf,
     pub iptables: PathBuf,
     pub ip6tables: PathBuf,
-    /// Name of logguard's chains in the mangle table (`<name>` and `<name>-ban`).
+    /// Name of logguard's chains in the mangle table (`<name>` and `<name>-ban`), and with
+    /// the ipset backend the start of its sets' names (`<name>-ban4`, `<name>-feed6`, ...).
     pub iptables_chain: String,
+    pub firewall_cmd: PathBuf,
+    pub ipset: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             mode: Mode::Shadow,
+            package_manager: PackageManager::Apt,
             sources: SourcesCfg::default(),
             ports: PortsCfg::default(),
             state_file: "/var/lib/logguard/state.json".into(),
@@ -606,20 +723,26 @@ impl Default for Config {
             notify: crate::notify::NotifyCfg::default(),
             exposure: crate::exposure::ExposureCfg::default(),
             cluster: crate::cluster::ClusterCfg::default(),
-            nextcloud: NextcloudCfg::default(),
+            console: crate::console::ConsoleCfg::default(),
+            nextcloud_aio: NextcloudCfg::default(),
             feeds: crate::feeds::FeedsCfg::default(),
+            waf: crate::waf::WafCfg::default(),
             digest: crate::digest::DigestCfg::default(),
             canary: CanaryCfg::default(),
             silence: SilenceCfg::default(),
             ratelimit: vec![],
             geo: crate::geo::GeoCfg::default(),
+            geoblock: crate::geo::GeoblockCfg::default(),
             cron: crate::cronwatch::CronCfg::default(),
             antivirus: crate::avscan::AvCfg::default(),
             resources: crate::resources::ResourcesCfg::default(),
             patches: crate::patches::PatchesCfg::default(),
             verify: crate::verify::VerifyCfg::default(),
             procwatch: crate::procwatch::ProcCfg::default(),
+            ssh_audit: crate::sshaudit::SshAuditCfg::default(),
             patterns: vec![],
+            app_patterns: vec![],
+            app_logs_found: vec![],
         }
     }
 }
@@ -672,6 +795,7 @@ impl Default for ScoringCfg {
             (FwTripwire, 100.0),
             (WebProbe, 40.0),
             (NcAuthFail, 25.0),
+            (PamAuthFail, 25.0),
             (XmppCanary, 100.0),
             (SshCanary, 100.0),
             (NcCanary, 100.0),
@@ -753,6 +877,8 @@ impl Default for EnforceCfg {
             iptables: "/usr/sbin/iptables".into(),
             ip6tables: "/usr/sbin/ip6tables".into(),
             iptables_chain: "logguard".into(),
+            firewall_cmd: "/usr/bin/firewall-cmd".into(),
+            ipset: "/usr/sbin/ipset".into(),
         }
     }
 }
@@ -781,8 +907,17 @@ impl Config {
         for (signal, w) in ScoringCfg::default().weights {
             cfg.scoring.weights.entry(signal).or_insert(w);
         }
+        cfg.share_package_manager();
+        (cfg.app_patterns, cfg.app_logs_found) = crate::parse::apps::expand(&cfg.sources, &crate::parse::apps::System)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Hands `package_manager` to the sections that use it (their copies aren't read from the file).
+    pub fn share_package_manager(&mut self) {
+        self.cron.package_manager = self.package_manager;
+        self.verify.package_manager = self.package_manager;
+        self.patches.package_manager = self.package_manager;
     }
 
     /// The journalctl matches to follow: explicit ones, or those of the enabled sources.
@@ -805,7 +940,14 @@ impl Config {
         if self.sources.privilege {
             m.extend(["su", "sudo"].map(|i| format!("SYSLOG_IDENTIFIER={i}")));
         }
-        for p in &self.patterns {
+        // PAM logs as authpriv (10), the account tools as auth (4), whatever the program
+        if self.sources.pam {
+            m.extend(["SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10"].map(String::from));
+        }
+        if self.sources.audit && self.sources.audit_log.as_os_str().is_empty() {
+            m.push("_TRANSPORT=audit".into());
+        }
+        for p in self.all_patterns() {
             if let Some(j) = p.journal_match() {
                 if !m.contains(&j) {
                     m.push(j);
@@ -853,11 +995,31 @@ impl Config {
         if let Some(s) = self.sources.services.iter().find(|s| !s.contains('.') || s.contains(|c: char| c.is_whitespace() || c == '=')) {
             bail!("[sources] services: '{s}' must be a full unit name, e.g. \"logguard-xmpp-bot.service\"");
         }
+        for log in self.silence.apps.keys() {
+            match crate::parse::apps::stream(log) {
+                None => bail!("[silence.apps]: unknown log '{log}' (the keys of [sources.app_logs])"),
+                Some((app, _)) if !self.sources.apps.iter().any(|a| a == app.name) => {
+                    bail!("[silence.apps] {log}: '{}' isn't in [sources] apps", app.name)
+                }
+                _ => {}
+            }
+        }
+        if !self.sources.audit_log.as_os_str().is_empty() && !self.sources.audit_log.is_absolute() {
+            bail!("[sources] audit_log must be an absolute path, e.g. \"/var/log/audit/audit.log\"");
+        }
+        if let Some(k) = self
+            .sources
+            .audit_keys
+            .iter()
+            .find(|k| k.is_empty() || k.len() > 31 || k.contains(|c: char| c.is_whitespace() || c.is_control()))
+        {
+            bail!("[sources] audit_keys: '{k}' is no audit rule key (1-31 characters, no spaces)");
+        }
         if !(self.sources.ejabberd || self.sources.ssh || self.sources.ufw) {
             bail!("[sources]: enable at least one of ejabberd, ssh, ufw");
         }
         if self.notify.enabled && self.notify.xmpp && !self.sources.ejabberd {
-            bail!("notify needs ejabberd (ejabberdctl) on this host; disable [notify], enable sources.ejabberd, or set [notify] xmpp = false with tg_outbox or mail_outbox");
+            bail!("notify needs ejabberd (ejabberdctl) on this host; disable [notify], enable sources.ejabberd, or set [notify] xmpp = false with a copy bot (tg_outbox, mail_outbox, signal_outbox, matrix_outbox or xmpp_outbox)");
         }
         let s = &self.scoring;
         if s.fast_threshold <= 0.0 || s.slow_threshold <= 0.0 {
@@ -905,22 +1067,33 @@ impl Config {
         if self.feeds.enabled && !self.feeds.asn_urls.is_empty() && (!self.geo.enabled || self.geo.asn_url.is_empty()) {
             bail!("[feeds] asn_urls needs the network database: [geo] enabled = true with an asn_url");
         }
+        self.waf.validate()?;
         let mut names = std::collections::BTreeSet::new();
         for p in &self.patterns {
             p.validate()?;
+            if self.app_patterns.iter().any(|a| a.name == p.name) {
+                bail!("[[patterns]]: '{}' is the name of a built-in pattern of [sources] apps: name yours differently", p.name);
+            }
             if !names.insert(p.name.as_str()) {
                 bail!("[[patterns]]: two patterns are named '{}'", p.name);
             }
         }
+        for p in &self.app_patterns {
+            p.validate()?;
+        }
         self.notify.validate()?;
         self.cluster.validate()?;
+        self.console.validate(&self.socket)?;
         self.digest.validate()?;
         self.canary.validate()?;
         for r in &self.ratelimit {
             r.validate()?;
         }
         self.procwatch.validate()?;
+        self.antivirus.validate_scans()?;
         self.verify.validate()?;
+        self.geo.validate()?;
+        self.geoblock.validate(&self.geo)?;
         if !self.enforce.nft_table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             bail!("enforce.nft_table must be alphanumeric");
         }
@@ -929,6 +1102,12 @@ impl Config {
             bail!("enforce.iptables_chain must be 1-24 letters, digits, '_' or '-' (iptables allows 28 with the -ban suffix)");
         }
         Ok(())
+    }
+
+    /// The patterns of your own, then the built-in ones of `[sources] apps`: a line goes to
+    /// the first that finds an address in it.
+    pub fn all_patterns(&self) -> impl Iterator<Item = &crate::parse::custom::PatternCfg> {
+        self.patterns.iter().chain(&self.app_patterns)
     }
 
     pub fn weight(&self, s: Signal) -> f64 {
@@ -970,6 +1149,32 @@ mod tests {
         assert!(Config::from_toml("[ports]\nnames = { \"x/tcp\" = \"y\" }").is_err());
     }
 
+    /// The desktop profile: watches the machine, leaves the firewall alone, and takes what a
+    /// desktop does (new apps talking, AppImages, snapd's units) without hiding programs by name.
+    #[test]
+    fn desktop_profile() {
+        let cfg = Config::from_toml(include_str!("../deploy/logguard-desktop.toml")).unwrap();
+        assert_eq!(cfg.mode, Mode::Shadow);
+        assert!(!cfg.notify.enabled && !cfg.cluster.enabled && !cfg.feeds.enabled && !cfg.exposure.enabled && !cfg.silence.enabled);
+        assert!(cfg.cron.enabled && cfg.verify.enabled && cfg.procwatch.enabled && cfg.sources.pam && cfg.sources.privilege);
+        assert!(!cfg.procwatch.new_outbound && cfg.procwatch.allow_appimages);
+        assert!(cfg.procwatch.ignore_processes.is_empty(), "nothing by name");
+        assert!(cfg.cron.exclude.iter().all(|p| p.contains("/snap")) && !cfg.cron.exclude.is_empty());
+        assert!(!cfg.cron.files.is_empty(), "the default watched files stay");
+        assert_eq!(cfg.cluster.node_id, "desktop", "upgrades find the template");
+
+        // its notes for the XMPP client bot, followed, give a valid config with that copy bot only
+        let template = include_str!("../deploy/logguard-desktop.toml");
+        let with_bot = template
+            .replace("enabled = false\n#xmpp = false", "enabled = true\nxmpp = false")
+            .replace("#xmpp_outbox", "xmpp_outbox")
+            .replace("#xmpp_user", "xmpp_user");
+        let cfg = Config::from_toml(&with_bot).unwrap();
+        assert!(cfg.notify.enabled && !cfg.notify.xmpp);
+        let bots: Vec<&str> = cfg.notify.copy_bots().iter().map(|(k, _, _)| k.unit).collect();
+        assert_eq!(bots, ["logguard-xmpp-bot"]);
+    }
+
     #[test]
     fn vpn_host_config() {
         let cfg = Config::from_toml(
@@ -989,7 +1194,10 @@ mod tests {
                 "SYSLOG_IDENTIFIER=sshd-auth",
                 "_TRANSPORT=kernel",
                 "SYSLOG_IDENTIFIER=su",
-                "SYSLOG_IDENTIFIER=sudo"
+                "SYSLOG_IDENTIFIER=sudo",
+                "SYSLOG_FACILITY=4",
+                "SYSLOG_FACILITY=10",
+                "_TRANSPORT=audit"
             ]
         );
         assert!(cfg.ports.whitelisted(Some(51820), Proto::Udp));
@@ -999,17 +1207,42 @@ mod tests {
         assert_eq!(cfg.ports.whitelist[0].to_string(), "51820/udp");
         assert!(Config::from_toml("[ports]\nwhitelist = [\"51820/sctp\"]").is_err());
         assert!(Config::from_toml("[sources]\nejabberd = false\nssh = false\nufw = false").is_err());
+        assert_eq!(Config::from_toml("[enforce]\nbackend = \"firewalld\"").unwrap().enforce.backend, Backend::Firewalld);
+        assert_eq!(Config::from_toml("[enforce]\nbackend = \"ipset\"").unwrap().enforce.backend, Backend::Ipset);
         let ipt = Config::from_toml("[enforce]\nbackend = \"iptables\"\niptables_chain = \"lg-raw\"").unwrap();
         assert_eq!((ipt.enforce.backend, ipt.enforce.iptables_chain.as_str()), (Backend::Iptables, "lg-raw"));
         assert!(Config::from_toml("[enforce]\niptables_chain = \"a b\"").is_err());
         assert!(Config::from_toml("[enforce]\niptables_chain = \"a-name-much-too-long-for-xt\"").is_err());
         assert!(Config::from_toml("[sources]\nejabberd = false\n[notify]\nenabled = true\nfrom = \"x.org\"").is_err());
-        assert_eq!(Config::default().journal_matches().len(), 7);
+        assert_eq!(Config::default().journal_matches().len(), 10);
         // a pattern of your own adds its unit; one already followed isn't added twice
         let p = Config::from_toml("[sources]\nprivilege = false\n[[patterns]]\nname = \"x\"\nunit = \"postfix@-.service\"\nregex = '(?P<ip>\\S+)'\n[[patterns]]\nname = \"y\"\nunit = \"postfix@-.service\"\nregex = 'a(?P<ip>\\S+)'").unwrap();
         assert_eq!(p.journal_matches().last().map(String::as_str), Some("_SYSTEMD_UNIT=postfix@-.service"));
-        assert_eq!(p.journal_matches().len(), 6);
+        assert_eq!(p.journal_matches().len(), 9);
         assert!(Config::from_toml("[[patterns]]\nname = \"x\"\nunit = \"a.service\"\nregex = '(?P<ip>\\S+)'\n[[patterns]]\nname = \"x\"\nunit = \"b.service\"\nregex = '(?P<ip>\\S+)'").is_err(), "names are unique");
+        // [sources] nextcloud_aio, called nextcloud before
+        assert!(Config::from_toml("[sources]\nnextcloud = true").unwrap().sources.nextcloud_aio);
+        assert!(Config::from_toml("[sources]\nnextcloud_aio = true").unwrap().sources.nextcloud_aio);
+        assert!(Config::from_toml("[sources]\nnextcloud = true\nnextcloud_aio = true").is_err(), "one name only");
+        assert!(toml::to_string(&Config::default()).unwrap().contains("nextcloud_aio = false"), "print-config: the new name");
+        // [nextcloud] and [silence] nextcloud, now nextcloud_aio
+        let old = Config::from_toml("[nextcloud]\napache_container = \"x\"\n[silence]\nnextcloud = \"1h\"").unwrap();
+        assert_eq!((old.nextcloud_aio.apache_container.as_str(), old.silence.nextcloud_aio.0), ("x", 3600));
+        assert!(Config::from_toml("[nextcloud]\ndocker = \"/a\"\n[nextcloud_aio]\ndocker = \"/b\"").is_err(), "one name only");
+        let printed = toml::to_string(&Config::default()).unwrap();
+        assert!(printed.contains("[nextcloud_aio]") && !printed.contains("[nextcloud]"), "{printed}");
+        let apps = Config::from_toml(
+            "[sources]\napps = [\"mysql\"]\n[sources.app_logs]\nmysql = \"mariadb.service\"\n[sources.app_weights]\nmysql_preauth = 0",
+        )
+        .unwrap();
+        let names: Vec<&str> = apps.all_patterns().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["mysql_auth", "mysql_preauth"]);
+        assert!(apps.journal_matches().contains(&"_SYSTEMD_UNIT=mariadb.service".to_string()));
+        let mine = "[[patterns]]\nname = \"nginx_auth\"\nunit = \"a.service\"\nregex = '(?P<ip>\\S+)'";
+        Config::from_toml(mine).expect("nginx isn't in [sources] apps: the name is free");
+        let clash = Config::from_toml(&format!("[sources]\napps = [\"nginx\"]\n{mine}")).unwrap_err();
+        assert!(clash.to_string().contains("built-in pattern"), "{clash}");
+        assert!(Config::from_toml("[sources]\napps = [\"iis\"]").is_err());
         // honeypots: a blocked SYN to a tripwire port is half the evidence then, unless set
         assert_eq!(Config::from_toml("[ports]\nhoneypot = [2323]").unwrap().weight(Signal::FwTripwire), 50.0);
         assert_eq!(
@@ -1022,6 +1255,42 @@ mod tests {
         assert!(Config::from_toml("[ports]\nkernel_tripwire_rate = \"fast\"").is_err());
         assert!(Config::from_toml("[subnets]\nv6_wide_prefix = 72").is_err());
         assert!(Config::from_toml("[feeds]\nenabled = true\nasn_urls = [\"https://x/asn\"]").is_err(), "needs [geo]");
+        assert!(Config::from_toml("[waf]\nenabled = true").is_err(), "needs a source");
+    }
+
+    #[test]
+    fn waf_sources() {
+        let cfg = Config::from_toml(
+            r#"
+            [waf]
+            enabled = true
+            [[waf.sources]]
+            name = "crowdsec"
+            format = "crowdsec"
+            url = "http://127.0.0.1:8080/v1/decisions?type=ban&origins=crowdsec,cscli"
+            api_key_file = "/etc/logguard/crowdsec-bouncer.key"
+            [[waf.sources]]
+            name = "capi"
+            format = "crowdsec"
+            command = ["cscli", "decisions", "list", "-a", "--origin", "CAPI", "-o", "raw"]
+            action = "list"
+            [[waf.sources]]
+            name = "edge"
+            format = "json"
+            file = "/var/lib/edge/blocked.json"
+            items = "result"
+            reason_field = "comment"
+            "#,
+        )
+        .unwrap();
+        let names: Vec<(&str, crate::waf::WafAction)> = cfg.waf.sources.iter().map(|s| (s.name.as_str(), s.action)).collect();
+        use crate::waf::WafAction::{Ban, List};
+        assert_eq!(names, [("crowdsec", Ban), ("capi", List), ("edge", Ban)]);
+        assert_eq!(cfg.waf.sources[0].api_key_header, "X-Api-Key");
+        assert!(
+            Config::from_toml("[waf]\nenabled = true\n[[waf.sources]]\nname = \"x\"\nfile = \"/x\"\nformt = \"json\"").is_err(),
+            "a typo"
+        );
     }
 
     #[test]
@@ -1030,7 +1299,7 @@ mod tests {
             r#"
             mode = "enforce"
             [allowlist]
-            nets = ["11.42.43.31", "11.32.48.86/32"]
+            nets = ["11.48.43.31", "11.38.48.86/32"]
             [scoring.weights]
             fw_block = 0.5
             "#,
@@ -1050,5 +1319,21 @@ mod tests {
         assert_eq!(cfg.subnets.wide_max_step, 2);
         assert!(!toml::to_string(&cfg).unwrap().contains("wide_min"), "print-config leaves them out");
         assert!(Config::from_toml("[subnets]\nwide_max_step = 0\n").is_err());
+    }
+
+    #[test]
+    fn package_manager() {
+        let cfg = Config::from_toml("package_manager = \"dnf\"\n").unwrap();
+        assert_eq!(cfg.package_manager, PackageManager::Dnf);
+        assert_eq!(
+            (cfg.cron.package_manager, cfg.verify.package_manager, cfg.patches.package_manager),
+            (PackageManager::Dnf, PackageManager::Dnf, PackageManager::Dnf)
+        );
+        assert_eq!(Config::from_toml("package_manager = \"rpm\"\n").unwrap().package_manager, PackageManager::Dnf);
+        assert_eq!(Config::from_toml("package_manager = \"dpkg\"\n").unwrap().package_manager, PackageManager::Apt);
+        assert_eq!(Config::from_toml("").unwrap().verify.package_manager, PackageManager::Apt, "apt by default");
+        assert!(Config::from_toml("package_manager = \"pacman\"\n").is_err());
+        assert!(toml::to_string(&cfg).unwrap().starts_with("mode = \"shadow\"\npackage_manager = \"dnf\"\n"), "print-config shows it once");
+        assert!(Config::from_toml("[verify]\npackage_manager = \"dnf\"\n").is_err(), "top-level only");
     }
 }

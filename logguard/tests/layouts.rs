@@ -1,7 +1,8 @@
 //! The deployment layouts logguard must protect a server in, run end to end: the real daemon
 //! with a fake `journalctl` (attacks as journal JSON, stamped now) and a fake `nft` that
-//! records the rulesets it is given, with and without the XMPP bot's, the Telegram bot's and
-//! the mail bot's outboxes, and with cluster peers on 127.0.0.1. Each layout must put the attackers into the
+//! records the rulesets it is given, with and without the XMPP bot's (admin or client mode),
+//! the Telegram bot's, the mail bot's, the Signal bot's and the Matrix bot's outboxes, and with
+//! cluster peers on 127.0.0.1. Each layout must put the attackers into the
 //! firewall within seconds, and deliver admin and user messages where that layout says:
 //!
 //! | layout | bots | peers |
@@ -15,7 +16,12 @@
 //! | 7 | logguard-xmpp-bot and logguard-tg-bot | none |
 //! | 8 | logguard-mail-bot | none |
 //! | 9 | logguard-mail-bot | yes (on a relay node of its own) |
-//! | 10 | all three | none |
+//! | 10 | logguard-xmpp-bot, logguard-tg-bot and logguard-mail-bot | none |
+//! | 11 | logguard-signal-bot | none |
+//! | 12 | logguard-matrix-bot | yes (on a relay node of its own) |
+//! | 13 | all five | none |
+//! | 14 | logguard-xmpp-bot in client mode (no ejabberd: a desktop, a lone server) | none |
+//! | 15 | logguard-xmpp-bot in client mode | yes (on a relay node of its own) |
 //!
 //! XMPP messages go to a fake ejabberd HTTP API (`[notify] api`), which records them.
 //! Needs to bind 127.0.0.1 (cluster and API): run outside a sandbox that forbids it.
@@ -28,9 +34,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ATTACKER_SSH: &str = "11.20.45.233";
-const ATTACKER_XMPP: &str = "11.46.50.7";
-const ATTACKER_VPN: &str = "11.28.63.115";
+const ATTACKER_SSH: &str = "11.23.45.233";
+const ATTACKER_XMPP: &str = "11.52.50.7";
+const ATTACKER_VPN: &str = "11.33.63.115";
 const USER: &str = "bob@example.org";
 const ADMIN: &str = "admin@example.org";
 const KEY: &str = "Zm9yIHRlc3RzIG9ubHk6IGEgMzItYnl0ZSBrZXkhISE=";
@@ -49,7 +55,7 @@ fn xmpp_attack(ip: &str, jid: &str) -> Vec<String> {
     let ts = logguard::time::fmt_ts(logguard::time::now());
     let line = |msg: String| journal("ejabberd", "ejabberd.service", &format!("{ts}.000 {msg}"));
     let login =
-        line(format!("[info] (tls|<0.4000.0>) Accepted c2s SCRAM-SHA-256 authentication for {jid} by sql backend from ::ffff:11.42.43.31"));
+        line(format!("[info] (tls|<0.4000.0>) Accepted c2s SCRAM-SHA-256 authentication for {jid} by sql backend from ::ffff:11.48.43.31"));
     let failures = (1..=5).map(|i| {
         line(format!(
             "[warning] (tls|<0.{}.0>) Failed c2s SCRAM-SHA-256 authentication for {jid} from ::ffff:{ip}: Invalid username or password",
@@ -152,6 +158,8 @@ impl Node {
         std::fs::create_dir_all(dir.join("outbox-xmpp")).unwrap();
         std::fs::create_dir_all(dir.join("outbox-tg")).unwrap();
         std::fs::create_dir_all(dir.join("outbox-mail")).unwrap();
+        std::fs::create_dir_all(dir.join("outbox-signal")).unwrap();
+        std::fs::create_dir_all(dir.join("outbox-matrix")).unwrap();
         std::fs::write(dir.join("journal.jsonl"), lines.join("\n") + "\n").unwrap();
         let d = dir.display();
         script(&dir.join("journalctl"), &format!("#!/bin/sh\ncat '{d}/journal.jsonl'\nexec sleep 300\n"));
@@ -195,7 +203,8 @@ enabled = false
         self.read("nft.log").lines().any(|l| l.starts_with("add element") && l.contains(&format!("{{ {ip} ")))
     }
 
-    /// The messages in a bot's outbox (`xmpp`, `tg` or `mail`), as their full text.
+    /// The messages in a bot's outbox (`xmpp`, `tg`, `mail`, `signal` or `matrix`), as their full
+    /// text. `xmpp` is the XMPP bot's in either mode.
     fn messages(&self, which: &str) -> Vec<String> {
         let mut out: Vec<String> = std::fs::read_dir(self.dir.join(format!("outbox-{which}")))
             .unwrap()
@@ -240,7 +249,8 @@ fn node_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("lgl-{}-{name}", std::process::id()))
 }
 
-/// A node's outbox for the XMPP bot (`xmpp`), the Telegram bot (`tg`) or the mail bot (`mail`).
+/// A node's outbox for the XMPP bot (`xmpp`), the Telegram bot (`tg`), the mail bot (`mail`), the
+/// Signal bot (`signal`) or the Matrix bot (`matrix`).
 fn outbox(name: &str, which: &str) -> String {
     node_dir(name).join(format!("outbox-{which}")).display().to_string()
 }
@@ -489,4 +499,104 @@ fn layout10_all_three_bots() {
         has("xmpp") && has("tg") && has("mail")
     });
     assert!(api.to(ADMIN).is_empty(), "admin messages only through the bots");
+}
+
+/// A node without ejabberd whose admin messages go to one copy bot (`signal`, `matrix`, or `xmpp`:
+/// logguard-xmpp-bot in client mode, `[notify] xmpp_outbox`) only.
+fn copy_bot_node(name: &str, which: &str) -> String {
+    format!(
+        "[sources]\nejabberd = false\n[notify]\nenabled = true\nxmpp = false\n{which}_outbox = \"{}\"\n{which}_user = \"{NO_USER}\"\n",
+        outbox(name, which)
+    )
+}
+
+#[test]
+fn layout11_signal_bot_no_peers() {
+    let signal = Node::start("11-signal", &copy_bot_node("11-signal", "signal"), &ssh_attack(ATTACKER_SSH));
+    signal.wait_until("the attacker blocked", || signal.blocks(ATTACKER_SSH));
+    signal.wait_until("the alert in the Signal bot's outbox", || {
+        signal.messages("signal").iter().any(|t| t.starts_with("To: admin\n") && t.contains(ATTACKER_SSH))
+    });
+    assert!(["xmpp", "tg", "mail", "matrix"].iter().all(|w| signal.messages(w).is_empty()));
+}
+
+#[test]
+fn layout12_matrix_bot_with_peers() {
+    // logguard-matrix-bot on a relay node of its own, as layout 9's mail bot
+    let api = FakeApi::start();
+    let (px, pm) = (free_port(), free_port());
+    let limit = format!("relay_notices = true\npeer_accept = {{ \"127.0.0.1:{pm}\" = [\"notices\", \"files\"] }}");
+    let xmpp = Node::start("12-xmpp", &(xmpp_notify(&api, "") + &cluster("xmpp", px, &[pm], &limit)), &attacks_on_xmpp_server());
+    let matrix = Node::start(
+        "12-matrix",
+        &(copy_bot_node("12-matrix", "matrix") + &cluster("matrix", pm, &[px], "relay_notices = true")),
+        &ssh_attack(ATTACKER_VPN),
+    );
+    matrix.wait_until("own and the XMPP server's attackers blocked", || {
+        [ATTACKER_VPN, ATTACKER_SSH, ATTACKER_XMPP].iter().all(|ip| matrix.blocks(ip))
+    });
+    xmpp.wait_until("own attackers blocked", || xmpp.blocks(ATTACKER_SSH) && xmpp.blocks(ATTACKER_XMPP));
+    xmpp.wait_until("the user warned over XMPP", || user_warned(&api));
+    matrix.wait_until("own and relayed alerts in the Matrix bot's outbox", || {
+        let m = matrix.messages("matrix");
+        m.iter().any(|t| t.contains(ATTACKER_VPN)) && m.iter().any(|t| t.contains("[xmpp] ") && t.contains(ATTACKER_XMPP))
+    });
+    xmpp.wait_until("the relay node's alert reaches the XMPP admin", || {
+        api.to(ADMIN).iter().any(|b| b.starts_with("[matrix] ") && b.contains(ATTACKER_VPN))
+    });
+    thread::sleep(Duration::from_secs(3));
+    assert!(!xmpp.blocks(ATTACKER_VPN), "the relay node may hand the XMPP server notices only");
+}
+
+#[test]
+fn layout13_all_five_bots() {
+    let api = FakeApi::start();
+    let mut more = format!("bot_outbox = \"{}\"\nbot_user = \"{NO_USER}\"\n", outbox("13-xmpp", "xmpp"));
+    for which in ["tg", "mail", "signal", "matrix"] {
+        more += &format!("{which}_outbox = \"{}\"\n{which}_user = \"{NO_USER}\"\n", outbox("13-xmpp", which));
+    }
+    let xmpp = Node::start("13-xmpp", &xmpp_notify(&api, &more), &attacks_on_xmpp_server());
+    xmpp.wait_until("both attackers blocked", || xmpp.blocks(ATTACKER_SSH) && xmpp.blocks(ATTACKER_XMPP));
+    xmpp.wait_until("the user warned over XMPP", || user_warned(&api));
+    xmpp.wait_until("the alerts in all five bots' outboxes", || {
+        let has = |which| xmpp.messages(which).iter().any(|t| t.starts_with(&format!("To: {ADMIN}\n")) && t.contains(ATTACKER_SSH));
+        ["xmpp", "tg", "mail", "signal", "matrix"].into_iter().all(has)
+    });
+    assert!(api.to(ADMIN).is_empty(), "admin messages only through the bots");
+}
+
+#[test]
+fn layout14_xmpp_client_bot_no_peers() {
+    // logguard-xmpp-bot in client mode with an account on someone else's XMPP server
+    let node = Node::start("14-client", &copy_bot_node("14-client", "xmpp"), &ssh_attack(ATTACKER_SSH));
+    node.wait_until("the attacker blocked", || node.blocks(ATTACKER_SSH));
+    node.wait_until("the alert in the XMPP client bot's outbox", || {
+        node.messages("xmpp").iter().any(|t| t.starts_with("To: admin\n") && t.contains(ATTACKER_SSH))
+    });
+    assert!(["tg", "mail", "signal", "matrix"].iter().all(|w| node.messages(w).is_empty()));
+}
+
+#[test]
+fn layout15_xmpp_client_bot_with_peers() {
+    // the client bot on a relay node of its own (the VPN server), as layout 12's Matrix bot
+    let api = FakeApi::start();
+    let (px, pc) = (free_port(), free_port());
+    let limit = format!("relay_notices = true\npeer_accept = {{ \"127.0.0.1:{pc}\" = [\"notices\", \"files\"] }}");
+    let xmpp = Node::start("15-xmpp", &(xmpp_notify(&api, "") + &cluster("xmpp", px, &[pc], &limit)), &attacks_on_xmpp_server());
+    let client = Node::start(
+        "15-client",
+        &(copy_bot_node("15-client", "xmpp") + &cluster("client", pc, &[px], "relay_notices = true")),
+        &ssh_attack(ATTACKER_VPN),
+    );
+    client.wait_until("own and the XMPP server's attackers blocked", || {
+        [ATTACKER_VPN, ATTACKER_SSH, ATTACKER_XMPP].iter().all(|ip| client.blocks(ip))
+    });
+    xmpp.wait_until("the user warned over XMPP", || user_warned(&api));
+    client.wait_until("own and relayed alerts in the XMPP client bot's outbox", || {
+        let m = client.messages("xmpp");
+        m.iter().any(|t| t.contains(ATTACKER_VPN)) && m.iter().any(|t| t.contains("[xmpp] ") && t.contains(ATTACKER_XMPP))
+    });
+    xmpp.wait_until("the relay node's alert reaches the XMPP admin", || {
+        api.to(ADMIN).iter().any(|b| b.starts_with("[client] ") && b.contains(ATTACKER_VPN))
+    });
 }

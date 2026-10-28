@@ -1,0 +1,207 @@
+#!/bin/bash
+# logguard-web's package, after its files are unpacked. dpkg runs it as  postinst configure
+# [old-version]  (also for dpkg-reconfigure), rpm as %post with 1 (first install) or 2
+# (upgrade): the same script for both.
+#
+# What the bundle's install.sh does, less the files the package puts in place itself: the
+# system user, /opt/logguard-web and config.env from the template (the first time), the
+# owners and modes, the self-signed certificate once CONSOLE_LISTEN is set. It also takes
+# over an install from a bundle or deploy.sh: its unit in /etc/systemd/system (it would
+# shadow the package's) and its rollback files go; config.env, the keys, the password and
+# the certificate stay. logguard-web is restarted only when it was running and nothing its
+# settings need is missing; a first install lists what to do and starts nothing.
+#
+# Asked, when a terminal is there: whether to replace config.env with this version's template
+# (the old one kept as config.env.old). Enter, a timeout, no terminal, or
+# DEBIAN_FRONTEND=noninteractive keep it. LOGGUARD_PACKAGE_CONFIG=keep|replace answers without
+# asking (sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./logguard-web_*.deb).
+set -eu
+
+WEB=logguard-web
+DIR=/opt/$WEB
+UNIT=$WEB.service
+OLD_UNIT=/etc/systemd/system/$UNIT
+WANTS=/etc/systemd/system/multi-user.target.wants/$UNIT
+
+case ${1:-} in
+    configure | 1 | 2 | [3-9]*) ;;
+    *) exit 0 ;;   # abort-upgrade and the like: nothing to do
+esac
+systemd() { [ -d /run/systemd/system ] && command -v systemctl > /dev/null; }
+sc() { systemctl "$@" 2> /dev/null || true; }
+note() { echo "$WEB: $*"; }
+setting() { # the value of $1 in config.env, quotes removed
+    grep -E "^$1=" "$DIR/config.env" 2> /dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"'" || true
+}
+# logguard's integrity watch covers the account files and the enabled units: announce what
+# changes, so it is logged instead of raised as a high alert. logguard is the package's
+# (/usr/bin) or a bundle's (/usr/local/bin).
+LG=""
+LGCONF=/etc/logguard/logguard.toml
+for b in /usr/bin/logguard /usr/local/bin/logguard; do
+    if [ -x "$b" ] && [ -f "$LGCONF" ]; then LG=$b; break; fi
+done
+announce() { [ -n "$LG" ] && "$LG" --config "$LGCONF" expect-change "$@" 2> /dev/null || true; }
+announce_accounts() {
+    local f files=()
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do [ -f "$f" ] && files+=("$f"); done
+    announce "${files[@]}"
+}
+
+# A system user of its own, without a home or a shell. logguard's [console] socket is given
+# to its group.
+if ! id "$WEB" > /dev/null 2>&1; then
+    useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$WEB"
+    note "created the system user $WEB"
+    announce_accounts
+fi
+
+mkdir -p "$DIR"
+first=no
+if [ ! -f "$DIR/config.env" ]; then
+    install -m 0640 -o root -g "$WEB" "$DIR/config.env.example" "$DIR/config.env"
+    first=yes
+    note "new $DIR/config.env from the template"
+else
+    # The config stays (the default), or this version's template replaces it.
+    replace=${LOGGUARD_PACKAGE_CONFIG:-}
+    if [ -z "$replace" ] && [ "${DEBIAN_FRONTEND:-}" != noninteractive ] && [ -c /dev/tty ] && { : < /dev/tty; } 2> /dev/null; then
+        echo
+        echo "$WEB: $DIR/config.env exists. Keep it (compare it with this version's template:"
+        echo "diff $DIR/config.env.example $DIR/config.env), or replace it with the template"
+        echo "(the old file kept as config.env.old)?"
+        ans=""
+        read -r -t 60 -p "$WEB: replace the config? [y/N] " ans < /dev/tty > /dev/tty || ans=""
+        case $ans in y | Y | yes | YES) replace=replace ;; *) replace=keep ;; esac
+    fi
+    if [ "$replace" = replace ]; then
+        cp -p "$DIR/config.env" "$DIR/config.env.old"
+        install -m 0640 -o root -g "$WEB" "$DIR/config.env.example" "$DIR/config.env"
+        note "replaced $DIR/config.env with the template; the old file is $DIR/config.env.old (compare: diff $DIR/config.env.old $DIR/config.env)"
+    else
+        note "kept $DIR/config.env (this version's template: $DIR/config.env.example)"
+    fi
+fi
+
+# Owners and modes, as install.sh sets them: everything root's, the service may only read
+# (it writes nothing).
+#   /opt/logguard-web                                        root:logguard-web 750
+#   config.env, the web key, the TLS key, password, TOTP,
+#   metrics token, the other admins' files                   root:logguard-web 640
+#   ADMINS_DIR (the other admins)                            root:logguard-web 750
+#   the certificate                                          root:logguard-web 644
+chown root:"$WEB" "$DIR"
+chmod 750 "$DIR"
+chown root:"$WEB" "$DIR/config.env"
+chmod 640 "$DIR/config.env"
+KEY=$(setting WEB_KEY_FILE); KEY=${KEY:-$DIR/web.key}
+CERT=$(setting TLS_CERT); CERT=${CERT:-$DIR/tls.crt}
+TLSKEY=$(setting TLS_KEY); TLSKEY=${TLSKEY:-$DIR/tls.key}
+PW=$(setting PASSWORD_FILE); PW=${PW:-$DIR/admin.password}
+TOTPF=$(setting TOTP_FILE); TOTPF=${TOTPF:-$DIR/admin.totp}
+METRICS=$(setting METRICS_TOKEN_FILE)
+ADMINS=$(setting ADMINS_DIR); ADMINS=${ADMINS:-$DIR/admins}
+if [ -d "$ADMINS" ] && [ "${ADMINS%/*}" = "$DIR" ]; then
+    chown root:"$WEB" "$ADMINS"
+    chmod 750 "$ADMINS"
+    find "$ADMINS" -maxdepth 1 -type f \( -name '*.password' -o -name '*.totp' \) -exec chown root:"$WEB" {} + -exec chmod 640 {} +
+fi
+for f in "$KEY" "$TLSKEY" "$PW" "$TOTPF" "$METRICS"; do
+    # files elsewhere (a Let's Encrypt key) keep their owners: the group must be able to read them
+    if [ -n "$f" ] && [ -f "$f" ] && [ "${f%/*}" = "$DIR" ]; then
+        chown root:"$WEB" "$f"
+        chmod 640 "$f"
+    fi
+done
+if [ -f "$CERT" ] && [ "${CERT%/*}" = "$DIR" ]; then
+    chown root:"$WEB" "$CERT"
+    chmod 644 "$CERT"
+fi
+
+# An install from a bundle or deploy.sh: its unit in /etc/systemd/system would shadow the
+# package's. It goes, with the rollback files its install.sh kept; the service is enabled
+# again on the package's unit if it was. (logguard's watch reports the removed unit as a
+# warning once.)
+was_active=no
+if systemd && systemctl is-active -q "$UNIT"; then was_active=yes; fi
+if [ -f "$OLD_UNIT" ] && [ ! -L "$OLD_UNIT" ]; then
+    note "taking over the install from the bundle (or deploy.sh): its unit and rollback files go; config.env, keys and certificate stay"
+    was_enabled=no
+    if systemd && systemctl is-enabled -q "$UNIT" 2> /dev/null; then was_enabled=yes; fi
+    rm -f "${OLD_UNIT:?}" "${WANTS:?}"
+    echo "  removed $OLD_UNIT"
+    for f in "$DIR/$WEB.prev" "$DIR/$WEB.service.prev" "$DIR/install.sh"; do
+        [ -e "$f" ] || continue
+        rm -f "${f:?}"
+        echo "  removed $f"
+    done
+    systemd && sc daemon-reload
+    if [ "$was_enabled" = yes ] && systemd; then
+        announce "$WANTS=/usr/lib/systemd/system/$UNIT"
+        sc enable -q "$UNIT"
+    fi
+fi
+systemd && sc daemon-reload
+
+# The console's certificate: a self-signed one for this host's names, the first time.
+CONSOLE=$(setting CONSOLE_LISTEN)
+if [ -n "$CONSOLE" ] && [ ! -f "$CERT" ] && [ ! -f "$TLSKEY" ] && [ "${CERT%/*}" = "$DIR" ]; then
+    h=$(hostname -f 2> /dev/null || hostname 2> /dev/null || true)
+    names=(--name "${h:-localhost}")
+    for ip in $(hostname -I 2> /dev/null || true); do names+=(--name "$ip"); done
+    if "$DIR/$WEB" --tls-cert "$CERT" --tls-key "$TLSKEY" gen-cert "${names[@]}"; then
+        chown root:"$WEB" "$CERT" "$TLSKEY"
+        chmod 644 "$CERT"
+        chmod 640 "$TLSKEY"
+        note "made the self-signed certificate $CERT"
+    fi
+fi
+
+# Not ready yet: placeholders, or a file the settings need
+todo=()
+AGENT=$(setting AGENT_LISTEN)
+ALLOW=$(setting AGENT_ALLOW)
+NODES=$(setting NODES)
+[ -z "$AGENT" ] && [ -z "$CONSOLE" ] && todo+=("set AGENT_LISTEN (every node) and/or CONSOLE_LISTEN (the console's node) in $DIR/config.env")
+[ -n "$AGENT" ] && [[ -z "$ALLOW" || "$ALLOW" == REPLACE* ]] && todo+=("set AGENT_ALLOW in $DIR/config.env: the console's address (or \"any\")")
+if [ -n "$AGENT" ] || [ -n "$NODES" ]; then
+    [ -f "$KEY" ] || todo+=("the web key: on ONE node  $DIR/$WEB keygen --out $KEY  then copy that file to every other node's $KEY (not the cluster key)")
+fi
+if [ -n "$CONSOLE" ]; then
+    [ -f "$PW" ] || todo+=("the admin's password:  $DIR/$WEB passwd")
+    if [ "$(setting TOTP)" != off ] && [ ! -f "$TOTPF" ]; then
+        todo+=("the one-time codes:  $DIR/$WEB totp-setup   (scan the QR code with an authenticator app)")
+    fi
+fi
+SOCK=$(setting LOGGUARD_SOCKET)
+if [ -n "$SOCK" ] && [ -f "$LGCONF" ] && ! grep -qE "^[[:space:]]*socket[[:space:]]*=[[:space:]]*\"$SOCK\"" "$LGCONF"; then
+    todo+=("logguard's console socket: in $LGCONF add
+       [console]
+       socket = \"$SOCK\"
+       group = \"$WEB\"
+     then: systemctl restart logguard")
+fi
+if [ ${#todo[@]} -gt 0 ]; then
+    note "not started yet. To do:"
+    for t in "${todo[@]}"; do echo "  - $t"; done
+    echo "  Then  dpkg-reconfigure $WEB  (rpm: dnf reinstall $WEB) sets the files' owners and modes and makes the"
+    echo "  self-signed certificate; check it with  $DIR/$WEB check  and start it:  systemctl enable --now $WEB"
+    exit 0
+fi
+if [ "$was_active" = yes ] && systemd; then
+    sc restart "$UNIT"
+    sleep 3
+    if systemctl is-active -q "$UNIT"; then
+        note "restarted: $("$DIR/$WEB" --version)"
+    else
+        note "WARNING: $WEB is not running after the restart:  journalctl -u $WEB -n 20"
+    fi
+else
+    note "not started (it wasn't running). Check it:  $DIR/$WEB check   then:  systemctl enable --now $WEB"
+fi
+[ -n "$CONSOLE" ] && [ -f "$CERT" ] && note "console: https://$CONSOLE  (certificate $("$DIR/$WEB" --tls-cert "$CERT" fingerprint 2> /dev/null || echo '?'))"
+if [ -f "$LGCONF" ] && ! grep -qE 'apps[[:space:]]*=.*"logguard-web"' "$LGCONF"; then
+    note "logguard can ban addresses that guess the console's password or probe it: in [sources] of $LGCONF"
+    echo "  add \"logguard-web\" to apps (apps = [\"logguard-web\"]), then: systemctl restart logguard"
+fi
+exit 0

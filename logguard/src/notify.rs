@@ -32,8 +32,8 @@ use crate::time::{Dur, Micros, SEC};
 pub struct NotifyCfg {
     pub enabled: bool,
     /// Deliver over XMPP (ejabberd on this host). false on a node without ejabberd that only
-    /// hands admin messages to the Telegram bot (`tg_outbox`) or the mail bot (`mail_outbox`):
-    /// no users' warnings, no `from` or `admins` needed.
+    /// hands admin messages to copy bots (`tg_outbox`, `mail_outbox`, `signal_outbox`,
+    /// `matrix_outbox`, `xmpp_outbox`): no users' warnings, no `from` or `admins` needed.
     pub xmpp: bool,
     pub ejabberdctl: PathBuf,
     /// A loopback ejabberd listener serving `/api` (mod_http_api), e.g. `127.0.0.1:5285`.
@@ -55,8 +55,9 @@ pub struct NotifyCfg {
     pub from: String,
     /// `chat` is shown by every client and stored for offline users; `headline` often isn't.
     pub message_type: String,
-    /// XMPP accounts that get admin messages. Empty with `tg_outbox` or `mail_outbox`: admin
-    /// messages go to those bots only, while users are still warned over XMPP.
+    /// XMPP accounts that get admin messages. Empty with a copy bot (`tg_outbox`, `mail_outbox`,
+    /// `signal_outbox`, `matrix_outbox`, `xmpp_outbox`): admin messages go to those bots only,
+    /// while users are still warned over XMPP.
     pub admins: Vec<String>,
     pub admin_topics: Vec<Topic>,
     pub user_topics: Vec<Topic>,
@@ -97,6 +98,35 @@ pub struct NotifyCfg {
     pub mail_outbox: Option<PathBuf>,
     /// The user logguard-mail-bot runs as, who gets the files.
     pub mail_user: String,
+    /// The Signal bot's outbox (logguard-signal-bot's `OUTBOX_DIR`, e.g. `/opt/logguard-signal-bot/outbox`).
+    /// Optional, and like `tg_outbox` in every way: a copy of every message to the first of
+    /// `admins` (every admin message when `admins` is empty or `xmpp` is false), which
+    /// logguard-signal-bot sends to the admin over Signal (as OpenPGP files while the admin's
+    /// safety number isn't the pinned one). No fallback; the admins are warned when copies
+    /// wait longer than `bot_stuck_after`.
+    pub signal_outbox: Option<PathBuf>,
+    /// The user logguard-signal-bot runs as, who gets the files.
+    pub signal_user: String,
+    /// The Matrix bot's outbox (logguard-matrix-bot's `OUTBOX_DIR`, e.g. `/opt/logguard-matrix-bot/outbox`).
+    /// Optional, and like `tg_outbox` in every way: a copy of every message to the first of
+    /// `admins` (every admin message when `admins` is empty or `xmpp` is false), which
+    /// logguard-matrix-bot sends to the admin's Matrix room end-to-end encrypted (as OpenPGP
+    /// files when that isn't possible). No fallback; the admins are warned when copies wait
+    /// longer than `bot_stuck_after`.
+    pub matrix_outbox: Option<PathBuf>,
+    /// The user logguard-matrix-bot runs as, who gets the files.
+    pub matrix_user: String,
+    /// The XMPP client bot's outbox (logguard-xmpp-bot with `BOT_MODE=client`, its `OUTBOX_DIR`,
+    /// e.g. `/opt/logguard-xmpp-bot/outbox`), on a host without ejabberd (a VPN server, a relay
+    /// node, a desktop). Optional, and like `tg_outbox` in every way: a copy of every message to
+    /// the first of `admins` (every admin message when `admins` is empty or `xmpp` is false),
+    /// which the bot sends from its account on any XMPP server to its admin, OMEMO-encrypted
+    /// (as OpenPGP files when OMEMO can't reach the admin). No fallback; the admins are warned
+    /// when copies wait longer than `bot_stuck_after`. Not with `bot_outbox`: one
+    /// logguard-xmpp-bot per host.
+    pub xmpp_outbox: Option<PathBuf>,
+    /// The user the XMPP client bot runs as, who gets the files.
+    pub xmpp_user: String,
 }
 
 impl Default for NotifyCfg {
@@ -137,6 +167,12 @@ impl Default for NotifyCfg {
             tg_user: "logguard-tg-bot".into(),
             mail_outbox: None,
             mail_user: "logguard-mail-bot".into(),
+            signal_outbox: None,
+            signal_user: "logguard-signal-bot".into(),
+            matrix_outbox: None,
+            matrix_user: "logguard-matrix-bot".into(),
+            xmpp_outbox: None,
+            xmpp_user: "logguard-xmpp-bot".into(),
         }
     }
 }
@@ -152,7 +188,10 @@ impl NotifyCfg {
         }
         if !self.xmpp {
             if !self.has_copy_bots() {
-                bail!("notify.xmpp = false needs notify.tg_outbox or notify.mail_outbox: nothing else would deliver admin messages");
+                bail!(
+                    "notify.xmpp = false needs a copy bot (notify.tg_outbox, mail_outbox, signal_outbox, matrix_outbox or \
+                     xmpp_outbox): nothing else would deliver admin messages"
+                );
             }
             if self.bot_outbox.is_some() {
                 bail!("notify.bot_outbox is the XMPP bot's: not with notify.xmpp = false");
@@ -184,12 +223,29 @@ impl NotifyCfg {
         if self.tg_outbox.as_ref().is_some_and(|p| !p.is_absolute()) {
             bail!("notify.tg_outbox must be an absolute path");
         }
-        if self.mail_outbox.as_ref().is_some_and(|p| !p.is_absolute()) {
-            bail!("notify.mail_outbox must be an absolute path");
+        for (key, dir) in [
+            ("mail_outbox", &self.mail_outbox),
+            ("signal_outbox", &self.signal_outbox),
+            ("matrix_outbox", &self.matrix_outbox),
+            ("xmpp_outbox", &self.xmpp_outbox),
+        ] {
+            if dir.as_ref().is_some_and(|p| !p.is_absolute()) {
+                bail!("notify.{key} must be an absolute path");
+            }
         }
-        let outboxes: Vec<&PathBuf> = [&self.bot_outbox, &self.tg_outbox, &self.mail_outbox].into_iter().flatten().collect();
+        if self.bot_outbox.is_some() && self.xmpp_outbox.is_some() {
+            bail!("notify.bot_outbox and xmpp_outbox are both logguard-xmpp-bot's (admin and client mode): one of them per host");
+        }
+        let outboxes: Vec<&PathBuf> =
+            [&self.bot_outbox, &self.tg_outbox, &self.mail_outbox, &self.signal_outbox, &self.matrix_outbox, &self.xmpp_outbox]
+                .into_iter()
+                .flatten()
+                .collect();
         if outboxes.iter().enumerate().any(|(i, a)| outboxes[..i].contains(a)) {
-            bail!("notify.bot_outbox, tg_outbox and mail_outbox must differ: each bot empties its own");
+            bail!(
+                "notify.bot_outbox, tg_outbox, mail_outbox, signal_outbox, matrix_outbox and xmpp_outbox must differ: each bot empties \
+                 its own"
+            );
         }
         if self.bot_outbox.is_some() && self.admins.is_empty() {
             bail!("notify.bot_outbox needs notify.admins: the XMPP bot only writes to an admin");
@@ -215,17 +271,24 @@ impl NotifyCfg {
         }
     }
 
-    /// Whether a bot gets a copy of admin messages (logguard-tg-bot, logguard-mail-bot).
+    /// Whether a bot gets a copy of admin messages (logguard-tg-bot, logguard-mail-bot,
+    /// logguard-signal-bot, logguard-matrix-bot, logguard-xmpp-bot in client mode).
     pub fn has_copy_bots(&self) -> bool {
-        self.tg_outbox.is_some() || self.mail_outbox.is_some()
+        !self.copy_bots().is_empty()
     }
 
     /// The copy bots set up here: what each is, its outbox, and the user it runs as.
     pub fn copy_bots(&self) -> Vec<(&'static CopyKind, PathBuf, String)> {
-        [(&TG_BOT, &self.tg_outbox, &self.tg_user), (&MAIL_BOT, &self.mail_outbox, &self.mail_user)]
-            .into_iter()
-            .filter_map(|(k, dir, user)| dir.clone().map(|d| (k, d, user.clone())))
-            .collect()
+        [
+            (&TG_BOT, &self.tg_outbox, &self.tg_user),
+            (&MAIL_BOT, &self.mail_outbox, &self.mail_user),
+            (&SIGNAL_BOT, &self.signal_outbox, &self.signal_user),
+            (&MATRIX_BOT, &self.matrix_outbox, &self.matrix_user),
+            (&XMPP_BOT, &self.xmpp_outbox, &self.xmpp_user),
+        ]
+        .into_iter()
+        .filter_map(|(k, dir, user)| dir.clone().map(|d| (k, d, user.clone())))
+        .collect()
     }
 
     /// Whether admin messages (and warnings about the bots) can go out over XMPP.
@@ -274,6 +337,28 @@ pub const MAIL_BOT: CopyKind = CopyKind {
     unit: "logguard-mail-bot",
     hint: "The mail server out of reach or refusing the login, or a recipient's OpenPGP key expired?",
     stuck_key: "logguard-mail-bot-stuck",
+};
+
+pub const SIGNAL_BOT: CopyKind = CopyKind {
+    name: "The Signal bot (logguard-signal-bot)",
+    unit: "logguard-signal-bot",
+    hint: "Signal out of reach, signal-cli outdated, or the admin's safety number changed with no OPENPGP_KEY to fall back to?",
+    stuck_key: "logguard-signal-bot-stuck",
+};
+
+pub const MATRIX_BOT: CopyKind = CopyKind {
+    name: "The Matrix bot (logguard-matrix-bot)",
+    unit: "logguard-matrix-bot",
+    hint: "The homeserver out of reach or the login gone, or no verified device of the admin with no OPENPGP_KEY to fall back to?",
+    stuck_key: "logguard-matrix-bot-stuck",
+};
+
+pub const XMPP_BOT: CopyKind = CopyKind {
+    name: "The XMPP client bot (logguard-xmpp-bot)",
+    unit: "logguard-xmpp-bot",
+    hint:
+        "The XMPP server out of reach or the password changed, or no trusted OMEMO device of the admin with no OPENPGP_KEY to fall back to?",
+    stuck_key: "logguard-xmpp-bot-stuck",
 };
 
 /// A copy bot's outbox, as the sending thread keeps it.
@@ -1240,6 +1325,128 @@ mod tests {
     }
 
     #[test]
+    fn signal_and_matrix_bot_copies() {
+        let dir = std::env::temp_dir().join(format!("logguard-notify-signal-matrix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (signal, matrix, mail) = (dir.join("signal"), dir.join("matrix"), dir.join("mail"));
+        for d in [&signal, &matrix, &mail] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let count = |d: &Path| std::fs::read_dir(d).unwrap().count();
+        let open = |d: &Path, k| CopyBot::new(k, BotBox::without_fallback(d.to_path_buf(), None, Duration::from_secs(3600)));
+
+        // each alone, on a node without ejabberd
+        for (dir, kind) in [(&signal, &SIGNAL_BOT), (&matrix, &MATRIX_BOT)] {
+            let only = NotifyCfg {
+                enabled: true,
+                xmpp: false,
+                signal_outbox: (kind == &SIGNAL_BOT).then(|| dir.clone()),
+                matrix_outbox: (kind == &MATRIX_BOT).then(|| dir.clone()),
+                ..Default::default()
+            };
+            only.validate().unwrap();
+            assert_eq!(only.admin_recipients(), [ADMIN_BOTS]);
+            assert_eq!(
+                only.copy_bots().iter().map(|(k, d, u)| (k.unit, d.clone(), u.as_str())).collect::<Vec<_>>(),
+                [(kind.unit, dir.clone(), kind.unit)]
+            );
+            let mut copies = [open(dir, kind)];
+            deliver(&only, None, &mut copies, Notice { to: ADMIN_BOTS.into(), subject: "s".into(), body: "b".into() });
+            assert_eq!(count(dir), 1);
+        }
+
+        // all four copy bots on an XMPP server: one copy each; a stuck Signal bot is reported to
+        // the others (and the XMPP admins), not to itself
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = api.local_addr().unwrap();
+        drop(api);
+        let telegram = dir.join("tg");
+        std::fs::create_dir_all(&telegram).unwrap();
+        let all = NotifyCfg {
+            api: Some(addr),
+            tg_outbox: Some(telegram.clone()),
+            mail_outbox: Some(mail.clone()),
+            signal_outbox: Some(signal.clone()),
+            matrix_outbox: Some(matrix.clone()),
+            ..cfg()
+        };
+        all.validate().unwrap();
+        let mut copies = [open(&telegram, &TG_BOT), open(&mail, &MAIL_BOT), open(&signal, &SIGNAL_BOT), open(&matrix, &MATRIX_BOT)];
+        assert_eq!(
+            all.copy_bots().iter().map(|(k, _, _)| k.unit).collect::<Vec<_>>(),
+            copies.iter().map(|c| c.kind.unit).collect::<Vec<_>>()
+        );
+        deliver(&all, None, &mut copies, Notice { to: "admin@example.org".into(), subject: "s".into(), body: "b".into() });
+        assert_eq!((count(&telegram), count(&mail), count(&signal), count(&matrix)), (1, 1, 2, 2));
+        let old = std::fs::read_dir(&signal).unwrap().map(|e| e.unwrap().path()).min().unwrap();
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        sweep_copy(&all, &mut copies, 2, None, &OnceLock::new(), &Mutex::new(Vec::new()));
+        assert_eq!((count(&telegram), count(&mail), count(&signal), count(&matrix)), (2, 2, 2, 3));
+        let newest = std::fs::read_dir(&matrix).unwrap().map(|e| e.unwrap().path()).max().unwrap();
+        assert!(std::fs::read_to_string(newest).unwrap().contains("The Signal bot (logguard-signal-bot) has left"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(NotifyCfg { signal_outbox: Some("outbox".into()), ..cfg() }.validate().is_err(), "absolute path");
+        assert!(NotifyCfg { matrix_outbox: Some("outbox".into()), ..cfg() }.validate().is_err());
+        assert!(
+            NotifyCfg { signal_outbox: Some(signal.clone()), matrix_outbox: Some(signal.clone()), ..cfg() }.validate().is_err(),
+            "one outbox each"
+        );
+        assert!(NotifyCfg { tg_outbox: Some(matrix.clone()), matrix_outbox: Some(matrix.clone()), ..cfg() }.validate().is_err());
+        let parsed: NotifyCfg = toml::from_str("enabled = true\nfrom = \"x.org\"\nadmins = [\"a@x.org\"]").unwrap();
+        assert_eq!((parsed.signal_outbox, parsed.signal_user.as_str()), (None, "logguard-signal-bot"), "older configs parse unchanged");
+        assert_eq!((parsed.matrix_outbox, parsed.matrix_user.as_str()), (None, "logguard-matrix-bot"));
+    }
+
+    #[test]
+    fn xmpp_client_bot_copies() {
+        let dir = std::env::temp_dir().join(format!("logguard-notify-xmpp-client-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (client, telegram) = (dir.join("xmpp"), dir.join("tg"));
+        for d in [&client, &telegram] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let count = |d: &Path| std::fs::read_dir(d).unwrap().count();
+        let open = |d: &Path, k| CopyBot::new(k, BotBox::without_fallback(d.to_path_buf(), None, Duration::from_secs(3600)));
+
+        // alone, on a node without ejabberd (a desktop, the VPN server)
+        let only = NotifyCfg { enabled: true, xmpp: false, xmpp_outbox: Some(client.clone()), ..Default::default() };
+        only.validate().unwrap();
+        assert_eq!(only.admin_recipients(), [ADMIN_BOTS]);
+        assert_eq!(
+            only.copy_bots().iter().map(|(k, d, u)| (k.unit, d.clone(), u.as_str())).collect::<Vec<_>>(),
+            [("logguard-xmpp-bot", client.clone(), "logguard-xmpp-bot")]
+        );
+        let mut copies = [open(&telegram, &TG_BOT), open(&client, &XMPP_BOT)];
+        deliver(&only, None, &mut copies[1..], Notice { to: ADMIN_BOTS.into(), subject: "s".into(), body: "b".into() });
+        assert_eq!(count(&client), 1);
+
+        // next to another copy bot, without XMPP here: a stuck client bot becomes a system alert
+        // (which goes to the copy bots like any other)
+        let both = NotifyCfg { tg_outbox: Some(telegram.clone()), ..only.clone() };
+        both.validate().unwrap();
+        let old = std::fs::read_dir(&client).unwrap().map(|e| e.unwrap().path()).min().unwrap();
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        let problems = Mutex::new(Vec::new());
+        sweep_copy(&both, &mut copies, 1, None, &OnceLock::new(), &problems);
+        let problems = problems.into_inner().unwrap();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, "logguard-xmpp-bot-stuck");
+        assert!(problems[0].1.contains("The XMPP client bot (logguard-xmpp-bot) has left"), "{}", problems[0].1);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(NotifyCfg { xmpp_outbox: Some("outbox".into()), ..cfg() }.validate().is_err(), "absolute path");
+        assert!(
+            NotifyCfg { xmpp_outbox: Some(client.clone()), tg_outbox: Some(client.clone()), ..cfg() }.validate().is_err(),
+            "one outbox each"
+        );
+        let e = NotifyCfg { bot_outbox: Some("/opt/a".into()), xmpp_outbox: Some("/opt/b".into()), ..cfg() }.validate().unwrap_err();
+        assert!(e.to_string().contains("one of them per host"), "{e}");
+        let parsed: NotifyCfg = toml::from_str("enabled = true\nfrom = \"x.org\"\nadmins = [\"a@x.org\"]").unwrap();
+        assert_eq!((parsed.xmpp_outbox, parsed.xmpp_user.as_str()), (None, "logguard-xmpp-bot"), "older configs parse unchanged");
+    }
+
+    #[test]
     fn user_and_admin_get_messages_with_cooldown() {
         let mut p = Planner::new(cfg(), Mode::Enforce);
         let n = p.plan(&attack(0, &["ejabberd:bob@example.org"]));
@@ -1297,9 +1504,9 @@ mod tests {
             user_note: Some(body.into()),
             ..attack(ts_s, &[])
         };
-        assert_eq!(p.plan(&relayed(0, "[High] ban 11.20.45.233 for 1h")).len(), 1);
-        assert_eq!(p.plan(&relayed(10, "[High] ban 11.28.63.115 for 1h")).len(), 1, "another ban from the same server");
-        assert!(p.plan(&relayed(20, "[High] ban 11.28.63.115 for 1h")).is_empty(), "the same one again: cooldown");
+        assert_eq!(p.plan(&relayed(0, "[High] ban 11.23.45.233 for 1h")).len(), 1);
+        assert_eq!(p.plan(&relayed(10, "[High] ban 11.33.63.115 for 1h")).len(), 1, "another ban from the same server");
+        assert!(p.plan(&relayed(20, "[High] ban 11.33.63.115 for 1h")).is_empty(), "the same one again: cooldown");
     }
 
     #[test]
@@ -1354,7 +1561,7 @@ mod tests {
         ban.until = Some(6 * 3600 * SEC);
         ban.topic = Some(Topic::BruteForce);
         ban.notice = Some(i18n::UserNotice::BruteForce {
-            ip: "11.10.2.3".parse().unwrap(),
+            ip: "11.13.2.3".parse().unwrap(),
             attempts: [("ejabberd:alice@example.org".to_string(), 2), ("ejabberd:bob@example.org".to_string(), 5)].into_iter().collect(),
         });
         let n = p.plan(&ban);
@@ -1362,11 +1569,11 @@ mod tests {
         let bob = to("bob@example.org");
         assert_eq!(bob.subject, "⚠️ Уведомление о безопасности: подбор пароля заблокирован");
         assert!(bob.body.starts_with("Уведомление о безопасности для bob@example.org"), "{}", bob.body);
-        assert!(bob.body.contains("С адреса 11.10.2.3: 5 неудачных попыток входа"), "{}", bob.body);
+        assert!(bob.body.contains("С адреса 11.13.2.3: 5 неудачных попыток входа"), "{}", bob.body);
         assert!(bob.body.contains("Этот адрес заблокирован на 6 часов."), "{}", bob.body);
         assert!(!bob.body.contains("alice"), "never another user's account: {}", bob.body);
         let alice = to("alice@example.org");
-        assert!(alice.body.contains("2 failed login attempts on alice@example.org came from 11.10.2.3."), "{}", alice.body);
+        assert!(alice.body.contains("2 failed login attempts on alice@example.org came from 11.13.2.3."), "{}", alice.body);
         assert!(alice.body.contains("This address is blocked for 6 hours."), "{}", alice.body);
         assert!(to("admin@example.org").body.contains("\n\n[High]"), "admins: English as before");
     }

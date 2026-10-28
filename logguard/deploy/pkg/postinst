@@ -1,0 +1,192 @@
+#!/bin/bash
+# logguard's package, after its files are unpacked. dpkg runs it as  postinst configure
+# [old-version]  (also for dpkg-reconfigure), rpm as %post with 1 (first install) or 2
+# (upgrade): the same script for both.
+#
+# A new host gets the config template as /etc/logguard/logguard.toml and nothing is started:
+# the template has example names and addresses to replace. A host with a config keeps it:
+# what the bundle's install.sh does on an upgrade (the new template next to it as
+# logguard.toml.new, config-diff), and the package also takes over a bundle's or deploy.sh's
+# install (the binary and units under /usr/local and /etc/systemd/system go; the config, the
+# cluster key, the state and the timers' settings stay). The running service is restarted
+# when its config is valid for this version; nothing is started that wasn't running.
+#
+# Asked, when a terminal is there: whether to replace the config with this version's template
+# (the old one kept as logguard.toml.old). Enter, a timeout, no terminal, or
+# DEBIAN_FRONTEND=noninteractive keep it. LOGGUARD_PACKAGE_CONFIG=keep|replace answers without
+# asking (sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./logguard_*.deb).
+set -eu
+
+CONF=/etc/logguard/logguard.toml
+KEY=/etc/logguard/cluster.key
+BIN=/usr/bin/logguard
+TEMPLATES=/usr/share/logguard/templates
+SYSD=/etc/systemd/system
+OLD_DEFAULTS=/run/logguard-package/old-defaults
+UNITS="logguard.service logguard-avscan.service logguard-avscan.timer logguard-abuse-report.service logguard-abuse-report.timer"
+
+case ${1:-} in
+    configure | 1 | 2 | [3-9]*) ;;
+    *) exit 0 ;;   # abort-upgrade and the like: nothing to do
+esac
+systemd() { [ -d /run/systemd/system ] && command -v systemctl > /dev/null; }
+sc() { systemctl "$@" 2> /dev/null || true; }
+note() { echo "logguard: $*"; }
+
+setting() { # the value of $2 in section [$1] of config $3, as logguard reads it
+    "$BIN" --config "$3" print-config 2> /dev/null \
+        | awk -v sec="[$1]" -v key="$2" '/^\[/ { s = ($0 == sec) } s && $1 == key { gsub(/"/, "", $3); print $3 }'
+}
+top_setting() { # the value of top-level $1 (before any section) of config $2
+    "$BIN" --config "$2" print-config 2> /dev/null | awk -v key="$1" '/^\[/ { exit } $1 == key { gsub(/"/, "", $3); print $3 }'
+}
+# The template for this host: logguard.toml (logguard-dnf.toml with dnf and no apt), or on a
+# host with a config the one for its node id and package manager, as the bundle's install.sh.
+template() {
+    local tpl=$TEMPLATES/logguard.toml node pm t
+    if ! command -v apt-get > /dev/null && command -v dnf > /dev/null; then tpl=$TEMPLATES/logguard-dnf.toml; fi
+    if [ -f "$CONF" ]; then
+        node=$(setting cluster node_id "$CONF" || true)
+        pm=$(top_setting package_manager "$CONF" || true)
+        for t in "$TEMPLATES"/*.toml; do
+            if [ -n "$node" ] && [ "$(setting cluster node_id "$t")" = "$node" ] && [ "$(top_setting package_manager "$t")" = "$pm" ]; then
+                tpl=$t
+            fi
+        done
+    fi
+    echo "$tpl"
+}
+# The integrity watch covers the files below: announce their new content first, so the
+# running daemon logs the changes instead of raising "may be compromised" alerts.
+announce() { [ -f "$CONF" ] && "$BIN" --config "$CONF" expect-change "$@" 2> /dev/null || true; }
+
+systemd && sc daemon-reload
+
+if [ ! -f "$CONF" ]; then
+    tpl=$(template)
+    install -d -m 0755 /etc/logguard
+    install -m 0600 "$tpl" "$CONF"
+    note "new host: $CONF is the template ${tpl##*/} now; nothing is started yet."
+    echo "  Edit it for this host: [allowlist] (your own addresses), [notify], [cluster] (node_id,"
+    echo "  peers; or enabled = false), [digest] certs, ... It starts in mode = \"shadow\" (decides and"
+    echo "  logs, bans nothing). The other templates are in $TEMPLATES (-vpn: SSH and UFW only,"
+    echo "  -tg: a Telegram relay node, -desktop: a desktop or laptop; -dnf: Fedora, RHEL)."
+    echo "  Then:  logguard -c $CONF print-config > /dev/null && systemctl enable --now logguard logguard-abuse-report.timer"
+    echo "  A node joining a cluster takes the other nodes' $KEY (root, mode 0600) first; the first"
+    echo "  node with [cluster] enabled makes one:  (umask 077; logguard cluster-keygen > $KEY)"
+    exit 0
+fi
+
+# An install from a bundle or deploy.sh: its units in /etc/systemd/system would shadow the
+# package's, and its binaries in /usr/local would stay first in PATH. They go; what was
+# enabled is enabled again on the package's units. (The watch reports each removed file as a
+# warning once: /usr/local/bin and /etc/systemd/system are watched by content.)
+was_active=no
+if systemd && systemctl is-active -q logguard.service; then was_active=yes; fi
+enabled=""
+if [ -f "$SYSD/logguard.service" ] && [ ! -L "$SYSD/logguard.service" ] \
+    && grep -q '^ExecStart=/usr/local/bin/logguard' "$SYSD/logguard.service"; then
+    note "taking over the install from the bundle (or deploy.sh): its units and binaries go, the config stays"
+    for u in $UNITS; do
+        [ -f "$SYSD/$u" ] && [ ! -L "$SYSD/$u" ] || continue
+        if systemd && systemctl is-enabled -q "$u" 2> /dev/null; then enabled="$enabled $u"; fi
+        rm -f "${SYSD:?}/${u:?}"
+        echo "  removed $SYSD/$u"
+    done
+    rm -f "${SYSD:?}"/multi-user.target.wants/logguard.service "${SYSD:?}"/timers.target.wants/logguard-avscan.timer \
+        "${SYSD:?}"/timers.target.wants/logguard-abuse-report.timer
+    for f in /usr/local/bin/logguard /usr/local/bin/logguard.prev /usr/local/sbin/logguard-avscan /usr/local/sbin/logguard-abuse-report; do
+        [ -e "$f" ] || continue
+        rm -f "${f:?}"
+        echo "  removed $f"
+    done
+    systemd && sc daemon-reload
+fi
+
+# The config stays (the default), or this version's template replaces it.
+tpl=$(template)
+replace=${LOGGUARD_PACKAGE_CONFIG:-}
+if [ -z "$replace" ] && [ "${DEBIAN_FRONTEND:-}" != noninteractive ] && [ -c /dev/tty ] && { : < /dev/tty; } 2> /dev/null; then
+    echo
+    echo "logguard: $CONF exists. Keep it (the new template is saved next to it as logguard.toml.new,"
+    echo "and config-diff below shows what this version changes), or replace it with the template"
+    echo "${tpl##*/} (the old file kept as logguard.toml.old)?"
+    ans=""
+    read -r -t 60 -p "logguard: replace the config? [y/N] " ans < /dev/tty > /dev/tty || ans=""
+    case $ans in y | Y | yes | YES) replace=replace ;; *) replace=keep ;; esac
+fi
+if [ "$replace" = replace ]; then
+    cp -p "$CONF" "$CONF.old"
+    install -m 0600 "$tpl" "$CONF"
+    rm -f "$CONF.new"
+    note "replaced $CONF with the template ${tpl##*/}; the old file is $CONF.old (compare: diff $CONF.old $CONF)."
+    echo "  Edit it for this host, then:  logguard -c $CONF print-config > /dev/null && systemctl restart logguard"
+    if [ "$was_active" = yes ]; then
+        echo "  logguard keeps running with the old config until then."
+    fi
+    rm -rf /run/logguard-package
+    exit 0
+fi
+install -m 0600 "$tpl" "$CONF.new"
+note "kept $CONF; this version's template ${tpl##*/} is $CONF.new"
+if [ -s "$OLD_DEFAULTS" ]; then
+    echo "=== logguard config-diff: what this version means for your config ==="
+    "$BIN" --config "$CONF" config-diff --against "$OLD_DEFAULTS" || true
+    echo "======================================================================"
+fi
+rm -rf /run/logguard-package
+
+valid=yes
+if ! "$BIN" --config "$CONF" print-config > /dev/null; then
+    valid=no
+    note "WARNING: $CONF is not valid for this version (above): fix it, then  systemctl restart logguard"
+fi
+# Files written by older versions were world-readable (addresses, account names; the config
+# holds users' addresses and JIDs).
+chmod 0600 /var/lib/logguard/state.json "$CONF" "$CONF.new" 2> /dev/null || true
+chmod 0640 /var/log/logguard/actions.jsonl* 2> /dev/null || true
+
+if [ "$valid" = yes ]; then
+    # The cluster port for the peers, as the bundle's install.sh opens it (ufw: the rules are
+    # applied; firewalld: rich rules in the default zone; plain iptables: only suggested).
+    if command -v firewall-cmd > /dev/null && firewall-cmd --state > /dev/null 2>&1; then
+        rules=$("$BIN" --config "$CONF" cluster-ufw-rules --firewalld 2> /dev/null || true)
+        if [ -n "$rules" ]; then
+            echo "$rules" | while read -r rule; do echo "  + $rule"; eval "$rule" > /dev/null || true; done
+            firewall-cmd --reload > /dev/null || true
+        fi
+    elif command -v ufw > /dev/null; then
+        "$BIN" --config "$CONF" cluster-ufw-rules 2> /dev/null | while read -r rule; do echo "  + $rule"; eval "$rule" || true; done
+    else
+        rules=$("$BIN" --config "$CONF" cluster-ufw-rules --iptables 2> /dev/null || true)
+        if [ -n "$rules" ]; then
+            note "no ufw or firewalld; open the cluster port to the peers in your iptables rules (and save them):"
+            echo "$rules" | sed 's/^/    /'
+        fi
+    fi
+fi
+
+if systemd; then
+    # The units that were enabled on the bundle's files are enabled on the package's.
+    for u in $enabled; do
+        case $u in
+            *.service) announce "$SYSD/multi-user.target.wants/$u=/usr/lib/systemd/system/$u" ;;
+            *.timer) announce "$SYSD/timers.target.wants/$u=/usr/lib/systemd/system/$u" ;;
+        esac
+        sc enable -q "$u"
+    done
+    if [ "$was_active" = yes ] && [ "$valid" = yes ]; then
+        sc restart logguard.service
+        sleep 2
+        if systemctl is-active -q logguard.service; then
+            note "restarted: $("$BIN" --version)"
+        else
+            note "WARNING: logguard is not running after the restart:  journalctl -u logguard -n 30"
+        fi
+    elif [ "$was_active" = yes ]; then
+        note "logguard keeps running the previous version until its config is fixed"
+    else
+        note "not started (it wasn't running):  systemctl enable --now logguard logguard-abuse-report.timer"
+    fi
+fi
+exit 0

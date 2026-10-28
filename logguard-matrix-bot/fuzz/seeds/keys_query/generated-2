@@ -1,0 +1,1 @@
+{"master_keys":{"@admin:example.org":{"user_id":"@admin:example.org","usage":["master"],"keys":{"ed25519:a":"a","ed25519:b":"b"}}}}

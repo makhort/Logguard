@@ -1,0 +1,32 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run cli_line
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-signal-bot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-signal-bot = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "cli_line"
+path = "fuzz_targets/cli_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "alert_file"
+path = "fuzz_targets/alert_file.rs"
+test = false
+doc = false
+bench = false

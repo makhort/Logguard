@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","error":{"code":-1,"message":"Failed to send message","data":{"response":{"timestamp":1,"results":[{"recipientAddress":{"number":"+491701234567"},"type":"IDENTITY_FAILURE","token":null}]}}},"id":8}

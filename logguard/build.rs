@@ -19,5 +19,14 @@ fn main() {
     println!("cargo:rustc-env=LOGGUARD_VERSION={version}");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/index");
+    // A commit on a branch moves the branch's ref, not HEAD (which names the branch); it is
+    // in a file of its own, or in packed-refs. Only files that exist: cargo reruns this
+    // script on every build for a missing one.
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]).map(|r| format!("../.git/{r}"));
+    for f in branch.iter().map(String::as_str).chain(["../.git/packed-refs"]) {
+        if std::path::Path::new(f).exists() {
+            println!("cargo:rerun-if-changed={f}");
+        }
+    }
     println!("cargo:rerun-if-changed=src");
 }

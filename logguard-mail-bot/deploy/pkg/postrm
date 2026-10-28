@@ -1,0 +1,20 @@
+#!/bin/bash
+# logguard-mail-bot's package, after its files are removed. dpkg runs it as  postrm remove|purge|
+# upgrade..., rpm as %postun with 0 (removal) or 1 (upgrade): the same script for both.
+# config.env, the state, the keys, the outbox and the log stay on removal; dpkg's purge takes
+# them too (rpm has no purge: remove them by hand). The system user stays either way
+# (userdel logguard-mail-bot removes it).
+set -eu
+case ${1:-} in
+    remove | 0)
+        if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+            systemctl daemon-reload 2> /dev/null || true
+        fi
+        echo "logguard-mail-bot: /opt/logguard-mail-bot and /var/log/logguard-mail-bot stay (dpkg: apt purge logguard-mail-bot removes them)"
+        ;;
+    purge)
+        rm -rf /opt/logguard-mail-bot /var/log/logguard-mail-bot
+        rm -f /etc/logrotate.d/logguard-mail-bot
+        ;;
+esac
+exit 0

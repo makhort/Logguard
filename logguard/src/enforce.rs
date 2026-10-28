@@ -8,7 +8,9 @@
 //! above UFW's ALLOW rules (plain `ufw deny` appends after them and never
 //! matches traffic to allowed ports). For hosts with plain iptables (e.g. with
 //! iptables-persistent) instead of ufw: two chains of our own in the mangle table, see
-//! [`iptables_static_rules`].
+//! [`iptables_static_rules`]; with `ipset`, the same chains match timed ipset sets instead of
+//! one rule per ban ([`ipset_create_script`]). With firewalld (Fedora, RHEL): ipsets of its own
+//! bound to a drop zone of logguard's, see [`firewalld_plan`].
 //!
 //! Bans never drop replies to connections this host opened: a banned source address can be
 //! forged (one SYN to a tripwire port), and the host must not lose its resolver, mail relay
@@ -32,8 +34,10 @@ use crate::time::{Micros, SEC};
 pub enum Kind {
     Shadow,
     Nft,
+    Firewalld,
     Ufw,
     Iptables,
+    Ipset,
 }
 
 pub struct Enforcer {
@@ -44,6 +48,8 @@ pub struct Enforcer {
     ufw: PathBuf,
     iptables: PathBuf,
     ip6tables: PathBuf,
+    firewall_cmd: PathBuf,
+    ipset: PathBuf,
     /// iptables chain names: static rules, and bans with operator allows.
     chain: String,
     table: String,
@@ -151,9 +157,156 @@ pub fn iptables_allow_rule(chain: &str, net: &Net, verb: &str) -> IptCmd {
     ipt(!net.is_v4(), &args)
 }
 
+/// firewalld's objects of logguard's (made once in its permanent configuration): ipsets of
+/// banned networks, bound as sources to a zone whose target is DROP, so firewalld drops
+/// everything from them except the zone's ports (`[ports] whitelist`) and replies to this
+/// host's own connections (firewalld accepts established traffic before any zone). A policy
+/// from that zone to any other drops their forwarded traffic too (containers' published
+/// ports; firewalld 0.9 and later). The entries are runtime only, re-added from the state
+/// file: nothing of a ban outlives logguard.
+pub const FIREWALLD_ZONE: &str = "logguard";
+const FIREWALLD_POLICY: &str = "logguard-fwd";
+const FIREWALLD_BAN4: &str = "logguard-ban4";
+const FIREWALLD_BAN6: &str = "logguard-ban6";
+/// `[geoblock]`'s networks: sources of the same zone.
+const FIREWALLD_GEO4: &str = "logguard-geo4";
+const FIREWALLD_GEO6: &str = "logguard-geo6";
+/// Most `[geoblock]` networks sent to firewalld: it takes ipset entries slowly, and the main
+/// loop (and the systemd watchdog, 2 minutes) waits for it. China is ~15,000, Russia ~23,000.
+const FIREWALLD_GEO_MAX: usize = 50_000;
+/// An ipset no rule uses, holding one runtime entry: when it is gone, firewalld was reloaded
+/// or restarted and forgot the bans too (its runtime entries aren't kept).
+const FIREWALLD_ALIVE: &str = "logguard-alive";
+const FIREWALLD_SENTINEL: &str = "192.0.2.1";
+
+fn firewalld_set(net: &Net) -> &'static str {
+    if net.is_v4() {
+        FIREWALLD_BAN4
+    } else {
+        FIREWALLD_BAN6
+    }
+}
+
+/// firewalld's names for a port list: `443/tcp`, and both protocols for a port without one.
+pub fn firewalld_ports(ports: &[PortSpec]) -> Vec<String> {
+    let mut out: Vec<String> =
+        ports_by_proto(ports).into_iter().flat_map(|(proto, list)| list.into_iter().map(move |p| format!("{p}/{proto}"))).collect();
+    out.sort();
+    out
+}
+
+/// The `firewall-cmd --permanent` calls that make what firewalld's permanent configuration
+/// lacks of logguard's objects, from what it lists: `ipsets`, `zones` and `policies` (`None`:
+/// firewalld before 0.9, no policies) as `--get-ipsets` etc. print them, `sources` and `ports`
+/// as `--zone=logguard --list-sources` / `--list-ports` do. Required calls, then those for
+/// the policy, which may fail without harm (only forwarded traffic is then not dropped).
+pub fn firewalld_plan(
+    ipsets: &str,
+    zones: &str,
+    policies: Option<&str>,
+    sources: &str,
+    ports: &str,
+    open: &[PortSpec],
+) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    let has = |list: &str, name: &str| list.split_whitespace().any(|x| x == name);
+    let call = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<String>>();
+    let zone = format!("--zone={FIREWALLD_ZONE}");
+    let mut required = Vec::new();
+    let sets = [(FIREWALLD_BAN4, "inet"), (FIREWALLD_BAN6, "inet6"), (FIREWALLD_GEO4, "inet"), (FIREWALLD_GEO6, "inet6")];
+    for (set, family) in sets {
+        if !has(ipsets, set) {
+            let family = format!("--option=family={family}");
+            required.push(call(&[&format!("--new-ipset={set}"), "--type=hash:net", &family, "--option=maxelem=1048576"]));
+        }
+    }
+    if !has(ipsets, FIREWALLD_ALIVE) {
+        required.push(call(&[&format!("--new-ipset={FIREWALLD_ALIVE}"), "--type=hash:ip", "--option=family=inet"]));
+    }
+    if !has(zones, FIREWALLD_ZONE) {
+        required.push(call(&[&format!("--new-zone={FIREWALLD_ZONE}")]));
+        required.push(call(&[&zone, "--set-target=DROP"]));
+    }
+    // (a zone from before [geoblock] gets the geo sets added)
+    for (set, _) in sets {
+        let source = format!("ipset:{set}");
+        if !has(sources, &source) {
+            required.push(call(&[&zone, &format!("--add-source={source}")]));
+        }
+    }
+    let want = firewalld_ports(open);
+    for p in &want {
+        if !has(ports, p) {
+            required.push(call(&[&zone, &format!("--add-port={p}")]));
+        }
+    }
+    for p in ports.split_whitespace().filter(|p| !want.iter().any(|w| w == p)) {
+        required.push(call(&[&zone, &format!("--remove-port={p}")]));
+    }
+    let mut optional = Vec::new();
+    if policies.is_some_and(|list| !has(list, FIREWALLD_POLICY)) {
+        let policy = format!("--policy={FIREWALLD_POLICY}");
+        optional.push(call(&[&format!("--new-policy={FIREWALLD_POLICY}")]));
+        optional.push(call(&[&policy, &format!("--add-ingress-zone={FIREWALLD_ZONE}")]));
+        optional.push(call(&[&policy, "--add-egress-zone=ANY"]));
+        optional.push(call(&[&policy, "--set-target=DROP"]));
+    }
+    (required, optional)
+}
+
+/// The ipset backend's sets: `<chain>-ban4`/`-ban6` (timed: a ban expires in the kernel),
+/// `<chain>-feed4`/`-feed6` (blocklist feeds), `<chain>-waf4`/`-waf6` (`[waf]` lists) and
+/// `<chain>-geo4`/`-geo6` (`[geoblock]`), each matched by one rule in `<chain>-ban`.
+fn ipset_set(chain: &str, what: &str, v6: bool) -> String {
+    format!("{chain}-{what}{}", if v6 { 6 } else { 4 })
+}
+
+fn ipset_name(chain: &str, what: &str, net: &Net) -> String {
+    ipset_set(chain, what, !net.is_v4())
+}
+
+/// The longest timeout ipset takes (seconds; the kernel's limit). A longer ban goes in
+/// without one, and logguard lifts it, as with iptables.
+const IPSET_MAX_TIMEOUT: i64 = 2_147_483;
+
+/// `ipset restore` lines creating the sets (with `-exist`, those already there stay as they are).
+pub fn ipset_create_script(chain: &str) -> String {
+    let mut s = String::new();
+    for (v6, family) in [(false, "inet"), (true, "inet6")] {
+        s += &format!("create {} hash:net family {family} timeout 0 maxelem 1048576\n", ipset_set(chain, "ban", v6));
+        s += &format!("create {} hash:net family {family} maxelem 1048576\n", ipset_set(chain, "feed", v6));
+        s += &format!("create {} hash:net family {family} maxelem 1048576\n", ipset_set(chain, "waf", v6));
+        s += &format!("create {} hash:net family {family} maxelem 1048576\n", ipset_set(chain, "geo", v6));
+    }
+    s
+}
+
+pub fn ipset_add_line(chain: &str, net: &Net, secs: i64) -> String {
+    let timeout = if secs > IPSET_MAX_TIMEOUT { 0 } else { secs.max(1) };
+    format!("add {} {net} timeout {timeout}\n", ipset_name(chain, "ban", net))
+}
+
+/// `ipset restore` lines replacing what the sets `<chain>-<what>4`/`6` hold (feeds, geoblock).
+pub fn ipset_list_script(chain: &str, what: &str, nets: &[Net]) -> String {
+    format!("flush {}\nflush {}\n", ipset_set(chain, what, false), ipset_set(chain, what, true)) + &ipset_fill_script(chain, what, nets)
+}
+
+/// `ipset restore` lines adding `nets` to the sets `<chain>-<what>4`/`6`.
+pub fn ipset_fill_script(chain: &str, what: &str, nets: &[Net]) -> String {
+    nets.iter().map(|n| format!("add {} {n}\n", ipset_name(chain, what, n))).collect()
+}
+
+/// The rule in `<chain>-ban` dropping what a set holds; `verb` is `-A`, `-C` or `-D`.
+pub fn ipset_match_rule(chain: &str, what: &str, v6: bool, verb: &str) -> IptCmd {
+    ipt(v6, &[verb, &format!("{chain}-ban"), "-m", "set", "--match-set", &ipset_set(chain, what, v6), "src", "-j", "DROP"])
+}
+
 /// Longest an nft or ufw call may take (a feed load is one big transaction); the main loop
 /// waits for it, and the systemd watchdog (2 min) must not fire.
 const FIREWALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Networks per command when filling the feed and geoblock sets (see `Enforcer::load_list`).
+const LOAD_CHUNK: usize = 10_000;
+/// For a firewalld reload, or thousands of its entries at once (it is slower than nft).
+const FIREWALL_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Comment tagging the rules of `[[ratelimit]]` entry `i` (used to read their counters back).
 const RL_COMMENT: &str = "logguard ratelimit";
@@ -272,6 +425,10 @@ pub fn nft_setup_script(table: &str, allow: &[Net], open_ports: &[PortSpec], lim
          \tset oper6 {{ type ipv6_addr; flags interval, timeout; }}\n\
          \tset feed4 {{ type ipv4_addr; flags interval; }}\n\
          \tset feed6 {{ type ipv6_addr; flags interval; }}\n\
+         \tset waf4 {{ type ipv4_addr; flags interval; }}\n\
+         \tset waf6 {{ type ipv6_addr; flags interval; }}\n\
+         \tset geo4 {{ type ipv4_addr; flags interval; }}\n\
+         \tset geo6 {{ type ipv6_addr; flags interval; }}\n\
          \tset tripports {{ type inet_service; }}\n\
          \tset tripseen4 {{ type ipv4_addr; flags dynamic, timeout; size 65536; timeout 10m; }}\n\
          \tset tripseen6 {{ type ipv6_addr; flags dynamic, timeout; size 65536; timeout 10m; }}\n\
@@ -301,8 +458,12 @@ pub fn nft_setup_script(table: &str, allow: &[Net], open_ports: &[PortSpec], lim
     }
     s += &format!(
         "add rule inet {table} bans ct direction reply accept\n\
+         add rule inet {table} bans ip saddr @geo4 counter drop\n\
+         add rule inet {table} bans ip6 saddr @geo6 counter drop\n\
          add rule inet {table} bans ip saddr @feed4 counter drop\n\
          add rule inet {table} bans ip6 saddr @feed6 counter drop\n\
+         add rule inet {table} bans ip saddr @waf4 counter drop\n\
+         add rule inet {table} bans ip6 saddr @waf6 counter drop\n\
          add rule inet {table} bans ip saddr @ban4 counter drop\n\
          add rule inet {table} bans ip6 saddr @ban6 counter drop\n"
     );
@@ -359,13 +520,18 @@ fn parse_rate_limit_drops(listing: &str) -> Vec<(usize, u64)> {
     drops.into_iter().collect()
 }
 
-/// Replaces the blocklist-feed sets atomically (one nft transaction).
-pub fn nft_feeds_script(table: &str, nets: &[Net]) -> String {
-    let mut s = format!("flush set inet {table} feed4\nflush set inet {table} feed6\n");
-    for (set, v4) in [("feed4", true), ("feed6", false)] {
+/// Replaces what the sets `<name>4`/`<name>6` hold (feeds, geoblock) in one transaction.
+pub fn nft_list_script(table: &str, name: &str, nets: &[Net]) -> String {
+    format!("flush set inet {table} {name}4\nflush set inet {table} {name}6\n") + &nft_fill_script(table, name, nets)
+}
+
+/// Adds `nets` to the sets `<name>4`/`<name>6`, 2000 elements a line.
+pub fn nft_fill_script(table: &str, name: &str, nets: &[Net]) -> String {
+    let mut s = String::new();
+    for (v, v4) in [(4, true), (6, false)] {
         let list: Vec<String> = nets.iter().filter(|n| n.is_v4() == v4).map(|n| n.to_string()).collect();
         for chunk in list.chunks(2000) {
-            s += &format!("add element inet {table} {set} {{ {} }}\n", chunk.join(", "));
+            s += &format!("add element inet {table} {name}{v} {{ {} }}\n", chunk.join(", "));
         }
     }
     s
@@ -400,6 +566,8 @@ impl Enforcer {
             ufw: PathBuf::new(),
             iptables: PathBuf::new(),
             ip6tables: PathBuf::new(),
+            firewall_cmd: PathBuf::new(),
+            ipset: PathBuf::new(),
             chain: String::new(),
             table: String::new(),
             setup: String::new(),
@@ -422,6 +590,8 @@ impl Enforcer {
             ufw: cfg.enforce.ufw.clone(),
             iptables: cfg.enforce.iptables.clone(),
             ip6tables: cfg.enforce.ip6tables.clone(),
+            firewall_cmd: cfg.enforce.firewall_cmd.clone(),
+            ipset: cfg.enforce.ipset.clone(),
             chain: cfg.enforce.iptables_chain.clone(),
             table: cfg.enforce.nft_table.clone(),
             setup: String::new(),
@@ -440,6 +610,7 @@ impl Enforcer {
             return e;
         }
         let try_nft = matches!(cfg.enforce.backend, Backend::Auto | Backend::Nft);
+        let try_firewalld = matches!(cfg.enforce.backend, Backend::Auto | Backend::Firewalld);
         let try_ufw = matches!(cfg.enforce.backend, Backend::Auto | Backend::Ufw);
         let try_ipt = matches!(cfg.enforce.backend, Backend::Auto | Backend::Iptables);
         if try_nft {
@@ -462,6 +633,31 @@ impl Enforcer {
                     eprintln!("logguard: nftables setup failed: {err:#}");
                     e.nft_error = Some(format!("{err:#}"));
                 }
+            }
+        }
+        // auto: firewalld only where it runs
+        if try_firewalld && (cfg.enforce.backend == Backend::Firewalld || e.firewall_cmd.exists()) {
+            match e.firewalld_setup(true) {
+                Ok(()) => {
+                    if !cfg.ratelimit.is_empty() {
+                        eprintln!("logguard: WARNING [[ratelimit]] needs nftables; not applied with firewalld");
+                    }
+                    e.kind = Kind::Firewalld;
+                    return e;
+                }
+                Err(err) => eprintln!("logguard: firewalld unavailable: {err:#}"),
+            }
+        }
+        if cfg.enforce.backend == Backend::Ipset {
+            match e.ipset_setup(true, extra_allow) {
+                Ok(()) => {
+                    if !cfg.ratelimit.is_empty() {
+                        eprintln!("logguard: WARNING [[ratelimit]] needs nftables; not applied with ipset");
+                    }
+                    e.kind = Kind::Ipset;
+                    return e;
+                }
+                Err(err) => eprintln!("logguard: ipset setup failed: {err:#}"),
             }
         }
         // auto: ufw only where it is installed, so a host with plain iptables gets iptables
@@ -536,8 +732,8 @@ impl Enforcer {
         self.extra_allow = extra_allow.to_vec();
         match self.kind {
             Kind::Nft => self.run_setup(),
-            Kind::Iptables => self.ipt_setup(false, extra_allow),
-            Kind::Ufw | Kind::Shadow => Ok(()),
+            Kind::Iptables | Kind::Ipset => self.ipt_setup(false, extra_allow),
+            Kind::Firewalld | Kind::Ufw | Kind::Shadow => Ok(()),
         }
     }
 
@@ -628,8 +824,10 @@ impl Enforcer {
         match self.kind {
             Kind::Shadow => "shadow",
             Kind::Nft => "nftables",
+            Kind::Firewalld => "firewalld",
             Kind::Ufw => "ufw",
             Kind::Iptables => "iptables",
+            Kind::Ipset => "ipset",
         }
     }
 
@@ -639,6 +837,138 @@ impl Enforcer {
         let out = crate::proc::run(cmd, Some(script.as_bytes()), FIREWALL_TIMEOUT).map_err(anyhow::Error::msg)?;
         if !out.status.success() {
             bail!("nft: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    fn run_ipset(&self, script: &str) -> Result<()> {
+        let mut cmd = Command::new(&self.ipset);
+        cmd.args(["-exist", "restore"]);
+        let out = crate::proc::run(cmd, Some(script.as_bytes()), FIREWALL_TIMEOUT).map_err(anyhow::Error::msg)?;
+        if !out.status.success() {
+            bail!("ipset: {}", out.complaint());
+        }
+        Ok(())
+    }
+
+    /// Creates the sets (if missing) and logguard's iptables chains with the rules matching
+    /// them; `fresh` also empties the ban sets and chain, to be refilled from the saved state.
+    fn ipset_setup(&self, fresh: bool, extra_allow: &[Net]) -> Result<()> {
+        self.run_ipset(&ipset_create_script(&self.chain))?;
+        if fresh {
+            self.run_ipset(&format!("flush {}\nflush {}\n", ipset_set(&self.chain, "ban", false), ipset_set(&self.chain, "ban", true)))?;
+        }
+        self.ipt_setup(fresh, extra_allow)?;
+        for v6 in [false, true] {
+            for what in ["geo", "feed", "waf", "ban"] {
+                self.ipt_ensure(ipset_match_rule(&self.chain, what, v6, "-C"), ipset_match_rule(&self.chain, what, v6, "-A"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs firewall-cmd; its stdout. Adding what is there already, or removing what isn't,
+    /// is fine (an entry the daemon re-adds after a restart, one a reload took away).
+    fn run_firewall_cmd(&self, args: &[&str]) -> Result<String> {
+        self.run_firewall_cmd_for(args, FIREWALL_TIMEOUT)
+    }
+
+    fn run_firewall_cmd_for(&self, args: &[&str], limit: Duration) -> Result<String> {
+        let mut cmd = Command::new(&self.firewall_cmd);
+        cmd.args(args);
+        let out = crate::proc::run(cmd, None, limit).map_err(anyhow::Error::msg)?;
+        let said = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && !said.contains("ALREADY_ENABLED") && !said.contains("NOT_ENABLED") {
+            bail!("firewall-cmd {}: {}", args.join(" "), out.complaint());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Makes logguard's objects in firewalld's permanent configuration where missing, and
+    /// reloads it then (firewalld makes ipsets and zones in its permanent configuration only).
+    /// `fresh` empties the ban sets, to be refilled from the saved state. The sentinel entry
+    /// goes in last.
+    fn firewalld_setup(&self, fresh: bool) -> Result<()> {
+        self.run_firewall_cmd(&["--state"])?; // fails unless firewalld runs
+        let ipsets = self.run_firewall_cmd(&["--permanent", "--get-ipsets"])?;
+        let zones = self.run_firewall_cmd(&["--permanent", "--get-zones"])?;
+        let policies = self.run_firewall_cmd(&["--permanent", "--get-policies"]).ok();
+        let zone = format!("--zone={FIREWALLD_ZONE}");
+        let (sources, ports) = if zones.split_whitespace().any(|z| z == FIREWALLD_ZONE) {
+            (
+                self.run_firewall_cmd(&["--permanent", &zone, "--list-sources"])?,
+                self.run_firewall_cmd(&["--permanent", &zone, "--list-ports"])?,
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let (required, optional) = firewalld_plan(&ipsets, &zones, policies.as_deref(), &sources, &ports, &self.open_ports);
+        let permanent = |args: &Vec<String>| {
+            let all: Vec<&str> = std::iter::once("--permanent").chain(args.iter().map(String::as_str)).collect();
+            self.run_firewall_cmd(&all)
+        };
+        for args in &required {
+            permanent(args)?;
+        }
+        for args in &optional {
+            if let Err(e) = permanent(args) {
+                eprintln!("logguard: firewalld policy {FIREWALLD_POLICY} (drops banned sources' forwarded traffic) not made: {e:#}");
+                break;
+            }
+        }
+        let runtime = self.run_firewall_cmd(&["--get-ipsets"])?;
+        if !required.is_empty() || !optional.is_empty() || !runtime.split_whitespace().any(|s| s == FIREWALLD_ALIVE) {
+            self.run_firewall_cmd_for(&["--reload"], FIREWALL_BATCH_TIMEOUT)?;
+        }
+        if fresh {
+            for set in [FIREWALLD_BAN4, FIREWALLD_BAN6] {
+                let old: Vec<String> =
+                    self.run_firewall_cmd(&[&format!("--ipset={set}"), "--get-entries"])?.split_whitespace().map(str::to_string).collect();
+                self.firewalld_file(set, "--remove-entries-from-file", &old)?;
+            }
+        }
+        self.run_firewall_cmd(&[&format!("--ipset={FIREWALLD_ALIVE}"), &format!("--add-entry={FIREWALLD_SENTINEL}")])?;
+        Ok(())
+    }
+
+    /// `--add-entries-from-file` / `--remove-entries-from-file` for many entries, in chunks.
+    /// The file is the client's to read (in the service's private /tmp).
+    fn firewalld_file(&self, set: &str, verb: &str, entries: &[String]) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for chunk in entries.chunks(10_000) {
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("logguard-firewalld-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all((chunk.join("\n") + "\n").as_bytes()));
+            let result = written.map_err(anyhow::Error::from).and_then(|()| {
+                self.run_firewall_cmd_for(&[&format!("--ipset={set}"), &format!("{verb}={}", path.display())], FIREWALL_BATCH_TIMEOUT)
+            });
+            let _ = std::fs::remove_file(&path);
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Adds many bans at once; if a chunk is refused (one entry overlapping another), one
+    /// by one, so the rest still apply.
+    fn firewalld_add_entries(&self, set: &str, nets: &[Net]) -> Result<()> {
+        for chunk in nets.chunks(10_000) {
+            let entries: Vec<String> = chunk.iter().map(Net::to_string).collect();
+            if self.firewalld_file(set, "--add-entries-from-file", &entries).is_ok() {
+                continue;
+            }
+            for e in &entries {
+                if let Err(err) = self.run_firewall_cmd(&[&format!("--ipset={set}"), &format!("--add-entry={e}")]) {
+                    eprintln!("logguard: restoring ban {e}: {err:#}");
+                }
+            }
         }
         Ok(())
     }
@@ -663,6 +993,10 @@ impl Enforcer {
                 self.run_ufw(&["prepend", "deny", "from", &net.to_string(), "comment", &comment])
             }
             Kind::Iptables => self.ipt_ensure(iptables_ban_rule(&self.chain, net, "-C"), iptables_ban_rule(&self.chain, net, "-A")),
+            Kind::Ipset => self.run_ipset(&ipset_add_line(&self.chain, net, (until - now) / SEC)),
+            Kind::Firewalld => {
+                self.run_firewall_cmd(&[&format!("--ipset={}", firewalld_set(net)), &format!("--add-entry={net}")]).map(drop)
+            }
         }
     }
 
@@ -672,6 +1006,10 @@ impl Enforcer {
             Kind::Nft => self.run_nft(&nft_delete_script(&self.table, net)),
             Kind::Ufw => self.run_ufw(&["delete", "deny", "from", &net.to_string()]),
             Kind::Iptables => self.ipt_drop(iptables_ban_rule(&self.chain, net, "-C"), iptables_ban_rule(&self.chain, net, "-D")),
+            Kind::Ipset => self.run_ipset(&format!("del {} {net}\n", ipset_name(&self.chain, "ban", net))),
+            Kind::Firewalld => {
+                self.run_firewall_cmd(&[&format!("--ipset={}", firewalld_set(net)), &format!("--remove-entry={net}")]).map(drop)
+            }
         }
     }
 
@@ -697,8 +1035,8 @@ impl Enforcer {
                 self.add(&net, until, now, &a.message)
             }
             ActionKind::Unban => self.remove(&net).or_else(|e| {
-                // For nft the kernel may already have expired the element.
-                if self.kind == Kind::Nft {
+                // For nft and ipset the kernel may already have expired the element.
+                if matches!(self.kind, Kind::Nft | Kind::Ipset) {
                     Ok(())
                 } else {
                     Err(e)
@@ -709,8 +1047,9 @@ impl Enforcer {
                 // ufw has no "skip logguard's rules only": an allow rule would open every port
                 // to the network, past your own rules. The bans inside it are lifted (Unban
                 // actions) and it is never banned again; nothing else is needed.
-                Kind::Ufw => Ok(()),
-                Kind::Iptables => {
+                // The same with firewalld: a zone's sources can't be excepted from.
+                Kind::Ufw | Kind::Firewalld => Ok(()),
+                Kind::Iptables | Kind::Ipset => {
                     self.ipt_ensure(iptables_allow_rule(&self.chain, &net, "-C"), iptables_allow_rule(&self.chain, &net, "-I"))
                 }
                 Kind::Shadow => Ok(()),
@@ -727,8 +1066,10 @@ impl Enforcer {
                     let _ = self.run_ufw(&["delete", "allow", "from", &net.to_string()]);
                     Ok(())
                 }
-                Kind::Iptables => self.ipt_drop(iptables_allow_rule(&self.chain, &net, "-C"), iptables_allow_rule(&self.chain, &net, "-D")),
-                Kind::Shadow => Ok(()),
+                Kind::Iptables | Kind::Ipset => {
+                    self.ipt_drop(iptables_allow_rule(&self.chain, &net, "-C"), iptables_allow_rule(&self.chain, &net, "-D"))
+                }
+                Kind::Firewalld | Kind::Shadow => Ok(()),
             },
             ActionKind::Alert => return,
         };
@@ -742,13 +1083,20 @@ impl Enforcer {
     /// `flush ruleset`) and rebuilds it with all active bans if not. Returns what happened.
     /// Whether our nftables chain still exists (always true for other backends).
     pub fn table_present(&self) -> bool {
-        if self.kind == Kind::Iptables {
+        if matches!(self.kind, Kind::Iptables | Kind::Ipset) {
             // the jump from PREROUTING and, at the end of our chain, the one to the bans
             let ban_chain = format!("{}-ban", self.chain);
             return [false, true].into_iter().all(|v6| {
                 self.run_ipt(&ipt(v6, &["-C", "PREROUTING", "-j", &self.chain])).is_ok()
                     && self.run_ipt(&ipt(v6, &["-C", &self.chain, "-j", &ban_chain])).is_ok()
+                    && (self.kind == Kind::Iptables || self.run_ipt(&ipset_match_rule(&self.chain, "ban", v6, "-C")).is_ok())
             });
+        }
+        if self.kind == Kind::Firewalld {
+            // `firewall-cmd --reload` (or a restart) forgets runtime entries: the sentinel too
+            let mut cmd = Command::new(&self.firewall_cmd);
+            cmd.args([&format!("--ipset={FIREWALLD_ALIVE}"), &format!("--query-entry={FIREWALLD_SENTINEL}")]);
+            return crate::proc::run(cmd, None, FIREWALL_TIMEOUT).map_or(true, |o| o.status.success());
         }
         if self.kind != Kind::Nft {
             return true;
@@ -759,23 +1107,58 @@ impl Enforcer {
         crate::proc::run(cmd, None, FIREWALL_TIMEOUT).map_or(true, |o| o.status.success())
     }
 
-    /// Rebuilds a missing table with all active bans, allowlist entries and feeds.
-    pub fn heal(&self, bans: &[Ban], allows: &[crate::engine::OperAllow], feeds: &[Net], now: Micros) -> Option<String> {
+    /// Rebuilds a missing table with all active bans, allowlist entries, feeds and `[waf]` lists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn heal(
+        &self,
+        bans: &[Ban],
+        allows: &[crate::engine::OperAllow],
+        feeds: &[Net],
+        waf: &[Net],
+        geo: &[Net],
+        now: Micros,
+    ) -> Option<String> {
         if self.table_present() {
             return None;
         }
-        if self.kind == Kind::Iptables {
-            return Some(match self.ipt_setup(true, &self.extra_allow) {
+        if matches!(self.kind, Kind::Iptables | Kind::Ipset) {
+            let setup =
+                if self.kind == Kind::Ipset { self.ipset_setup(true, &self.extra_allow) } else { self.ipt_setup(true, &self.extra_allow) };
+            return Some(match setup {
                 Ok(()) => {
                     self.restore(bans, now);
                     self.restore_allows(allows, now);
+                    if !feeds.is_empty() {
+                        let _ = self.load_feeds(feeds);
+                    }
+                    if !waf.is_empty() {
+                        let _ = self.load_waf(waf);
+                    }
+                    if !geo.is_empty() {
+                        let _ = self.load_geoblock(geo);
+                    }
                     format!(
-                        "iptables chain {} in the raw table had been removed or emptied (e.g. a firewall reload); rebuilt it and restored {} bans",
+                        "iptables chain {} in the mangle table had been removed or emptied (e.g. a firewall reload); rebuilt it and restored {} bans",
                         self.chain,
                         bans.iter().filter(|b| b.until > now).count()
                     )
                 }
                 Err(e) => format!("iptables chain {} is missing and could not be rebuilt: {e:#}", self.chain),
+            });
+        }
+        if self.kind == Kind::Firewalld {
+            return Some(match self.firewalld_setup(true) {
+                Ok(()) => {
+                    self.restore(bans, now);
+                    if !geo.is_empty() {
+                        let _ = self.load_geoblock(geo);
+                    }
+                    format!(
+                        "firewalld forgot logguard's entries (firewall-cmd --reload, or firewalld restarted); restored {} bans",
+                        bans.iter().filter(|b| b.until > now).count()
+                    )
+                }
+                Err(e) => format!("firewalld lost logguard's entries and they could not be restored: {e:#}"),
             });
         }
         Some(match self.run_setup() {
@@ -784,6 +1167,12 @@ impl Enforcer {
                 self.restore_allows(allows, now);
                 if !feeds.is_empty() {
                     let _ = self.load_feeds(feeds);
+                }
+                if !waf.is_empty() {
+                    let _ = self.load_waf(waf);
+                }
+                if !geo.is_empty() {
+                    let _ = self.load_geoblock(geo);
                 }
                 format!(
                     "nftables table inet {} had been removed (e.g. `nft flush ruleset` / nftables restart); rebuilt it and restored {} bans",
@@ -795,17 +1184,89 @@ impl Enforcer {
         })
     }
 
-    /// Loads blocklist feeds (nftables only). Returns whether they are now active.
+    /// Replaces what the nftables or ipset sets `<name>4`/`<name>6` hold. A list of up to
+    /// `LOAD_CHUNK` networks goes in one transaction, the flush included (never half-loaded);
+    /// a longer one is flushed, then filled `LOAD_CHUNK` at a time, so the script for a whole
+    /// country list (several MB) is never in memory at once.
+    fn load_list(&self, name: &str, nets: &[Net]) -> Result<()> {
+        let run = |script: &str| if self.kind == Kind::Ipset { self.run_ipset(script) } else { self.run_nft(script) };
+        let (list, fill) = (
+            |nets: &[Net]| {
+                if self.kind == Kind::Ipset {
+                    ipset_list_script(&self.chain, name, nets)
+                } else {
+                    nft_list_script(&self.table, name, nets)
+                }
+            },
+            |nets: &[Net]| {
+                if self.kind == Kind::Ipset {
+                    ipset_fill_script(&self.chain, name, nets)
+                } else {
+                    nft_fill_script(&self.table, name, nets)
+                }
+            },
+        );
+        if nets.len() <= LOAD_CHUNK {
+            return run(&list(nets));
+        }
+        run(&list(&[]))?;
+        nets.chunks(LOAD_CHUNK).try_for_each(|chunk| run(&fill(chunk)))
+    }
+
+    /// Loads blocklist feeds (nftables and ipset). Returns whether they are now active.
     pub fn load_feeds(&self, nets: &[Net]) -> Result<bool> {
         match self.kind {
-            Kind::Nft => self.run_nft(&nft_feeds_script(&self.table, nets)).map(|()| !nets.is_empty()),
+            Kind::Nft | Kind::Ipset => self.load_list("feed", nets).map(|()| !nets.is_empty()),
+            Kind::Firewalld | Kind::Ufw | Kind::Iptables | Kind::Shadow => Ok(false),
+        }
+    }
+
+    /// Loads what `[waf]` sources with `action = "list"` hold (nftables and ipset), replacing
+    /// the last list. Returns whether it is now active.
+    pub fn load_waf(&self, nets: &[Net]) -> Result<bool> {
+        match self.kind {
+            Kind::Nft | Kind::Ipset => self.load_list("waf", nets).map(|()| !nets.is_empty()),
+            Kind::Firewalld | Kind::Ufw | Kind::Iptables | Kind::Shadow => Ok(false),
+        }
+    }
+
+    /// Loads `[geoblock]`'s networks, replacing the last ones (an empty list clears them).
+    /// Returns whether they are now active: not with ufw or plain iptables, nor in shadow mode.
+    pub fn load_geoblock(&self, nets: &[Net]) -> Result<bool> {
+        match self.kind {
+            Kind::Nft | Kind::Ipset => self.load_list("geo", nets).map(|()| !nets.is_empty()),
+            Kind::Firewalld => {
+                if nets.len() > FIREWALLD_GEO_MAX {
+                    bail!(
+                        "{} networks are more than firewalld takes in good time ({FIREWALLD_GEO_MAX}): fewer countries, \
+                         or the nftables or ipset backend",
+                        nets.len()
+                    );
+                }
+                for (set, v4) in [(FIREWALLD_GEO4, true), (FIREWALLD_GEO6, false)] {
+                    let want: std::collections::BTreeSet<String> = nets.iter().filter(|n| n.is_v4() == v4).map(Net::to_string).collect();
+                    self.firewalld_sync(set, &want)?;
+                }
+                Ok(!nets.is_empty())
+            }
             Kind::Ufw | Kind::Iptables | Kind::Shadow => Ok(false),
         }
     }
 
+    /// Makes a firewalld ipset's runtime entries `want`, changing only what differs (firewalld
+    /// takes thousands of entries slowly).
+    fn firewalld_sync(&self, set: &str, want: &std::collections::BTreeSet<String>) -> Result<()> {
+        let listed = self.run_firewall_cmd_for(&[&format!("--ipset={set}"), "--get-entries"], FIREWALL_BATCH_TIMEOUT)?;
+        let have: std::collections::BTreeSet<String> = listed.split_whitespace().map(str::to_string).collect();
+        let gone: Vec<String> = have.difference(want).cloned().collect();
+        let new: Vec<String> = want.difference(&have).cloned().collect();
+        self.firewalld_file(set, "--remove-entries-from-file", &gone)?;
+        self.firewalld_file(set, "--add-entries-from-file", &new)
+    }
+
     /// Re-adds operator allowlist entries from saved state.
     pub fn restore_allows(&self, allows: &[crate::engine::OperAllow], now: Micros) {
-        if self.kind == Kind::Iptables {
+        if matches!(self.kind, Kind::Iptables | Kind::Ipset) {
             for a in allows.iter().filter(|a| a.until > now) {
                 let (check, add) = (iptables_allow_rule(&self.chain, &a.net, "-C"), iptables_allow_rule(&self.chain, &a.net, "-I"));
                 if let Err(e) = self.ipt_ensure(check, add) {
@@ -843,6 +1304,25 @@ impl Enforcer {
 
     /// Re-adds bans from saved state (nft sets don't survive a reboot).
     pub fn restore(&self, bans: &[Ban], now: Micros) {
+        let live: Vec<&Ban> = bans.iter().filter(|b| b.until > now).collect();
+        if self.kind == Kind::Ipset {
+            for chunk in live.chunks(10_000) {
+                let script: String = chunk.iter().map(|b| ipset_add_line(&self.chain, &b.net, (b.until - now) / SEC)).collect();
+                if let Err(e) = self.run_ipset(&script) {
+                    eprintln!("logguard: restoring {} bans: {e:#}", chunk.len());
+                }
+            }
+            return;
+        }
+        if self.kind == Kind::Firewalld {
+            for v6 in [false, true] {
+                let nets: Vec<Net> = live.iter().map(|b| b.net).filter(|n| n.is_v4() != v6).collect();
+                if let Err(e) = self.firewalld_add_entries(if v6 { FIREWALLD_BAN6 } else { FIREWALLD_BAN4 }, &nets) {
+                    eprintln!("logguard: restoring bans: {e:#}");
+                }
+            }
+            return;
+        }
         if self.kind == Kind::Iptables {
             for b in bans.iter().filter(|b| b.until > now) {
                 if let Err(e) = self.add(&b.net, b.until, now, "") {
@@ -866,7 +1346,7 @@ mod tests {
 
     #[test]
     fn scripts() {
-        let allow: Vec<Net> = vec!["11.42.43.31".parse().unwrap(), "2001:db8::/32".parse().unwrap()];
+        let allow: Vec<Net> = vec!["11.48.43.31".parse().unwrap(), "2001:db8::/32".parse().unwrap()];
         let ports: Vec<PortSpec> = ["51820/udp", "51821/tcp", "443"].iter().map(|p| p.parse().unwrap()).collect();
         let s = nft_setup_script("logguard", &allow, &ports, &[], None);
         assert!(s.contains("chain bans { type filter hook prerouting priority mangle - 1; policy accept; }"), "after conntrack");
@@ -881,26 +1361,30 @@ mod tests {
         let pos = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(pos("@oper4 accept") < pos("bans ct direction reply accept"));
         assert!(pos("bans ct direction reply accept") < pos("@feed4 counter drop"));
-        assert!(pos("@feed4 counter drop") < pos("@ban4 counter drop"));
+        assert!(pos("bans ct direction reply accept") < pos("@geo4 counter drop"));
+        assert!(pos("@geo4 counter drop") < pos("@feed4 counter drop"), "countries, then feeds, then bans");
+        assert!(pos("@feed4 counter drop") < pos("@waf4 counter drop") && pos("@waf6 counter drop") < pos("@ban4 counter drop"));
         assert_eq!(nft_legacy_script("logguard"), "flush chain inet logguard pre\ndelete chain inet logguard pre\n");
-        let feeds = nft_feeds_script("logguard", &["11.1.16.0/20".parse().unwrap(), "3fff:110::/29".parse().unwrap()]);
+        let feeds = nft_list_script("logguard", "feed", &["11.1.16.0/20".parse().unwrap(), "3fff:140::/29".parse().unwrap()]);
         assert_eq!(
             feeds,
-            "flush set inet logguard feed4\nflush set inet logguard feed6\nadd element inet logguard feed4 { 11.1.16.0/20 }\nadd element inet logguard feed6 { 3fff:110::/29 }\n"
+            "flush set inet logguard feed4\nflush set inet logguard feed6\nadd element inet logguard feed4 { 11.1.16.0/20 }\nadd element inet logguard feed6 { 3fff:140::/29 }\n"
         );
         assert_eq!(nft_allow_script("t", &"8.8.8.8".parse().unwrap(), 60), "add element inet t oper4 { 8.8.8.8 timeout 60s }\n");
-        assert!(s.contains("add element inet logguard allow4 { 11.42.43.31 }"));
+        assert!(s.contains("add element inet logguard allow4 { 11.48.43.31 }"));
         assert!(s.contains("add element inet logguard allow6 { 2001:db8::/32 }"));
         // the host's own 127.0.0.1 next to the configured 127.0.0.0/8 must not break the set
-        let overlapping: Vec<Net> = ["127.0.0.0/8", "127.0.0.1", "11.42.43.31"].iter().map(|n| n.parse().unwrap()).collect();
-        assert!(nft_setup_script("t", &overlapping, &[], &[], None).contains("add element inet t allow4 { 127.0.0.0/8, 11.42.43.31 }"));
-        let net: Net = "11.17.59.0/24".parse().unwrap();
-        assert_eq!(nft_add_script("logguard", &net, 3600), "add element inet logguard ban4 { 11.17.59.0/24 timeout 3600s }\n");
+        let overlapping: Vec<Net> = ["127.0.0.0/8", "127.0.0.1", "11.48.43.31"].iter().map(|n| n.parse().unwrap()).collect();
+        assert!(nft_setup_script("t", &overlapping, &[], &[], None).contains("add element inet t allow4 { 127.0.0.0/8, 11.48.43.31 }"));
+        let net: Net = "11.20.59.0/24".parse().unwrap();
+        assert_eq!(nft_add_script("logguard", &net, 3600), "add element inet logguard ban4 { 11.20.59.0/24 timeout 3600s }\n");
         let v6: Net = "2001:db8::1".parse().unwrap();
         assert_eq!(nft_delete_script("t", &v6), "delete element inet t ban6 { 2001:db8::1 }\n");
     }
 
     #[test]
+    // /proc/net fixtures as a little-endian kernel prints them (x86_64, ARM)
+    #[cfg(target_endian = "little")]
     fn kernel_tripwires() {
         let trip = Trip { ports: vec![23, 3389], rate: "60/minute".into() };
         let s = nft_setup_script("t", &[], &[], &[], Some(&trip)) + &nft_trip_rules_script("t", &trip);
@@ -928,7 +1412,7 @@ mod tests {
 
     #[test]
     fn iptables_rules() {
-        let allow: Vec<Net> = ["11.42.43.31", "127.0.0.0/8", "127.0.0.1", "2001:db8::/32"].iter().map(|n| n.parse().unwrap()).collect();
+        let allow: Vec<Net> = ["11.48.43.31", "127.0.0.0/8", "127.0.0.1", "2001:db8::/32"].iter().map(|n| n.parse().unwrap()).collect();
         let ports: Vec<PortSpec> = ["51820/udp", "443"].iter().map(|p| p.parse().unwrap()).collect();
         let lines: Vec<String> = iptables_static_rules("logguard", &allow, &ports)
             .iter()
@@ -939,7 +1423,7 @@ mod tests {
             [
                 "iptables -F logguard",
                 "iptables -A logguard -s 127.0.0.0/8 -j RETURN",
-                "iptables -A logguard -s 11.42.43.31 -j RETURN",
+                "iptables -A logguard -s 11.48.43.31 -j RETURN",
                 "iptables -A logguard -p tcp -m multiport --dports 443 -j RETURN",
                 "iptables -A logguard -p udp -m multiport --dports 443,51820 -j RETURN",
                 "iptables -A logguard -m conntrack --ctdir REPLY -j RETURN",
@@ -957,16 +1441,16 @@ mod tests {
         let rules = iptables_static_rules("c", &[], &many);
         assert_eq!(rules.iter().filter(|(v6, a)| !v6 && a.contains(&"multiport".to_string())).count(), 2);
 
-        let v4: Net = "11.17.59.0/24".parse().unwrap();
+        let v4: Net = "11.20.59.0/24".parse().unwrap();
         let v6: Net = "2001:db8::1".parse().unwrap();
         assert_eq!(
             iptables_ban_rule("logguard", &v4, "-A"),
-            (false, ["-A", "logguard-ban", "-s", "11.17.59.0/24", "-j", "DROP"].iter().map(|s| s.to_string()).collect())
+            (false, ["-A", "logguard-ban", "-s", "11.20.59.0/24", "-j", "DROP"].iter().map(|s| s.to_string()).collect())
         );
         assert!(iptables_ban_rule("logguard", &v6, "-D").0, "IPv6 goes to ip6tables");
         let top = iptables_allow_rule("logguard", &v4, "-I").1;
-        assert_eq!(top, ["-I", "logguard-ban", "1", "-s", "11.17.59.0/24", "-j", "RETURN"], "operator allows above the bans");
-        assert_eq!(iptables_allow_rule("logguard", &v4, "-D").1, ["-D", "logguard-ban", "-s", "11.17.59.0/24", "-j", "RETURN"]);
+        assert_eq!(top, ["-I", "logguard-ban", "1", "-s", "11.20.59.0/24", "-j", "RETURN"], "operator allows above the bans");
+        assert_eq!(iptables_allow_rule("logguard", &v4, "-D").1, ["-D", "logguard-ban", "-s", "11.20.59.0/24", "-j", "RETURN"]);
     }
 
     /// The iptables backend builds its chains in the mangle table (after conntrack), and
@@ -1010,6 +1494,309 @@ mod tests {
         );
         let raw: Vec<&str> = calls.lines().filter(|l| l.contains(" -t raw ")).collect();
         assert!(raw.iter().all(|l| [" -D ", " -F ", " -X "].iter().any(|v| l.contains(v))), "only the clean-up in raw: {raw:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_action(kind: ActionKind, net: &str, secs: i64) -> Action {
+        Action {
+            ts: crate::time::now(),
+            kind,
+            severity: crate::engine::Severity::Info,
+            target: Some(net.parse().unwrap()),
+            until: Some(crate::time::now() + secs * SEC),
+            message: "x".into(),
+            evidence: vec![],
+            superseded: vec![],
+            applied: false,
+            topic: None,
+            accounts: vec![],
+            user_note: None,
+            notice: None,
+            category: None,
+        }
+    }
+
+    fn fake(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn firewalld_objects() {
+        let ports: Vec<PortSpec> = ["443", "51820/udp"].iter().map(|p| p.parse().unwrap()).collect();
+        assert_eq!(firewalld_ports(&ports), ["443/tcp", "443/udp", "51820/udp"]);
+        // a new firewalld: everything, the policy apart
+        let (req, opt) = firewalld_plan("", "block drop public", Some("allow-host-ipv6"), "", "", &ports);
+        let req: Vec<String> = req.iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            req,
+            [
+                "--new-ipset=logguard-ban4 --type=hash:net --option=family=inet --option=maxelem=1048576",
+                "--new-ipset=logguard-ban6 --type=hash:net --option=family=inet6 --option=maxelem=1048576",
+                "--new-ipset=logguard-geo4 --type=hash:net --option=family=inet --option=maxelem=1048576",
+                "--new-ipset=logguard-geo6 --type=hash:net --option=family=inet6 --option=maxelem=1048576",
+                "--new-ipset=logguard-alive --type=hash:ip --option=family=inet",
+                "--new-zone=logguard",
+                "--zone=logguard --set-target=DROP",
+                "--zone=logguard --add-source=ipset:logguard-ban4",
+                "--zone=logguard --add-source=ipset:logguard-ban6",
+                "--zone=logguard --add-source=ipset:logguard-geo4",
+                "--zone=logguard --add-source=ipset:logguard-geo6",
+                "--zone=logguard --add-port=443/tcp",
+                "--zone=logguard --add-port=443/udp",
+                "--zone=logguard --add-port=51820/udp",
+            ]
+        );
+        assert_eq!(opt.len(), 4);
+        assert_eq!(opt[1].join(" "), "--policy=logguard-fwd --add-ingress-zone=logguard");
+        // all there: nothing, but ports follow the whitelist
+        let have = "logguard-ban4 logguard-ban6 logguard-geo4 logguard-geo6 logguard-alive";
+        let sources = "ipset:logguard-ban4 ipset:logguard-ban6 ipset:logguard-geo4 ipset:logguard-geo6";
+        let (req, opt) = firewalld_plan(have, "drop logguard public", Some("logguard-fwd"), sources, "443/tcp 22/tcp", &ports[..1]);
+        let req: Vec<String> = req.iter().map(|c| c.join(" ")).collect();
+        assert_eq!(req, ["--zone=logguard --add-port=443/udp", "--zone=logguard --remove-port=22/tcp"]);
+        assert!(opt.is_empty());
+        // a zone from before [geoblock]: its geo sets are added to it
+        let old_sets = "logguard-ban4 logguard-ban6 logguard-alive";
+        let (req, _) = firewalld_plan(old_sets, "logguard", None, "ipset:logguard-ban4 ipset:logguard-ban6", "", &[]);
+        let req: Vec<String> = req.iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            req,
+            [
+                "--new-ipset=logguard-geo4 --type=hash:net --option=family=inet --option=maxelem=1048576",
+                "--new-ipset=logguard-geo6 --type=hash:net --option=family=inet6 --option=maxelem=1048576",
+                "--zone=logguard --add-source=ipset:logguard-geo4",
+                "--zone=logguard --add-source=ipset:logguard-geo6",
+            ]
+        );
+        // firewalld before 0.9: no policies
+        assert!(firewalld_plan(have, "logguard", None, sources, "", &[]).1.is_empty());
+    }
+
+    #[test]
+    fn firewalld_backend() {
+        let dir = std::env::temp_dir().join(format!("lg-firewalld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (calls, alive) = (dir.join("calls"), dir.join("alive"));
+        // a firewalld without logguard's objects, with one entry left over from the last run
+        let fw = fake(
+            &dir,
+            "firewall-cmd",
+            &format!(
+                "echo \"$*\" >> '{calls}'\ncase \"$*\" in\n\
+                 --state) echo running ;;\n\
+                 *--get-entries) echo 203.0.113.5 ;;\n\
+                 --reload) touch '{made}' ;;\n\
+                 *--get-ipsets) ! [ -f '{made}' ] || echo logguard-ban4 logguard-ban6 logguard-geo4 logguard-geo6 logguard-alive ;;\n\
+                 *--list-sources) ! [ -f '{made}' ] || echo ipset:logguard-ban4 ipset:logguard-ban6 ipset:logguard-geo4 ipset:logguard-geo6 ;;\n\
+                 *--get-zones) [ -f '{made}' ] && echo drop logguard public || echo drop public ;;\n\
+                 *--get-policies) ! [ -f '{made}' ] || echo logguard-fwd ;;\n\
+                 *--list-ports) echo 443/tcp ;;\n\
+                 *--query-entry=*) [ -f '{alive}' ] ;;\n\
+                 *--ipset=logguard-alive\\ --add-entry=*) touch '{alive}' ;;\n\
+                 *-from-file=*) cat \"${{2#*=}}\" >> '{calls}' ;;\n\
+                 *--add-entry=192.0.2.77) echo 'Warning: ALREADY_ENABLED: 192.0.2.77' >&2; exit 11 ;;\n\
+                 esac\n",
+                calls = calls.display(),
+                alive = alive.display(),
+                made = dir.join("made").display()
+            ),
+        );
+        let cfg = Config {
+            mode: Mode::Enforce,
+            ports: crate::config::PortsCfg { whitelist: vec!["443/tcp".parse().unwrap()], ..Default::default() },
+            enforce: crate::config::EnforceCfg { backend: Backend::Firewalld, firewall_cmd: fw, ..Default::default() },
+            ..Default::default()
+        };
+        let e = Enforcer::new(&cfg, &[]);
+        assert_eq!(e.kind, Kind::Firewalld);
+        let log = std::fs::read_to_string(&calls).unwrap();
+        for want in [
+            "--permanent --new-ipset=logguard-ban4 --type=hash:net --option=family=inet --option=maxelem=1048576\n",
+            "--permanent --zone=logguard --set-target=DROP\n",
+            "--permanent --zone=logguard --add-source=ipset:logguard-ban6\n",
+            "--permanent --zone=logguard --add-port=443/tcp\n",
+            "--permanent --policy=logguard-fwd --add-egress-zone=ANY\n",
+            "--reload\n",
+            "203.0.113.5\n", // the leftover entry, removed from file
+            "--ipset=logguard-alive --add-entry=192.0.2.1\n",
+        ] {
+            assert!(log.contains(want), "{want}: {log}");
+        }
+        assert!(log.find("--reload").unwrap() < log.find("--remove-entries-from-file").unwrap(), "{log}");
+        assert!(e.table_present());
+
+        let _ = std::fs::remove_file(&calls);
+        let mut ban = test_action(ActionKind::Ban, "198.51.100.0/24", 3600);
+        e.apply(&mut ban);
+        let mut ban6 = test_action(ActionKind::Ban, "2001:db8::/48", 3600);
+        e.apply(&mut ban6);
+        let mut again = test_action(ActionKind::Ban, "192.0.2.77", 3600);
+        e.apply(&mut again);
+        let mut unban = test_action(ActionKind::Unban, "198.51.100.0/24", 0);
+        e.apply(&mut unban);
+        assert!(ban.applied && ban6.applied && again.applied && unban.applied, "an entry there already is fine");
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(
+            log,
+            "--ipset=logguard-ban4 --add-entry=198.51.100.0/24\n--ipset=logguard-ban6 --add-entry=2001:db8::/48\n\
+             --ipset=logguard-ban4 --add-entry=192.0.2.77\n--ipset=logguard-ban4 --remove-entry=198.51.100.0/24\n"
+        );
+
+        // a reload forgets the entries: the sentinel says so, and heal re-adds the bans
+        std::fs::remove_file(&alive).unwrap();
+        let _ = std::fs::remove_file(&calls);
+        let now = crate::time::now();
+        let bans = [
+            Ban {
+                net: "198.51.100.7".parse().unwrap(),
+                since: now,
+                until: now + 600 * SEC,
+                offence: 1,
+                reason: String::new(),
+                origin: None,
+                inner: vec![],
+            },
+            Ban {
+                net: "2001:db8::1".parse().unwrap(),
+                since: now,
+                until: now + 600 * SEC,
+                offence: 1,
+                reason: String::new(),
+                origin: None,
+                inner: vec![],
+            },
+            Ban {
+                net: "198.51.100.8".parse().unwrap(),
+                since: now,
+                until: now - SEC,
+                offence: 1,
+                reason: String::new(),
+                origin: None,
+                inner: vec![],
+            },
+        ];
+        let msg = e.heal(&bans, &[], &[], &[], &[], now).unwrap();
+        assert!(msg.contains("restored 2 bans"), "{msg}");
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(!log.contains("--reload"), "the objects are there: {log}");
+        assert!(log.contains("--ipset=logguard-ban4 --add-entries-from-file=") && log.contains("198.51.100.7\n"), "{log}");
+        assert!(log.contains("--ipset=logguard-ban6 --add-entries-from-file=") && log.contains("2001:db8::1\n"), "{log}");
+        assert!(!log.contains("198.51.100.8"), "an ended ban isn't restored: {log}");
+        assert!(e.table_present());
+
+        // [geoblock]: only the difference to what the set holds (203.0.113.5) goes over
+        let _ = std::fs::remove_file(&calls);
+        assert!(e.load_geoblock(&["198.51.100.0/24".parse().unwrap(), "2001:db8:1::/48".parse().unwrap()]).unwrap());
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(log.contains("--ipset=logguard-geo4 --remove-entries-from-file=") && log.contains("203.0.113.5\n"), "{log}");
+        assert!(log.contains("--ipset=logguard-geo4 --add-entries-from-file=") && log.contains("198.51.100.0/24\n"), "{log}");
+        assert!(log.contains("--ipset=logguard-geo6 --add-entries-from-file=") && log.contains("2001:db8:1::/48\n"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ipset_scripts() {
+        assert_eq!(
+            ipset_create_script("logguard"),
+            "create logguard-ban4 hash:net family inet timeout 0 maxelem 1048576\ncreate logguard-feed4 hash:net family inet maxelem 1048576\n\
+             create logguard-waf4 hash:net family inet maxelem 1048576\ncreate logguard-geo4 hash:net family inet maxelem 1048576\n\
+             create logguard-ban6 hash:net family inet6 timeout 0 maxelem 1048576\ncreate logguard-feed6 hash:net family inet6 maxelem 1048576\n\
+             create logguard-waf6 hash:net family inet6 maxelem 1048576\ncreate logguard-geo6 hash:net family inet6 maxelem 1048576\n"
+        );
+        let net: Net = "198.51.100.0/24".parse().unwrap();
+        assert_eq!(ipset_add_line("lg", &net, 3600), "add lg-ban4 198.51.100.0/24 timeout 3600\n");
+        assert_eq!(ipset_add_line("lg", &net, 0), "add lg-ban4 198.51.100.0/24 timeout 1\n", "a ban with a second left");
+        assert_eq!(
+            ipset_add_line("lg", &net, 365 * 86_400),
+            "add lg-ban4 198.51.100.0/24 timeout 0\n",
+            "longer than ipset takes: logguard lifts it"
+        );
+        assert_eq!(
+            ipset_list_script("lg", "feed", &[net, "2001:db8::/32".parse().unwrap()]),
+            "flush lg-feed4\nflush lg-feed6\nadd lg-feed4 198.51.100.0/24\nadd lg-feed6 2001:db8::/32\n"
+        );
+        assert_eq!(
+            ipset_match_rule("lg", "ban", true, "-A"),
+            ipt(true, &["-A", "lg-ban", "-m", "set", "--match-set", "lg-ban6", "src", "-j", "DROP"])
+        );
+    }
+
+    #[test]
+    fn ipset_backend() {
+        let dir = std::env::temp_dir().join(format!("lg-ipset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("calls");
+        let log = format!("echo \"$(basename \"$0\") $*\" >> '{}'\n", calls.display());
+        let ipt_script = format!("{log}case \"$*\" in *' -C '*) exit 1;; esac\n");
+        let cfg = Config {
+            mode: Mode::Enforce,
+            feeds: crate::feeds::FeedsCfg::default(),
+            enforce: crate::config::EnforceCfg {
+                backend: Backend::Ipset,
+                iptables: fake(&dir, "iptables", &ipt_script),
+                ip6tables: fake(&dir, "ip6tables", &ipt_script),
+                ipset: fake(&dir, "ipset", &format!("{log}cat >> '{}'\n", calls.display())),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let e = Enforcer::new(&cfg, &[]);
+        assert_eq!(e.kind, Kind::Ipset);
+        let setup = std::fs::read_to_string(&calls).unwrap();
+        let pos = |needle: &str| setup.find(needle).unwrap_or_else(|| panic!("{needle}: {setup}"));
+        assert!(pos("create logguard-ban4 hash:net family inet timeout 0") < pos("flush logguard-ban4\n"));
+        assert!(pos("flush logguard-ban6\n") < pos("iptables -w 10 -t mangle -F logguard-ban\n"));
+        assert!(
+            pos("iptables -w 10 -t mangle -F logguard-ban\n")
+                < pos("iptables -w 10 -t mangle -A logguard-ban -m set --match-set logguard-ban4 src -j DROP")
+        );
+        assert!(setup.contains("ip6tables -w 10 -t mangle -A logguard-ban -m set --match-set logguard-feed6 src -j DROP"), "{setup}");
+        assert!(setup.contains("iptables -w 10 -t mangle -A logguard-ban -m set --match-set logguard-waf4 src -j DROP"), "{setup}");
+
+        let _ = std::fs::remove_file(&calls);
+        let mut ban = test_action(ActionKind::Ban, "198.51.100.0/24", 3600);
+        e.apply(&mut ban);
+        let mut unban = test_action(ActionKind::Unban, "198.51.100.0/24", 0);
+        e.apply(&mut unban);
+        let mut allow = test_action(ActionKind::Allow, "192.0.2.9", 60);
+        e.apply(&mut allow);
+        assert!(ban.applied && unban.applied && allow.applied);
+        assert!(e.load_feeds(&["203.0.113.0/24".parse().unwrap()]).unwrap());
+        let log = std::fs::read_to_string(&calls).unwrap();
+        let timeout = log.lines().find(|l| l.starts_with("add logguard-ban4 198.51.100.0/24 timeout ")).unwrap();
+        let secs: i64 = timeout.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((3598..=3600).contains(&secs), "{timeout}");
+        assert!(log.contains("del logguard-ban4 198.51.100.0/24\n"), "{log}");
+        assert!(
+            log.contains("iptables -w 10 -t mangle -I logguard-ban 1 -s 192.0.2.9 -j RETURN\n"),
+            "an allow goes above the set rules: {log}"
+        );
+        assert!(log.contains("flush logguard-feed4\nflush logguard-feed6\nadd logguard-feed4 203.0.113.0/24\n"), "{log}");
+        assert!(e.load_geoblock(&["198.51.100.0/22".parse().unwrap()]).unwrap());
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(log.contains("flush logguard-geo4\nflush logguard-geo6\nadd logguard-geo4 198.51.100.0/22\n"), "{log}");
+        assert!(e.load_waf(&["2001:db8:5::/48".parse().unwrap()]).unwrap());
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(log.contains("flush logguard-waf4\nflush logguard-waf6\nadd logguard-waf6 2001:db8:5::/48\n"), "{log}");
+
+        // a long list: flushed, then filled LOAD_CHUNK networks per call, never all at once
+        let _ = std::fs::remove_file(&calls);
+        let many: Vec<Net> =
+            (0..25_001u32).map(|i| Net::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + (i << 8))), 24)).collect();
+        assert!(e.load_geoblock(&many).unwrap());
+        let log = std::fs::read_to_string(&calls).unwrap();
+        let calls_made: Vec<&str> = log.split("ipset -exist restore\n").filter(|c| !c.is_empty()).collect();
+        assert_eq!(calls_made.len(), 4, "a flush, then three fills");
+        assert_eq!(calls_made[0], "flush logguard-geo4\nflush logguard-geo6\n");
+        let sizes: Vec<usize> = calls_made[1..].iter().map(|c| c.lines().count()).collect();
+        assert_eq!(sizes, [LOAD_CHUNK, LOAD_CHUNK, 5_001]);
+        assert!(log.contains("add logguard-geo4 11.4.0.0/24\n") && log.contains("add logguard-geo4 11.5.40.0/24\n"), "first and last");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -348,6 +348,7 @@ fn build(mut files: Vec<Vec<Action>>, geo: Option<&GeoDb>) -> Snapshot {
     let recent: Vec<Action> = actions.iter().rev().take(RECENT).cloned().collect();
     let alerts: Vec<Action> = actions.iter().rev().filter(|a| a.kind == ActionKind::Alert).take(RECENT).cloned().collect();
     Snapshot {
+        version: String::new(),
         generated: to,
         started: from,
         mode: if applied { crate::config::Mode::Enforce } else { crate::config::Mode::Shadow },
@@ -366,6 +367,7 @@ fn build(mut files: Vec<Vec<Action>>, geo: Option<&GeoDb>) -> Snapshot {
         cluster: None,
         allowed: vec![],
         feeds: None,
+        waf: None,
         certs: vec![],
         last_lines: BTreeMap::new(),
         cron: None,
@@ -377,8 +379,11 @@ fn build(mut files: Vec<Vec<Action>>, geo: Option<&GeoDb>) -> Snapshot {
         patches: None,
         verify: None,
         procwatch: None,
+        ssh_audit: None,
         allow_hosts: vec![],
         patterns: vec![],
+        backend: None,
+        geoblock: None,
     }
 }
 
@@ -486,11 +491,11 @@ mod tests {
                 2 * h
             )),
             line(&format!(
-                r#"{{"ts":{},"kind":"ban","severity":"high","target":"11.35.1.1","until":{},"message":"ban 11.35.1.1 [Finland / Hetzner Online GmbH (AS24940)] for 1h (offence #1): x","evidence":["10-12 10:01:00 block UDP/3389","10-12 10:01:01 block TCP/3389"],"applied":true,"category":"port scan"}}"#,
+                r#"{{"ts":{},"kind":"ban","severity":"high","target":"11.41.1.1","until":{},"message":"ban 11.41.1.1 [Finland / Hetzner Online GmbH (AS24940)] for 1h (offence #1): x","evidence":["10-12 10:01:00 block UDP/3389","10-12 10:01:01 block TCP/3389"],"applied":true,"category":"port scan"}}"#,
                 h + 2,
                 9 * h
             )),
-            line(&format!(r#"{{"ts":{},"kind":"unban","severity":"info","target":"11.35.1.1","message":"unban"}}"#, 2 * h)),
+            line(&format!(r#"{{"ts":{},"kind":"unban","severity":"info","target":"11.41.1.1","message":"unban"}}"#, 2 * h)),
             line(&format!(r#"{{"ts":{},"kind":"alert","severity":"warning","message":"something"}}"#, 2 * h + 5)),
             line(r#"{"ts":0,"kind":"alert","severity":"warning","message":"no time"}"#),
         ];
@@ -500,7 +505,7 @@ mod tests {
         assert_eq!(sum.categories, BTreeMap::from([("port scan".into(), 1), ("tripwire".into(), 1)]));
         assert_eq!(sum.bans_per_hour, vec![3]);
         assert_eq!((sum.from, sum.to), (h, 2 * h + 5), "an alert without a time doesn't start the period");
-        // at the end (2h+5): 1.0.0.1 expired at 2h, 11.35.1.1 was lifted, 5.9.1.1 lasts until 3h
+        // at the end (2h+5): 1.0.0.1 expired at 2h, 11.41.1.1 was lifted, 5.9.1.1 lasts until 3h
         let active: Vec<String> = s.bans.iter().map(|b| b.net.to_string()).collect();
         assert_eq!(active, ["5.9.1.1"]);
         assert_eq!((s.bans[0].offence, s.bans[0].reason.as_str()), (2, "burst score fast=100 [1x fw_tripwire]"));

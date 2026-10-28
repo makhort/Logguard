@@ -25,5 +25,7 @@ elif ! cargo audit --quiet --deny unsound --deny yanked > /dev/null 2>&1; then
     fi
 fi
 step "static Linux binary"
-cargo build --release --quiet --target x86_64-unknown-linux-musl
-ls -l target/x86_64-unknown-linux-musl/release/logguard-tg-bot
+# TARGET=aarch64-unknown-linux-musl or armv7-unknown-linux-musleabihf builds for ARM instead
+TARGET=${TARGET:-x86_64-unknown-linux-musl}
+cargo build --release --quiet --target "$TARGET"
+ls -l target/$TARGET/release/logguard-tg-bot

@@ -169,6 +169,16 @@ impl Session {
     /// sends it to `to`. `also` is a device known to exist even if the device list
     /// fetch fails (the one that just wrote to us).
     pub(super) async fn send_encrypted(&mut self, to: Jid, bare: &str, also: Option<u32>, reply: &Reply) -> Result<(), String> {
+        let targets = self.omemo_targets(bare, also).await?;
+        let ctx = self.omemo.as_mut().ok_or("OMEMO is off")?;
+        let encrypted = ctx.store.encrypt(bare, &targets, Some(&reply.text)).map_err(|e| e.to_string())?;
+        self.send(encrypted_chat(to, encrypted)).await;
+        Ok(())
+    }
+
+    /// `bare`'s trusted devices with a session, starting sessions as needed (see
+    /// [`Session::send_encrypted`]); or why there are none.
+    pub(super) async fn omemo_targets(&mut self, bare: &str, also: Option<u32>) -> Result<Vec<u32>, String> {
         let pins = self.omemo.as_ref().ok_or("OMEMO is off")?.pins();
         let devices = self.devices_of(bare, also).await;
         for &dev in &devices {
@@ -200,14 +210,17 @@ impl Session {
                 Err(e) => log::warn!("{bare} device {dev}: {e}"),
             }
         }
-        let ctx = self.omemo.as_mut().ok_or("OMEMO is off")?;
+        let ctx = self.omemo.as_ref().ok_or("OMEMO is off")?;
+        let found = devices.len();
         let targets: Vec<u32> = devices
             .into_iter()
             .filter(|&d| ctx.store.session_identity(bare, d).is_some_and(|ik| pins.check(bare, &ik.fingerprint()).trusted()))
             .collect();
-        let encrypted = ctx.store.encrypt(bare, &targets, Some(&reply.text)).map_err(|e| e.to_string())?;
-        self.send(encrypted_chat(to, encrypted)).await;
-        Ok(())
+        match (found, targets.is_empty()) {
+            (0, _) => Err(format!("{bare} has no OMEMO device (none published)")),
+            (n, true) => Err(format!("none of {bare}'s {n} OMEMO device(s) is trusted and reachable (not pinned, or no key bundle)")),
+            _ => Ok(targets),
+        }
     }
 
     /// What Conversations does on a broken session: start a new one from the device's
@@ -253,13 +266,13 @@ impl Session {
     /// The admin alert of /abuse: encrypted when possible; in plain text only when
     /// OMEMO is not required.
     pub(super) async fn notify_admin(&mut self, note: String) {
-        let Ok(admin) = self.bot.admin_jid.parse::<Jid>() else {
-            log::error!("admin JID {} is not a JID", self.bot.admin_jid);
+        let Ok(admin) = self.admin_jid.parse::<Jid>() else {
+            log::error!("admin JID {} is not a JID", self.admin_jid);
             return;
         };
         let reply = Reply::from(note);
         if self.omemo.is_some() {
-            let bare = self.bot.admin_jid.clone();
+            let bare = self.admin_jid.clone();
             match self.send_encrypted(admin.clone(), &bare, None, &reply).await {
                 Ok(()) => return,
                 Err(e) if self.omemo.as_ref().is_some_and(|c| c.required) => {
@@ -274,7 +287,7 @@ impl Session {
 
     /// Bot and sender fingerprints, for /omemo.
     pub(super) async fn omemo_info(&mut self, sender: &str) -> String {
-        let t = self.bot.language_of(sender).texts();
+        let t = self.texts(sender);
         let Some(ctx) = &self.omemo else {
             return t.omemo_off.into();
         };
@@ -300,7 +313,7 @@ impl Session {
             out.push_str(&line);
         }
         // where keys are pinned is the admin's business
-        if sender == self.bot.admin_jid {
+        if sender == self.admin_jid {
             out.push_str(&format!("\n\nPinned keys: `{}` on the server.", trust_file.display()));
         }
         out
@@ -309,7 +322,7 @@ impl Session {
     /// An `<encrypted>` message from `sender` (bare, lowercase), already allowed to use
     /// the bot. `stale`: the command came too late to be run, and this is the reply.
     pub(super) async fn on_encrypted(&mut self, from: Jid, sender: &str, encrypted: Encrypted, stale: Option<String>) {
-        let t = self.bot.language_of(sender).texts();
+        let t = self.texts(sender);
         let Some(ctx) = &mut self.omemo else {
             self.send(chat(from, t.omemo_off_send_plain.into())).await;
             return;
@@ -327,7 +340,7 @@ impl Session {
             Err(OmemoError::Untrusted { device_id, identity }) => {
                 let fp = identity.fingerprint();
                 log::warn!("{sender} device {device_id}: OMEMO key {fp} is not pinned; command refused");
-                let intro = if sender == self.bot.admin_jid {
+                let intro = if sender == self.admin_jid {
                     format!(
                         "✗ This device's OMEMO key is not trusted by the bot:\n`{}`\nTo trust it, add this line to `{}` on the server:",
                         pretty(&fp),
@@ -354,7 +367,7 @@ impl Session {
                 }
                 // a store that can't be saved: its error names server paths
                 let error = match e {
-                    OmemoError::Save(_) if sender != self.bot.admin_jid => t.internal_error.to_string(),
+                    OmemoError::Save(_) if sender != self.admin_jid => t.internal_error.to_string(),
                     _ => e.to_string(),
                 };
                 let text = t.decrypt_failed.replace("{error}", &error);
@@ -372,7 +385,7 @@ impl Session {
         let body = body.trim().to_string();
         let fp = decrypted.identity.fingerprint();
         // (untrusted keys were refused above)
-        if pins.check(sender, &fp) == Trust::Blind && sender == self.bot.admin_jid {
+        if pins.check(sender, &fp) == Trust::Blind && sender == self.admin_jid {
             log::warn!(
                 "admin's OMEMO key is not pinned; trusting device {} ({fp}). Pin it in {}",
                 decrypted.device_id,

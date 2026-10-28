@@ -1,0 +1,94 @@
+[package]
+name = "logguard-web"
+version = "0.2.0"
+edition = "2021"
+description = "Read-only web console for a logguard cluster: every node's bans, alerts and health on one HTTPS page, for one admin"
+license = "MIT"
+repository = "https://github.com/makhort/Logguard"
+
+[dependencies]
+anyhow = "1"
+# the admin's password (Argon2id, PHC string): pure Rust
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+base64 = "0.22"
+# the agent protocol (src/wire.rs): XChaCha20-Poly1305 like the logguard cluster
+chacha20poly1305 = { version = "0.10", features = ["std", "getrandom"] }
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+hkdf = "0.12"
+# TOTP (RFC 6238: HMAC-SHA-1)
+hmac = "0.12"
+# termios for the password prompt, getuid
+libc = "0.2"
+# the TOTP secret as a QR code on the terminal (`totp-setup`); no image support
+qrcode = { version = "0.14", default-features = false }
+# the console's own certificate (`gen-cert`): self-signed, ECDSA P-256
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+# HTTPS: rustls with ring (as the bots): no OpenSSL, no aws-lc, so the static musl build works
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha1 = "0.10"
+sha2 = "0.10"
+signal-hook = { version = "0.3", default-features = false }
+# forward secrecy for the agents' replies: an ephemeral X25519 key per request
+x25519-dalek = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# the end-to-end tests hash a password with the real Argon2 parameters
+[profile.test]
+opt-level = 2
+
+# The distribution packages (scripts/package.sh builds them with cargo-deb and
+# cargo-generate-rpm; README, "Install from a package"). The deploy files come from
+# target/package/stage/, where package.sh puts deploy/'s files; the maintainer scripts are
+# deploy/pkg/. Both tables list the same files.
+[package.metadata.deb]
+maintainer = "makhort <makhort@users.noreply.github.com>"
+copyright = "2026 The logguard contributors"
+license-file = ["target/package/stage/LICENSE", "0"]
+section = "admin"
+priority = "optional"
+depends = "systemd"
+extended-description = """\
+logguard-web shows a logguard cluster to its admins over HTTPS, read only: every node's bans, \
+alerts, offenders, health and abuse reports. An agent on each node hands its logguard's data \
+(through logguard's read-only console socket) to the console, sealed with a web key of its own. \
+It installs to /opt/logguard-web with config.env from the template; nothing is started until \
+the settings, the web key, the password and the one-time codes are in place."""
+maintainer-scripts = "deploy/pkg"
+assets = [
+    ["target/release/logguard-web", "opt/logguard-web/", "755"],
+    ["target/package/stage/config.env.example", "opt/logguard-web/", "644"],
+    ["target/package/stage/logguard-web.service", "usr/lib/systemd/system/", "644"],
+    ["README.md", "usr/share/doc/logguard-web/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Read-only web console and agents for a logguard cluster"
+url = "https://github.com/makhort/Logguard"
+release = "1"
+auto-req = "no"
+post_install_script = "deploy/pkg/postinst"
+post_install_script_prog = ["/bin/bash"]
+pre_uninstall_script = "deploy/pkg/prerm"
+pre_uninstall_script_prog = ["/bin/bash"]
+post_uninstall_script = "deploy/pkg/postrm"
+post_uninstall_script_prog = ["/bin/bash"]
+assets = [
+    { source = "target/release/logguard-web", dest = "/opt/logguard-web/logguard-web", mode = "755" },
+    { source = "target/package/stage/config.env.example", dest = "/opt/logguard-web/config.env.example", mode = "644" },
+    { source = "target/package/stage/logguard-web.service", dest = "/usr/lib/systemd/system/logguard-web.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/logguard-web/README.md", mode = "644", doc = true },
+    { source = "target/package/stage/LICENSE", dest = "/usr/share/doc/logguard-web/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+shadow-utils = "*"

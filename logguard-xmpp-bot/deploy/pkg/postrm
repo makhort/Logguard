@@ -1,0 +1,21 @@
+#!/bin/bash
+# logguard-xmpp-bot's package, after its files are removed. dpkg runs it as  postrm remove|
+# purge|upgrade..., rpm as %postun with 0 (removal) or 1 (upgrade): the same script for both.
+# config.env, the state, the OMEMO keys and pins, the outbox and the log stay on removal;
+# dpkg's purge takes them too, with the logrotate rules postinst wrote (rpm has no purge:
+# remove them by hand). The client mode's system user stays either way (userdel
+# logguard-xmpp-bot removes it).
+set -eu
+case ${1:-} in
+    remove | 0)
+        if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+            systemctl daemon-reload 2> /dev/null || true
+        fi
+        echo "logguard-xmpp-bot: /opt/logguard-xmpp-bot and /var/log/logguard-xmpp-bot stay (dpkg: apt purge logguard-xmpp-bot removes them)"
+        ;;
+    purge)
+        rm -rf /opt/logguard-xmpp-bot /var/log/logguard-xmpp-bot
+        rm -f /etc/logrotate.d/logguard-xmpp-bot /etc/logrotate.d/ejabberd-logs
+        ;;
+esac
+exit 0

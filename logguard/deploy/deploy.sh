@@ -12,7 +12,8 @@ cd "$(dirname "$0")/.."
 
 HOST=${1:-xmpp}
 CONFIG=${2:-deploy/logguard.toml}
-TARGET=x86_64-unknown-linux-musl
+# An ARM server: TARGET=aarch64-unknown-linux-musl (or armv7-unknown-linux-musleabihf) ./deploy/deploy.sh ...
+export TARGET=${TARGET:-x86_64-unknown-linux-musl}   # ci.sh builds it
 
 if [ -n "$(git status --porcelain --untracked-files=no -- . 2>/dev/null)" ]; then
     echo "NOTE: deploying uncommitted changes (the binary's --version will say 'modified')"

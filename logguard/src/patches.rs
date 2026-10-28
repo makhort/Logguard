@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::PackageManager;
 use crate::time::{Dur, Micros};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,10 +21,15 @@ pub struct PatchesCfg {
     /// Ask apt which upgrades are pending (`apt-get -s dist-upgrade`, a simulation: nothing
     /// is installed, and apt's lock isn't taken). It loads apt's package cache, some tens of
     /// MB: under systemd it runs in a transient unit of its own (`systemd-run`), so that isn't
-    /// charged to logguard's memory limit.
+    /// charged to logguard's memory limit. With `package_manager = "dnf"`: dnf instead
+    /// (`dnf --cacheonly check-update`, the metadata dnf-makecache.timer keeps current).
     pub apt: bool,
     pub apt_get: PathBuf,
+    pub dnf: PathBuf,
     pub systemd_run: PathBuf,
+    /// The top-level `package_manager` (`Config::share_package_manager`).
+    #[serde(skip)]
+    pub package_manager: PackageManager,
 }
 
 impl Default for PatchesCfg {
@@ -33,7 +39,9 @@ impl Default for PatchesCfg {
             interval: Dur(6 * 3600),
             apt: true,
             apt_get: "/usr/bin/apt-get".into(),
+            dnf: "/usr/bin/dnf".into(),
             systemd_run: "/usr/bin/systemd-run".into(),
+            package_manager: PackageManager::Apt,
         }
     }
 }
@@ -50,6 +58,9 @@ pub struct Stale {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PatchReport {
     pub read: Micros,
+    /// Which tool was asked: what the digest says to run.
+    #[serde(default)]
+    pub manager: PackageManager,
     /// Pending upgrades, when apt was asked.
     #[serde(default)]
     pub upgradable: Option<usize>,
@@ -90,7 +101,7 @@ impl PatchReport {
         if self.security_count > 0 {
             let names = self.security.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
             let more = if self.security_count > 8 { ", ..." } else { "" };
-            out.push(format!("{} security updates pending ({names}{more}): apt upgrade", self.security_count));
+            out.push(format!("{} security updates pending ({names}{more}): {}", self.security_count, self.manager.upgrade_command()));
         }
         if let Some(k) = self.kernel_pending() {
             out.push(format!("kernel {k} is installed but {} runs: reboot", self.running_kernel.as_deref().unwrap_or("?")));
@@ -112,8 +123,13 @@ impl PatchReport {
 
     /// One line for the dashboard and `status`.
     pub fn summary(&self) -> String {
-        let c = self.concerns();
+        let mut c = self.concerns();
         if !c.is_empty() {
+            // the other updates too, which the concerns don't count
+            match self.upgradable {
+                Some(n) if n > self.security_count => c.push(format!("{} other updates pending", n - self.security_count)),
+                _ => {}
+            }
             return c.join("; ");
         }
         match self.upgradable {
@@ -170,6 +186,37 @@ pub fn parse_apt_simulation(text: &str) -> (usize, Vec<String>) {
     (total, security)
 }
 
+/// `dnf check-update` output (dnf 4 and 5): a `name.arch  version  repository` line per
+/// pending update, which dnf 4 wraps after a long name; then, after an "Obsoleting packages"
+/// heading, the packages replaced, which aren't updates. Names, sorted, each once.
+pub fn parse_dnf_check_update(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for l in text.lines() {
+        if l.trim_start().to_ascii_lowercase().starts_with("obsoleting") {
+            break;
+        }
+        match lines.last_mut() {
+            Some(prev) if l.starts_with(char::is_whitespace) => {
+                prev.push(' ');
+                prev.push_str(l.trim());
+            }
+            _ => lines.push(l.to_string()),
+        }
+    }
+    let mut names: Vec<String> = lines
+        .iter()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (name, arch) = f.first()?.rsplit_once('.')?;
+            (f.len() == 3 && !name.is_empty() && !arch.is_empty() && f[1].chars().next()?.is_ascii_alphanumeric())
+                .then(|| crate::event::clean(name, 64))
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The newest kernel among `/boot/vmlinuz-*` names.
 pub fn newest_kernel<'a>(names: impl Iterator<Item = &'a str>) -> Option<String> {
     names.filter_map(|n| n.strip_prefix("vmlinuz-")).filter(|v| !v.is_empty()).max_by(|a, b| natural_cmp(a, b)).map(str::to_string)
@@ -224,35 +271,65 @@ fn stale_processes(proc: &Path) -> Vec<Stale> {
     by_name.into_values().collect()
 }
 
-/// The command apt-get runs as. Run by systemd (`INVOCATION_ID` is set for a service), in a
-/// transient unit of its own: apt's package cache (some tens of MB) would otherwise count
-/// against logguard's memory limit, next to everything else running then.
+/// The command apt-get (or dnf) runs as. Run by systemd (`INVOCATION_ID` is set for a
+/// service), in a transient unit of its own: apt's package cache (some tens of MB; dnf's
+/// metadata, a few hundred) would otherwise count against logguard's memory limit, next to
+/// everything else running then. systemd-run passes on the program's exit status.
 fn apt_command(cfg: &PatchesCfg, under_systemd: bool) -> Command {
+    let (program, memory) = match cfg.package_manager {
+        PackageManager::Apt => (&cfg.apt_get, "512M"),
+        PackageManager::Dnf => (&cfg.dnf, "1G"),
+    };
     if !(under_systemd && cfg.systemd_run.exists()) {
-        let mut cmd = Command::new(&cfg.apt_get);
+        let mut cmd = Command::new(program);
         cmd.env("LC_ALL", "C");
         return cmd;
     }
     let mut cmd = Command::new(&cfg.systemd_run);
-    cmd.args([
-        "--quiet",
-        "--wait",
-        "--pipe",
-        "--collect",
-        "--property=MemoryMax=512M",
-        "--property=RuntimeMaxSec=110",
-        "--property=Nice=10",
-        "--setenv=LC_ALL=C",
-        "--",
-    ])
-    .arg(&cfg.apt_get);
+    cmd.args(["--quiet", "--wait", "--pipe", "--collect"])
+        .arg(format!("--property=MemoryMax={memory}"))
+        .args(["--property=RuntimeMaxSec=110", "--property=Nice=10", "--setenv=LC_ALL=C", "--"])
+        .arg(program);
     cmd
+}
+
+/// Pending updates from dnf, and the security ones: `check-update` exits 100 when there are
+/// some, 0 when none. From the metadata on disk only (`--cacheonly`), like apt's simulation:
+/// no download, and dnf's lock isn't taken.
+fn dnf_updates(cfg: &PatchesCfg, security: bool) -> Result<Vec<String>, String> {
+    let mut cmd = apt_command(cfg, std::env::var_os("INVOCATION_ID").is_some());
+    cmd.args(["--cacheonly", "--quiet", "check-update"]);
+    if security {
+        cmd.arg("--security");
+    }
+    let out = crate::proc::run(cmd, None, Duration::from_secs(120))?;
+    match out.status.code() {
+        Some(0 | 100) => Ok(parse_dnf_check_update(&String::from_utf8_lossy(&out.stdout))),
+        _ => Err(format!("dnf check-update: {}", crate::event::clean(&out.complaint(), 200))),
+    }
 }
 
 /// Reads the patch status of this host.
 pub fn scan(cfg: &PatchesCfg, now: Micros) -> PatchReport {
-    let mut r = PatchReport { read: now, ..Default::default() };
-    if cfg.apt && cfg.apt_get.exists() {
+    let mut r = PatchReport { read: now, manager: cfg.package_manager, ..Default::default() };
+    if cfg.apt && cfg.package_manager == PackageManager::Dnf && cfg.dnf.exists() {
+        match dnf_updates(cfg, false) {
+            Ok(all) => {
+                r.upgradable = Some(all.len());
+                if !all.is_empty() {
+                    match dnf_updates(cfg, true) {
+                        Ok(sec) => {
+                            r.security_count = sec.len();
+                            r.security = sec.into_iter().take(30).collect();
+                        }
+                        Err(e) => r.errors.push(e),
+                    }
+                }
+            }
+            Err(e) => r.errors.push(e),
+        }
+    }
+    if cfg.apt && cfg.package_manager == PackageManager::Apt && cfg.apt_get.exists() {
         let mut cmd = apt_command(cfg, std::env::var_os("INVOCATION_ID").is_some());
         // a simulation, as any user can run it; no lock, so a running upgrade isn't disturbed
         cmd.args(["-s", "-q", "-o", "Debug::NoLocking=true", "dist-upgrade"]);
@@ -320,6 +397,14 @@ mod tests {
         assert!(c[2].contains("1 programs still run replaced code (sshd)"));
         assert_eq!(PatchReport { upgradable: Some(0), ..Default::default() }.summary(), "up to date");
         assert_eq!(PatchReport { upgradable: Some(3), ..Default::default() }.summary(), "3 updates pending, none for security");
+        assert!(r.summary().ends_with("; 1 other updates pending"), "{}", r.summary());
+        let kernel = PatchReport {
+            upgradable: Some(0),
+            running_kernel: Some("7.2.10".into()),
+            newest_kernel: Some("7.2.11".into()),
+            ..Default::default()
+        };
+        assert_eq!(kernel.summary(), "kernel 7.2.11 is installed but 7.2.10 runs: reboot", "none pending: not said");
     }
 
     #[test]
@@ -345,5 +430,38 @@ mod tests {
         assert_eq!(stale_file(Some("/usr/sbin/sshd (deleted)"), "").as_deref(), Some("/usr/sbin/sshd"));
         assert_eq!(stale_file(Some("/tmp/x (deleted)"), "7f-7f rw-s 0 00:01 9 /dev/shm/y (deleted)\n"), None, "not an upgrade");
         assert_eq!(stale_file(None, "7f-7f r--p 0 08:01 5 /usr/share/locale/x.mo (deleted)\n"), None, "libraries only");
+    }
+
+    #[test]
+    fn dnf_check_update_output() {
+        // dnf 4: a blank line first, a long name wrapped, obsoleted packages at the end
+        let dnf4 = "\nopenssl-libs.x86_64                 1:3.2.2-9.fc41           updates\n\
+                    kernel-core.x86_64                  6.11.5-300.fc41          updates\n\
+                    a-very-long-package-name-indeed.noarch\n                                    2.0-1.fc41               updates\n\
+                    openssl-libs.i686                   1:3.2.2-9.fc41           updates\n\
+                    Obsoleting Packages\nnew-thing.x86_64  1.0-1.fc41  updates\n    old-thing.x86_64  0.9-1.fc41  @System\n";
+        assert_eq!(parse_dnf_check_update(dnf4), ["a-very-long-package-name-indeed", "kernel-core", "openssl-libs"]);
+        // dnf 5
+        let dnf5 = "Repositories loaded.\nopenssh-server.aarch64 9.8p1-3.fc42 updates\nSecurity: kernel-core-6.11.4-301.fc42.aarch64 is an installed security update\n";
+        assert_eq!(parse_dnf_check_update(dnf5), ["openssh-server"]);
+        assert!(parse_dnf_check_update("").is_empty());
+        let r = PatchReport {
+            manager: PackageManager::Dnf,
+            upgradable: Some(1),
+            security_count: 1,
+            security: vec!["openssh-server".into()],
+            ..Default::default()
+        };
+        assert_eq!(r.concerns(), ["1 security updates pending (openssh-server): dnf upgrade"]);
+    }
+
+    #[test]
+    fn dnf_runs_outside_the_service_too() {
+        let cfg = PatchesCfg { systemd_run: "/bin/sh".into(), package_manager: PackageManager::Dnf, ..Default::default() };
+        let unit = apt_command(&cfg, true);
+        let a: Vec<String> = unit.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(a.contains(&"--property=MemoryMax=1G".to_string()), "{a:?}");
+        assert_eq!(a.last().map(String::as_str), Some("/usr/bin/dnf"));
+        assert_eq!(apt_command(&cfg, false).get_program(), "/usr/bin/dnf");
     }
 }

@@ -1,0 +1,19 @@
+#!/bin/bash
+# logguard's package, after its files are removed. dpkg runs it as  postrm remove|purge|
+# upgrade..., rpm as %postun with 0 (removal) or 1 (upgrade): the same script for both. The
+# config, the cluster key, the state (bans, baselines) and the logs stay on removal; dpkg's
+# purge takes them too (rpm has no purge: remove them by hand).
+set -eu
+case ${1:-} in
+    remove | 0)
+        if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+            systemctl daemon-reload 2> /dev/null || true
+        fi
+        echo "logguard: /etc/logguard, /var/lib/logguard and /var/log/logguard stay (dpkg: apt purge logguard removes them)"
+        ;;
+    purge)
+        rm -rf /etc/logguard /var/lib/logguard /var/log/logguard /run/logguard /run/logguard-console /run/logguard-package
+        rm -f /etc/default/logguard-avscan /etc/default/logguard-abuse-report /etc/logrotate.d/logguard
+        ;;
+esac
+exit 0

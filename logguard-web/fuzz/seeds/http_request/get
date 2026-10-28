@@ -1,0 +1,5 @@
+GET /api/v1/cluster?x=1 HTTP/1.1
+Host: console.example.org:7948
+Cookie: a=b; __Host-lgw=abc
+Accept-Encoding: gzip, br
+

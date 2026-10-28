@@ -1,0 +1,39 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run keys_query
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-matrix-bot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-matrix-bot = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "keys_query"
+path = "fuzz_targets/keys_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "alert_file"
+path = "fuzz_targets/alert_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attachment"
+path = "fuzz_targets/attachment.rs"
+test = false
+doc = false
+bench = false

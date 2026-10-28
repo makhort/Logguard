@@ -1,0 +1,54 @@
+[Unit]
+Description=XMPP bot for logguard's admin messages (client mode, OMEMO-encrypted)
+# Not Wants=network-online.target: on a desktop that delays booting. Without network the
+# bot waits and tries again by itself (backing off to 5 minutes).
+After=network-online.target
+
+[Service]
+Type=simple
+# Client mode (BOT_MODE=client): install.sh installs this file as logguard-xmpp-bot.service
+# instead of the admin bot's. Its own user: no ejabberd, no ejabberdctl. install.sh creates
+# it and sets the owners and modes of /opt/logguard-xmpp-bot.
+User=logguard-xmpp-bot
+Group=logguard-xmpp-bot
+WorkingDirectory=/opt/logguard-xmpp-bot
+EnvironmentFile=/opt/logguard-xmpp-bot/config.env
+ExecStart=/opt/logguard-xmpp-bot/logguard-xmpp-bot
+
+Restart=always
+RestartSec=5
+# 78: wrong password, no SCRAM-SHA-256 (see ALLOW_SCRAM_SHA1), or a bad setting (an
+# unusable OPENPGP_KEY). Restarting would only get the address banned by the server.
+RestartPreventExitStatus=78
+
+# Hardening: the bot reads its outbox and talks to the XMPP server and its upload service,
+# nothing else. An OUTBOX_DIR or LOG_DIR elsewhere needs  ReadWritePaths=<it>
+# (systemctl edit logguard-xmpp-bot).
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/opt/logguard-xmpp-bot /var/log/logguard-xmpp-bot
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -28,7 +28,7 @@ if [ "${1:-}" = --check ]; then
     exit 0
 fi
 [ "$(id -u)" = 0 ] || die "run as root:  sudo ./install.sh"
-[ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || die "this bundle is for Linux on x86_64"
+[ "$(uname -s)" = Linux ] || die "this bundle is for Linux"
 command -v systemctl > /dev/null || die "the bot runs as a systemd service: no systemctl here"
 
 # The unzipped files may belong to another user, who could swap them while this runs:
@@ -44,5 +44,7 @@ done < SHA256SUMS
 cp SHA256SUMS "$work/"
 cd "$work"
 sha256sum -c --quiet --strict SHA256SUMS || die "files don't match SHA256SUMS: a damaged or altered bundle"
+# One bundle per architecture (TARGET: x86_64, aarch64 or armv7 hard-float): its program must run here.
+files/logguard-tg-bot --version > /dev/null 2>&1 || die "this bundle is for $(cat TARGET); this machine is $(uname -m): use its own bundle"
 
 bash files/install.sh "$@"

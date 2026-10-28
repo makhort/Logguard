@@ -36,10 +36,20 @@ if [ "${1:-}" = rollback ]; then
     exit 0
 fi
 
+# logguard's integrity watch covers the account files: announce what useradd (or a rename)
+# wrote, so it is logged instead of raised as a high alert.
+announce_accounts() {
+    [ -x /usr/local/bin/logguard ] && [ -f /etc/logguard/logguard.toml ] || return 0
+    local f files=()
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do [ -f "$f" ] && files+=("$f"); done
+    /usr/local/bin/logguard --config /etc/logguard/logguard.toml expect-change "${files[@]}" 2> /dev/null || true
+}
+
 # A system user of its own, without a home or a shell.
 if ! id "$BOT" > /dev/null 2>&1; then
     useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$BOT"
     echo "created the system user $BOT"
+    announce_accounts
 fi
 
 mkdir -p "$DIR"

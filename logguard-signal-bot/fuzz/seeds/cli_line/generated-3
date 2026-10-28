@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"source":"+15550000000","sourceNumber":"+15550000000","timestamp":1,"dataMessage":{"message":"/status"}},"account":"+491700000000"}}

@@ -1,0 +1,12 @@
+# cargo audit (scripts/ci.sh) reads this.
+[advisories]
+# RUSTSEC-2023-0071 (rsa, "Marvin"): timing side channels in RSA private-key operations
+# (decryption, signing). logguard-signal-bot only encrypts to the admin's public key (src/seal.rs, through
+# rpgp) and holds no RSA private key; no fixed rsa version exists. Look again when rpgp moves
+# to rsa 0.10 or the advisory changes.
+# RUSTSEC-2026-0387 (crypto-bigint 0.5, through rpgp 0.21's elliptic-curve 0.13): timing
+# variability in arithmetic meant to be constant-time, used for the NIST and secp256k1 curves
+# and X448. logguard-signal-bot holds no OpenPGP private key: an ECDH recipient on such a curve only meets
+# it with the one-time key of a single message (RSA goes through num-bigint, Curve25519
+# through x25519-dalek). No rpgp release uses crypto-bigint 0.7 yet: look again when one does.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

@@ -1,0 +1,6 @@
+
+
+GET /%2e%2e/.env HTTP/1.1
+Host: c
+ folded: x
+

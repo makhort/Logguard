@@ -324,7 +324,7 @@ fn config(d: &Path, key: &Path) -> Config {
 }
 
 const ALERT: &str =
-    "To: admin\nSubject: [vpn] logguard: password guessing blocked\n\n[vpn] logguard: password guessing blocked\n\n11.20.45.233 banned → ✓";
+    "To: admin\nSubject: [vpn] logguard: password guessing blocked\n\n[vpn] logguard: password guessing blocked\n\n11.23.45.233 banned → ✓";
 
 #[test]
 fn plain_smtp_to_the_local_server_with_a_login() {
@@ -343,10 +343,10 @@ fn plain_smtp_to_the_local_server_with_a_login() {
         ("alerts@example.org", &["admin@example.org".to_string()][..], Some("PLAIN alerts"))
     );
     assert!(!m.tls);
-    assert!(m.data.contains("\r\nSubject: ...\r\n") && !m.data.contains("11.20.45.233") && !m.data.contains("guessing"));
+    assert!(m.data.contains("\r\nSubject: ...\r\n") && !m.data.contains("11.23.45.233") && !m.data.contains("guessing"));
     let inner = decrypt(&secret, &m.data);
     assert!(inner.contains("Subject: [vpn] logguard: password guessing blocked\r\n"), "{inner}");
-    assert!(inner.contains("11.20.45.233 banned =E2=86=92 =E2=9C=93"), "{inner}");
+    assert!(inner.contains("11.23.45.233 banned =E2=86=92 =E2=9C=93"), "{inner}");
     assert!(!d.join("outbox/alert-1.msg").exists());
 
     // a wrong password: refused for good, which the service takes as "stop" (exit 78)

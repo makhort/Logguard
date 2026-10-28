@@ -20,12 +20,15 @@ MemoryHigh=192M
 MemoryMax=256M
 
 # Sandbox: reads logguard's records, writes the cluster inbox (/var/lib/logguard) and the
-# bots' outboxes (logguard-xmpp-bot's, logguard-tg-bot's, logguard-mail-bot's; any may be missing), talks to the peers and
+# bots' outboxes (logguard-xmpp-bot's in either mode, logguard-tg-bot's, logguard-mail-bot's,
+# logguard-signal-bot's, logguard-matrix-bot's; any may be missing), talks to the peers and
 # rdap.org. An outbox elsewhere needs  ReadWritePaths=<it>  (systemctl edit logguard-abuse-report).
 StateDirectory=logguard
 ReadWritePaths=-/opt/logguard-xmpp-bot/outbox
 ReadWritePaths=-/opt/logguard-tg-bot/outbox
 ReadWritePaths=-/opt/logguard-mail-bot/outbox
+ReadWritePaths=-/opt/logguard-signal-bot/outbox
+ReadWritePaths=-/opt/logguard-matrix-bot/outbox
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

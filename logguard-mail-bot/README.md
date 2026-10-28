@@ -11,6 +11,20 @@ works like logguard-tg-bot: logguard puts a copy of every admin message in its o
 sends it and deletes it. It can run on any logguard node, alone or next to the other bots, or
 on a relay node of its own (as logguard-tg-bot does, `deploy/logguard-tg.toml` in logguard).
 
+## Contents
+
+1. [What a mail looks like](#what-a-mail-looks-like)
+2. [Keys](#keys)
+3. [Sanitizing (optional)](#sanitizing-optional)
+4. [The mail server](#the-mail-server)
+5. [How logguard and the bot meet](#how-logguard-and-the-bot-meet)
+6. [Install from a release bundle](#install-from-a-release-bundle)
+7. [Install from a package](#install-from-a-package)
+8. [Setup](#setup)
+9. [Settings](#settings)
+10. [Retention and what the bot keeps](#retention-and-what-the-bot-keeps)
+11. [Build and test](#build-and-test)
+
 ## What a mail looks like
 
 Every mail is PGP/MIME (RFC 3156): `multipart/encrypted`, one OpenPGP message holding the
@@ -67,7 +81,7 @@ logguard-tg-bot does for Telegram (the same code, `src/redact.rs` and `src/serve
   `[acct:1a2b3c]`, an HMAC under `PSEUDONYM_KEY` (made on the first start, the bot's, 600);
   `logguard-mail-bot pseudonym alice@example.org` on the server tells which is which;
 - the servers' own addresses and host names in `SERVER_NAMES` become their node ids
-  (`nextcloud.example.org:443` → `nextcloud.xmpp:443`); attackers' addresses stay.
+  (`nextcloud.example.org:443` → `nextcloud.node1:443`); attackers' addresses stay.
 
 The weekly abuse report is never changed (as on Telegram). The Telegram bot sanitizes always.
 
@@ -117,27 +131,43 @@ longer than `bot_stuck_after`.
 
 ## Install from a release bundle
 
-Instead of `deploy.sh` (below), without a Rust toolchain: every version tag `logguard-mail-bot-v<version>` gets its bundle, `logguard-mail-bot-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit, `config.env.example`, `SHA256SUMS` and `install.sh`.
+Instead of `deploy.sh` (below), without a Rust toolchain: every version tag `logguard-mail-bot-v<version>` gets its bundle, `logguard-mail-bot-<version>-<commit>-<arch>.zip` for each architecture (`x86_64-linux-musl`, `aarch64-linux-musl` for arm64, `armv7-linux-musleabihf` for 32-bit ARMv7 with hardware floating point), as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit, `config.env.example`, `SHA256SUMS` and `install.sh`.
 
-**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip for the server's architecture (`uname -m`: `x86_64`, `aarch64`, or `armv7l` for armv7) from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the [Releases page](https://github.com/makhort/Logguard/releases) (each crate's releases are tagged `logguard-mail-bot-v<version>`):
 
 ```bash
-gh release download logguard-mail-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
-sha256sum -c logguard-mail-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-mail-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-mail-bot-v0.2.0
+arch=x86_64-linux-musl     # the server's: aarch64-linux-musl (arm64), armv7-linux-musleabihf (32-bit ARM)
+gh release download logguard-mail-bot-v0.4.0 --repo makhort/Logguard --pattern "*-$arch.zip*"   # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-mail-bot-*-$arch.zip.sha256              # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-mail-bot-*-$arch.zip --repo makhort/Logguard --source-ref refs/tags/logguard-mail-bot-v0.4.0
 ```
 
-`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-mail-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-mail-bot-*-$arch.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
 
-On the server (`apt install unzip` if needed):
+On the server (`apt install unzip` or `dnf install unzip` if needed):
 
 ```bash
-unzip logguard-mail-bot-*-x86_64-linux-musl.zip && cd logguard-mail-bot-*-x86_64-linux-musl
+arch=x86_64-linux-musl     # as above: aarch64-linux-musl, armv7-linux-musleabihf on ARM
+unzip logguard-mail-bot-*-$arch.zip && cd logguard-mail-bot-*-$arch
 sudo ./install.sh          # install or upgrade; the first time also /opt/logguard-mail-bot/config.env
 sudo ./install.sh rollback # back to the previous version
 ```
 
 The first install, as with `deploy.sh`, doesn't start the bot until `config.env` is filled in (then run it again). `install.sh` checks every file against `SHA256SUMS` in a copy only root can write, then runs the same installer as `deploy.sh` (`./install.sh --check` only checks the files).
+
+## Install from a package
+
+The same release has a package per architecture, for the distribution's package manager instead of `install.sh`: `logguard-mail-bot_<version>-1_<arch>.deb` (`amd64`, `arm64`, `armhf`; Debian, Ubuntu and their derivatives) and `logguard-mail-bot-<version>-1.<arch>.rpm` (`x86_64`, `aarch64`, `armv7hl`; Fedora, RHEL and its rebuilds), each with its `.sha256` and `.sigstore.json`, downloaded and verified as the bundle above (`--pattern "*.deb*"` or `"*.rpm*"`). CI keeps them for every commit as workflow artifacts, and `scripts/package.sh` builds them locally (`cargo install cargo-deb cargo-generate-rpm --locked` once; neither needs dpkg or rpm, so it runs on macOS too; `--target aarch64-unknown-linux-musl` or `armv7-unknown-linux-musleabihf` for the ARM ones). The package is for one host at a time: there is no apt or dnf repository.
+
+```bash
+sudo apt install ./logguard-mail-bot_0.4.0-1_amd64.deb     # Fedora, RHEL:  sudo dnf install ./logguard-mail-bot-0.4.0-1.x86_64.rpm
+sudoedit /opt/logguard-mail-bot/config.env                 # the first install put the template there
+sudo systemctl enable --now logguard-mail-bot
+```
+
+The package puts the same files in the same places as `install.sh` (`/opt/logguard-mail-bot` with the binary and `config.env.example`, the user `logguard-mail-bot`, `/var/log/logguard-mail-bot`, the logrotate rule), except the unit, which is in `/usr/lib/systemd/system`. Its post-install step does what `install.sh` does apart from copying files: the user, `config.env` from the template the first time, the owners and modes, the outbox and the log directory; and it prints what is left to do ("Setup": the addresses, the mail server, the recipients' OpenPGP keys). `dpkg-reconfigure logguard-mail-bot` (rpm: `dnf reinstall ./logguard-mail-bot-*.rpm`) runs that step again, e.g. after copying a key there. `apt remove logguard-mail-bot` (`dnf remove`) stops the bot and keeps `/opt/logguard-mail-bot`; `apt purge logguard-mail-bot` removes it with the state and keys (rpm: by hand).
+
+**Nothing starts on its own.** The first install puts the template in place and prints what to fill in; you enable the service once it is filled in. An upgrade keeps the config and restarts the service only if it was running and the config is filled in. **Over a bundle or `deploy.sh` install** the package takes over: the config, state and keys stay; the bundle's unit in `/etc/systemd/system` (it would shadow the package's) and its rollback files go, and the service is enabled again on the package's unit if it was (logguard's integrity watch reports the removed unit as a warning once). **Replacing the config:** when a terminal is there, the install asks whether to replace the config with the new template (the old one kept with the suffix `.old`); Enter, a timeout of a minute, no terminal or `DEBIAN_FRONTEND=noninteractive` keep it. `LOGGUARD_PACKAGE_CONFIG=replace` (or `keep`) answers without asking: `sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./<file>.deb`. **Rollback** is installing the previous version's package (`apt install ./<old>.deb --allow-downgrades`, `dnf downgrade ./<old>.rpm`): there is no `.prev` file.
 
 ## Setup
 
@@ -196,7 +226,7 @@ each one.
 ./scripts/ci.sh
 ```
 
-Format, clippy, the tests, `cargo audit`, and the static `x86_64-unknown-linux-musl` binary.
+Format, clippy, the tests, `cargo audit`, and the static `x86_64-unknown-linux-musl` binary (`TARGET=aarch64-unknown-linux-musl ./scripts/ci.sh`, or `armv7-unknown-linux-musleabihf`, for ARM).
 `tests/fake_smtp.rs` runs the bot against a fake mail server on 127.0.0.1 (plain, STARTTLS and
 TLS with a test CA, PLAIN and LOGIN, a server that strips STARTTLS, refusals) and runs the
 binary as systemd would; it needs to bind 127.0.0.1. `tests/gpg_interop.rs` needs `gpg`
@@ -235,7 +265,7 @@ holding `=?utf-8?b?…?=` went into the header as it was, so mail clients would 
 decoded, as other text (now encoded); a damaged signing key whose secret part no longer
 matched its public part was taken, and every mail would have carried a bad signature (now
 refused at the start); with `SANITIZE=on`, a server address replaced by its node id completed
-an address (`admin@::ffff:192.0.2.10` → `admin@xmpp`; fixed in logguard-tg-bot too). One was the
+an address (`admin@::ffff:192.0.2.10` → `admin@node1`; fixed in logguard-tg-bot too). One was the
 oracle's: a pseudonym cut by the 200-character subject limit.
 
 **Tested on a server (2026-10-20):** a Debian VPS deployed with `deploy.sh`, the unit running.

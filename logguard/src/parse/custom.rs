@@ -58,6 +58,9 @@ pub struct PatternCfg {
     /// Instead of the journal: a log file, followed from its end (`tail -F`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
+    /// More files of the same kind (the built-in sources' logs, `parse::apps`).
+    #[serde(skip)]
+    pub extra_files: Vec<PathBuf>,
     /// Must have a group `ip` (the client address); `user` (the account) is optional.
     pub regex: String,
     #[serde(default = "default_kind")]
@@ -134,6 +137,11 @@ impl PatternCfg {
         self.compile().map(|_| ())
     }
 
+    /// The log files it reads (none: journal lines).
+    pub fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        self.file.iter().chain(&self.extra_files)
+    }
+
     /// The journalctl match that brings this pattern's lines (none for a file).
     pub fn journal_match(&self) -> Option<String> {
         if self.file.is_some() {
@@ -149,8 +157,8 @@ impl PatternCfg {
     /// fields; an export without them (`journalctl -o json` of a copy, syslog text) is taken by
     /// its identifier, as the built-in parsers take theirs.
     fn applies(&self, s: &Sender) -> bool {
-        if let Some(f) = &self.file {
-            return s.file.as_deref() == f.to_str();
+        if self.file.is_some() {
+            return s.file.as_deref().is_some_and(|got| self.files().any(|f| f.to_str() == Some(got)));
         }
         if s.file.is_some() {
             return false;
@@ -213,9 +221,9 @@ pub struct Patterns {
 }
 
 impl Patterns {
-    /// Compiles `[[patterns]]` (validated with the configuration already).
-    pub fn new(cfgs: &[PatternCfg]) -> Self {
-        let list = cfgs.iter().filter_map(|c| c.compile().ok().map(|re| Compiled { cfg: c.clone(), re })).collect();
+    /// Compiles `[[patterns]]` and the built-in ones (validated with the configuration already).
+    pub fn new<'a>(cfgs: impl IntoIterator<Item = &'a PatternCfg>) -> Self {
+        let list = cfgs.into_iter().filter_map(|c| c.compile().ok().map(|re| Compiled { cfg: c.clone(), re })).collect();
         Patterns { list }
     }
 
@@ -388,7 +396,8 @@ impl PatternCfg {
     /// Where its lines come from, for the dashboard.
     pub fn from(&self) -> String {
         match (&self.file, self.unit.is_empty()) {
-            (Some(f), _) => format!("file {}", f.display()),
+            (Some(f), _) if self.extra_files.is_empty() => format!("file {}", f.display()),
+            (Some(f), _) => format!("file {} and {} more", f.display(), self.extra_files.len()),
             (None, false) if !self.identifier.is_empty() => format!("unit {}, identifier {}", self.unit, self.identifier),
             (None, false) => format!("unit {}", self.unit),
             (None, true) => format!("identifier {}, uid {}", self.identifier, self.uid.map_or("-".into(), |u| u.to_string())),
@@ -411,8 +420,8 @@ pub fn test(cfgs: &[PatternCfg], only: Option<&str>, input: impl BufRead, verbos
     let chosen: Vec<&PatternCfg> = cfgs.iter().filter(|c| only.is_none_or(|n| c.name == n)).collect();
     if chosen.is_empty() {
         match only {
-            Some(n) => bail!("no pattern named '{n}' in [[patterns]]"),
-            None => bail!("no [[patterns]] in the configuration"),
+            Some(n) => bail!("no pattern named '{n}' in [[patterns]] or [sources] apps"),
+            None => bail!("no [[patterns]] and no [sources] apps in the configuration"),
         }
     }
     let compiled: Vec<Compiled> = chosen.iter().map(|c| Ok(Compiled { cfg: (*c).clone(), re: c.compile()? })).collect::<Result<_>>()?;
@@ -465,7 +474,7 @@ pub fn test(cfgs: &[PatternCfg], only: Option<&str>, input: impl BufRead, verbos
     for (p, t) in compiled.iter().zip(&tallies) {
         let c = &p.cfg;
         let from = match &c.file {
-            Some(f) => format!("file {}", f.display()),
+            Some(_) => c.from(),
             None if !c.unit.is_empty() => format!("journal, unit {}", c.unit),
             None => format!("journal, identifier {}", c.identifier),
         };

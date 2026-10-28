@@ -1,0 +1,147 @@
+# The variant of logguard-desktop.toml for Fedora and RHEL (dnf), written from it by
+# scripts/dnf-templates.sh: edit that file, then run the script.
+# logguard for a Linux desktop or laptop (README, "Desktops and laptops"): it watches the
+# machine itself (scheduled tasks, SSH keys, sudoers, systemd units, package files, set-uid
+# programs, programs running from /tmp or deleted files, shells talking out, failed su, sudo,
+# polkit and console logins, account changes) and leaves the firewall alone. Behind a home
+# router nothing reaches a desktop from the internet: there is nobody to ban.
+#
+# SSH reachable from the internet (a forwarded port, a public address)? Then it is a server
+# for that port: set mode = "enforce", and see [canary], [ratelimit] and [allowlist] in
+# logguard-standalone.toml.
+# `logguard -c /etc/logguard/logguard.toml print-config` shows every effective setting.
+mode = "shadow"
+# "apt": dpkg and apt (Debian, Ubuntu, Mint); "dnf": rpm and dnf (Fedora; logguard-desktop-dnf.toml)
+package_manager = "dnf"
+state_file = "/var/lib/logguard/state.json"
+socket = "/run/logguard/logguard.sock"
+actions_log = "/var/log/logguard/actions.jsonl"
+
+[sources]
+ejabberd = false
+ssh = true                # nothing to read without sshd: harmless
+ufw = true                # firewall lines, when ufw or firewalld logs what it drops
+oom = true                # a process killed for lack of memory
+privilege = true          # failed su and sudo: high (a typo of your own too: "if it wasn't you")
+pam = true                # failed logins at the console, the screen lock, polkit; new accounts, admins, passwords
+audit = true              # the same as the audit log records them (with auditd or journald's audit socket)
+audit_keys = []           # audit rule keys (auditctl -k) to alert on when their rules fire, e.g. ["identity"]
+services = []             # systemd services to alert about when they fail, e.g. ["x.service"]
+apps = []                 # a web server or database on this machine: see the README's built-in sources
+
+[silence]
+# A desktop sleeps and is switched off: quiet logs are normal.
+enabled = false
+
+[allowlist]
+nets = ["127.0.0.0/8", "::1"]
+hosts = []
+
+[enforce]
+backend = "auto"          # used only with mode = "enforce"
+
+[notify]
+# Alerts are in the journal (journalctl -u logguard), the actions log and `logguard tui`.
+# For messages on your phone, a copy bot with xmpp = false (README, "Deployment layouts"):
+# xmpp_outbox (logguard-xmpp-bot in client mode: OMEMO from an account on any XMPP server, its
+# README), tg_outbox, mail_outbox, signal_outbox or matrix_outbox. With the XMPP client bot,
+# enabled = true and the three lines below. Test: logguard notify-test --xmpp-client
+enabled = false
+#xmpp = false
+#xmpp_outbox = "/opt/logguard-xmpp-bot/outbox"
+#xmpp_user = "logguard-xmpp-bot"
+
+[cluster]
+enabled = false
+node_id = "desktop"       # no cluster: only so that upgrades find this template (logguard.toml.new)
+
+[exposure]
+# Services reachable from the internet. Behind a home router none is, while desktop apps
+# (Steam, Spotify, KDE Connect) open and close listeners all day: off. On a machine with a
+# public address or forwarded ports, turn it on.
+enabled = false
+
+[feeds]
+enabled = false           # blocklists: for mode = "enforce" only
+
+[console]
+# The read-only socket for logguard-web, the web console (logguard-web/README.md): its group
+# reads this node's snapshot, digest preview and abuse reports there, never bans or unbans.
+# Empty: off.
+socket = ""                # "/run/logguard-console/console.sock" with logguard-web installed
+group = "logguard-web"
+
+[digest]
+enabled = false           # a daily summary needs [notify] or a copy bot
+
+[geo]
+enabled = false           # places for addresses: little to label on a desktop
+
+[cron]
+# New or changed crontabs, timers, the scripts they run, and the files of `files` (SSH keys,
+# sudoers, PAM, systemd units, /usr/local/bin, ...: the defaults, see logguard.toml).
+# Changes in the first day are learned quietly; after that each is reported once.
+enabled = true
+interval = "1m"
+learn = "1d"
+scripts = true
+# snapd writes units and timers at every snap install and refresh: not watched. An intruder
+# can hide a unit by naming it snap.*: on a desktop without snaps, delete these lines.
+exclude = [
+    "/etc/systemd/system/snap-*",
+    "/etc/systemd/system/snap.*",
+    "/etc/systemd/system/*.wants/snap-*",
+    "/etc/systemd/system/*.wants/snap.*",
+    "/etc/systemd/system/snap.*.d/*.conf",
+]
+rpm = "/usr/bin/rpm"            # asked which package owns a changed file (rpm -qf)
+
+[antivirus]
+enabled = false           # with ClamAV's daily scan (logguard-avscan.timer), true
+log = "/var/log/logguard/avscan.log"
+stale_after = "36h"
+# Scans of changed files (cron jobs and scripts, watched files, changed package files,
+# set-uid programs, programs from /tmp): "none", "clamav", "yara" or "both". With clamav,
+# the clamav-daemon package keeps the signatures loaded (clamscan reads 1 GB each time).
+scan_changed = "none"
+# yara_rules = ["/etc/logguard/yara"]
+
+[resources]
+enabled = true
+disks = ["/", "/home"]
+
+[patches]
+# Pending security updates, a reboot pending for a new kernel: in `logguard status` and the TUI.
+enabled = true
+interval = "6h"
+apt = true                 # here: dnf (package_manager)
+
+[verify]
+# Weekly: package programs and libraries against the package database's checksums, and the
+# set-uid programs. Snap's and Flatpak's files are outside its directories (/snap, /var/lib/flatpak).
+enabled = true
+interval = "7d"
+max_rate_mb = 10          # gentle on a laptop's disk and battery
+
+[procwatch]
+# Every minute from /proc. A desktop's apps open new connections all the time (browsers,
+# chat, games, updates): only the dangerous kinds are reported - shells and network tools
+# talking out (a reverse shell), and the ports miners and reverse shells use. Programs
+# running from /tmp, /dev/shm, memory only, or a deleted file are reported too; apps that
+# Snap or Flatpak updated while they run are not.
+enabled = true
+interval = "60s"
+new_outbound = false
+# AppImages run from their own FUSE mount in /tmp/.mount_*: not reported. A program in a
+# directory merely named so is.
+allow_appimages = true
+# Not by name: a dropper can call itself "firefox". Remote ports whose connections aren't
+# watched (a shell's still are), e.g. a game's:
+ignore_ports = []
+
+[ssh_audit]
+# sshd's settings, when it is installed: passwords, root logins, key file permissions (with
+# fixes: logguard ssh-audit). Nothing to do without sshd.
+enabled = true
+interval = "1h"
+ignore = []

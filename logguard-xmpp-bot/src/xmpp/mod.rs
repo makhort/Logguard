@@ -1,11 +1,13 @@
-//! The XMPP side: login, presence and vCard, and turning chat messages into commands.
+//! The XMPP side: login, presence and vCard, and turning chat messages into commands (admin
+//! mode) or delivering logguard's outbox (both modes; [`client`] for client mode).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -37,21 +39,20 @@ use crate::ctl::{running_as_root, Ejabberdctl, RunAs};
 use crate::i18n::Texts;
 use crate::state::State;
 
+mod client;
 mod omemo;
 mod pep;
 mod upload;
-use crate::{Args, OmemoMode, OmemoTrust, Tls};
+use crate::{Args, BotMode, OmemoMode, OmemoTrust, Tls};
 
 const BOT_FULL_NAME: &str = "Bot";
 const BOT_TITLE: &str = "Account Administration Bot";
 const BOT_ROLE: &str = "Chatbot";
 const BOT_NOTE: &str = "Your account managment helper";
+const CLIENT_TITLE: &str = "logguard notifications";
+const CLIENT_NOTE: &str = "Sends logguard's alerts and reports to its admin";
 const AVATAR_MAX_SIZE: u32 = 512;
 pub(crate) const HINTS: &str = "urn:xmpp:hints";
-/// Connections that got through TLS but never online, in a row: then the password is
-/// wrong (changed while the bot runs). mod_fail2ban bans after 5 failed logins (the
-/// startup check is one of them).
-const MAX_FAILED_LOGINS: u32 = 3;
 /// A command delivered later than this (from offline storage, after the bot was down) is
 /// not run: "/restart 5 confirm" an hour late is not what anyone wants.
 const STALE_AFTER_SECS: i64 = 120;
@@ -60,6 +61,11 @@ const STALE_AFTER_SECS: i64 = 120;
 const RECENT_IDS: usize = 500;
 /// Stanzas held while waiting for an IQ answer; more wait in the client's own queue.
 const MAX_BACKLOG: usize = 1000;
+/// The longest a send waits to be written to the connection (it stays queued after that).
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// After a ping without answer, the server counts as unreachable this long without asking
+/// again: every ping waits in tokio-xmpp's queue until the reconnect.
+const QUIET_AFTER_NO_ANSWER: Duration = Duration::from_secs(30);
 
 /// A login that retrying will not fix: wrong password, or no SCRAM-SHA-256. The process
 /// then exits with [`LoginRefused::EXIT_CODE`], which the systemd unit does not restart.
@@ -78,17 +84,189 @@ impl std::fmt::Display for LoginRefused {
 
 impl std::error::Error for LoginRefused {}
 
-/// TLS to a fixed host and port, direct or via STARTTLS. With `channel_binding` off,
-/// SCRAM runs without -PLUS even on TLS 1.3.
-#[derive(Clone, Debug)]
+/// The XMPP canary names of logguard's shipped config (`[canary] xmpp` in its
+/// deploy/logguard.toml). On a server guarded by logguard with that list, one failed login on
+/// such an account bans the address at once and every login is a critical alert, so the bot's
+/// own account must not be one of them (unless the server lists it in `[canary] except`).
+const LOGGUARD_CANARY_NAMES: &[&str] = &[
+    "test",
+    "info",
+    "support",
+    "contact",
+    "root",
+    "administrator",
+    "webmaster",
+    "postmaster",
+    "hostmaster",
+    "user",
+    "guest",
+    "demo",
+    "xmpp",
+    "jabber",
+    "office",
+    "sales",
+    "billing",
+];
+
+/// Whether `jid`'s local part is one of logguard's default canary names.
+fn default_canary(jid: &BareJid) -> bool {
+    jid.node().is_some_and(|n| LOGGUARD_CANARY_NAMES.contains(&n.as_str().to_lowercase().as_str()))
+}
+
+/// Why a login check didn't pass.
+#[derive(Debug)]
+enum CheckError {
+    /// Retrying won't help: the password is wrong, or the server offers no mechanism we take.
+    Refused(String),
+    /// No answer, or the connection broke. `visible`: the attempt reached the XMPP server, which
+    /// (or logguard, or mod_fail2ban there) may count it against this address.
+    Net { error: String, visible: bool },
+}
+
+/// Whether a failed connection attempt got as far as the XMPP server. DNS errors and a refused
+/// or unroutable TCP connect never do: those can be retried freely (an offline laptop).
+fn server_visible(e: &Error) -> bool {
+    use std::io::ErrorKind as K;
+    match e {
+        Error::DnsProto(_) | Error::DnsNet(_) | Error::Idna | Error::Addr(_) => false,
+        Error::Io(io) => !matches!(
+            io.kind(),
+            K::ConnectionRefused | K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown | K::AddrNotAvailable | K::NotConnected
+        ),
+        _ => true,
+    }
+}
+
+/// How long to wait before connecting again after `n` attempts in a row that reached the server
+/// and failed. The server may be guarded by logguard: a failed login there is 25 points, a
+/// connection without login 10, a failed TLS handshake 40, against a ban at 100 points of a
+/// score that halves every 10 minutes (and 200 of one that halves every 12 hours). With this
+/// spacing even failed TLS handshakes stay under 100, and reconnecting after a sleep or a Wi-Fi
+/// change, which normally works at once, never waits.
+fn retry_spacing(n: u32) -> Duration {
+    let mins = match n {
+        0 => 0,
+        1 => 2,
+        2 => 5,
+        3..=5 => 10,
+        6..=11 => 30,
+        _ => 60,
+    };
+    Duration::from_secs(mins * 60)
+}
+
+/// What the connector instances share (tokio-xmpp clones the connector) and the main loop
+/// resets once the session is online.
+#[derive(Debug)]
+struct ConnState {
+    /// SCRAM -PLUS (tls-exporter binding) in use.
+    channel_binding: AtomicBool,
+    /// A login with channel binding passed: a later failure is the password, not the binding.
+    cb_confirmed: AtomicBool,
+    /// Attempts in a row that reached the server and didn't get the session online.
+    unsettled: AtomicU32,
+    /// The latest connection got through TLS, and the session hasn't come online since.
+    pending_tls: AtomicBool,
+    /// Why the bot gives up (set before `gave_up` is notified).
+    refusal: std::sync::Mutex<Option<String>>,
+}
+
+impl ConnState {
+    /// The session is online: the attempts before it were fine.
+    fn settled(&self) {
+        self.unsettled.store(0, Ordering::SeqCst);
+        self.pending_tls.store(false, Ordering::SeqCst);
+    }
+}
+
+/// TLS to a fixed host and port (or SRV records), direct or via STARTTLS. With channel binding
+/// off, SCRAM runs without -PLUS even on TLS 1.3.
+///
+/// tokio-xmpp retries a failed login forever (backing off to 30 s), and a reconnect can't tell
+/// a changed password from a network that went away during the login. Before connecting after
+/// such an attempt, this waits ([`retry_spacing`]) and checks the login on a connection of its
+/// own: a wrong password then stops the bot after two failed logins, and a flaky network never
+/// does.
+#[derive(Clone)]
 struct Connector {
     dns: DnsConfig,
     direct_tls: bool,
-    channel_binding: bool,
-    /// Connections since the last time online (see [`MAX_FAILED_LOGINS`]); shared with
-    /// the main loop, which resets it, and by the clones tokio-xmpp makes.
-    attempts: Arc<AtomicU32>,
+    password: Arc<str>,
+    allow_sha1: bool,
+    timeouts: Timeouts,
+    state: Arc<ConnState>,
     gave_up: Arc<Notify>,
+}
+
+impl std::fmt::Debug for Connector {
+    // without the password
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Connector").field("dns", &self.dns).field("direct_tls", &self.direct_tls).field("state", &self.state).finish()
+    }
+}
+
+impl Connector {
+    /// TCP and TLS, nothing counted.
+    async fn raw_connect(
+        &self,
+        jid: &Jid,
+        ns: &'static str,
+        timeouts: Timeouts,
+    ) -> Result<(PendingFeaturesRecv<<Self as ServerConnector>::Stream>, ChannelBinding), Error> {
+        let (stream, cb) = if self.direct_tls {
+            DirectTlsServerConnector(self.dns.clone()).connect(jid, ns, timeouts).await?
+        } else {
+            StartTlsServerConnector(self.dns.clone()).connect(jid, ns, timeouts).await?
+        };
+        Ok((stream, if self.state.channel_binding.load(Ordering::SeqCst) { cb } else { ChannelBinding::None }))
+    }
+
+    /// One login on a connection of its own; returns the mechanism. Leaves channel binding on
+    /// only when the server offers the -PLUS variant of the best mechanism and accepts our
+    /// binding (tried once, before a login with it ever passed).
+    async fn login_check(&self, jid: &Jid) -> Result<&'static str, CheckError> {
+        let net = |error: String, visible: bool| CheckError::Net { error, visible };
+        loop {
+            let (pending, cb) =
+                self.raw_connect(jid, ns::JABBER_CLIENT, self.timeouts).await.map_err(|e| net(e.to_string(), server_visible(&e)))?;
+            let (features, stream) =
+                pending.recv_features::<FallibleStreamElement>().await.map_err(|e| net(format!("reading stream features: {e}"), true))?;
+            let offered = features.sasl_mechanisms;
+            let have_cb = !matches!(cb, ChannelBinding::None);
+            let picked = mechanism(&offered, have_cb);
+            // Without this, tokio-xmpp would move on to SCRAM-SHA-1-PLUS or PLAIN: SCRAM-SHA-256
+            // without channel binding is better than either.
+            let better_unbound = offered.contains("SCRAM-SHA-256") && picked != Some("SCRAM-SHA-256-PLUS");
+            if have_cb && (!acceptable(picked, self.allow_sha1) || better_unbound) {
+                self.state.channel_binding.store(false, Ordering::SeqCst);
+                continue;
+            }
+            let Some(mech) = picked.filter(|_| acceptable(picked, self.allow_sha1)) else {
+                let wanted = if self.allow_sha1 { "SCRAM-SHA-256 or SCRAM-SHA-1" } else { "SCRAM-SHA-256" };
+                return Err(CheckError::Refused(format!(
+                    "the server offers no {wanted} (it offers: {offered:?}); refusing weaker mechanisms"
+                )));
+            };
+            let creds = Credentials::default()
+                .with_username(jid.node().map(|n| n.as_str()).unwrap_or_default())
+                .with_password(&*self.password)
+                .with_channel_binding(cb);
+            match client_login(stream, offered, creds).await {
+                Ok(_) => {
+                    if have_cb {
+                        self.state.cb_confirmed.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(mech);
+                }
+                Err(Error::Auth(e)) if have_cb && !self.state.cb_confirmed.load(Ordering::SeqCst) => {
+                    log::warn!("{mech} failed ({e}); retrying without channel binding");
+                    self.state.channel_binding.store(false, Ordering::SeqCst);
+                }
+                Err(Error::Auth(e)) => return Err(CheckError::Refused(format!("login as {jid} with {mech} failed: {e}"))),
+                Err(e) => return Err(net(format!("login as {jid}: {e}"), true)),
+            }
+        }
+    }
 }
 
 impl ServerConnector for Connector {
@@ -101,68 +279,93 @@ impl ServerConnector for Connector {
         ns: &'static str,
         timeouts: Timeouts,
     ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), Error> {
-        let (stream, cb) = if self.direct_tls {
-            DirectTlsServerConnector(self.dns.clone()).connect(jid, ns, timeouts).await?
-        } else {
-            StartTlsServerConnector(self.dns.clone()).connect(jid, ns, timeouts).await?
-        };
-        // Only connections that reached the server count: while ejabberd restarts, TCP
-        // connects fail and the client may keep retrying.
-        if self.attempts.fetch_add(1, Ordering::SeqCst) >= MAX_FAILED_LOGINS {
-            // tokio-xmpp would retry the login forever; the main loop stops instead
-            self.gave_up.notify_one();
-            std::future::pending::<()>().await;
+        let n = self.state.unsettled.load(Ordering::SeqCst);
+        if n > 0 {
+            let wait = retry_spacing(n);
+            log::info!("{n} connection(s) in a row reached the server and failed; connecting again in {} min", wait.as_secs() / 60);
+            tokio::time::sleep(wait).await;
         }
-        Ok((stream, if self.channel_binding { cb } else { ChannelBinding::None }))
+        if self.state.pending_tls.swap(false, Ordering::SeqCst) {
+            // The last connection got through TLS but never online: a changed password, or the
+            // network went away during the login. A login of its own tells which.
+            match self.login_check(jid).await {
+                Ok(mech) => log::info!("Login check passed with {mech}; connecting"),
+                Err(CheckError::Refused(why)) => {
+                    if let Ok(mut r) = self.state.refusal.lock() {
+                        *r = Some(why);
+                    }
+                    // tokio-xmpp would retry the login forever; the main loop stops instead
+                    self.gave_up.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Err(CheckError::Net { error, visible }) => {
+                    if visible {
+                        self.state.unsettled.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // still unknown: checked again before the next attempt
+                    self.state.pending_tls.store(true, Ordering::SeqCst);
+                    return Err(Error::Io(std::io::Error::other(format!("login check: {error}"))));
+                }
+            }
+        }
+        match self.raw_connect(jid, ns, timeouts).await {
+            Ok(connected) => {
+                // counted now; the main loop resets it once the session is online
+                self.state.unsettled.fetch_add(1, Ordering::SeqCst);
+                self.state.pending_tls.store(true, Ordering::SeqCst);
+                Ok(connected)
+            }
+            Err(e) => {
+                if server_visible(&e) {
+                    self.state.unsettled.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
-/// The mechanism tokio-xmpp will pick: SCRAM-SHA-256-PLUS when there is a channel
-/// binding, else SCRAM-SHA-256.
-fn mechanism(channel_binding: bool) -> &'static str {
-    if channel_binding {
-        "SCRAM-SHA-256-PLUS"
-    } else {
-        "SCRAM-SHA-256"
-    }
+/// The mechanism tokio-xmpp will pick from `offered`, in its order: SCRAM-SHA-256, then
+/// SCRAM-SHA-1 (each -PLUS when there is a channel binding), then PLAIN.
+fn mechanism(offered: &std::collections::BTreeSet<String>, channel_binding: bool) -> Option<&'static str> {
+    let ours: [&str; 3] =
+        if channel_binding { ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-1-PLUS", "PLAIN"] } else { ["SCRAM-SHA-256", "SCRAM-SHA-1", "PLAIN"] };
+    ours.into_iter().find(|m| offered.contains(*m))
 }
 
-/// One login before the client starts. The client retries a failed login forever
-/// (backing off to 30 s), which would trip mod_fail2ban; a bad password or a server
-/// without SCRAM-SHA-256 should stop the bot instead. Leaves channel binding on only when
-/// the server offers SCRAM-SHA-256-PLUS and accepts our (tls-exporter) binding.
-async fn check_login(connector: &mut Connector, jid: &Jid, password: &str) -> Result<()> {
+/// Whether the bot logs in with `mech`: SCRAM-SHA-256, or SCRAM-SHA-1 if allowed; never PLAIN.
+fn acceptable(mech: Option<&str>, allow_sha1: bool) -> bool {
+    mech.is_some_and(|m| m.starts_with("SCRAM-SHA-256") || (allow_sha1 && m.starts_with("SCRAM-SHA-1")))
+}
+
+/// The login check before the client starts: a wrong password or a server without
+/// SCRAM-SHA-256 (or SCRAM-SHA-1 if allowed) stops the bot (exit 78). Without network (a laptop
+/// that boots offline) it waits and tries again rather than exit, spacing attempts that reached
+/// the server as [`retry_spacing`] does. `Ok(false)`: a stop signal came while waiting.
+async fn startup_login(connector: &Connector, jid: &Jid, stop: &mut (impl Future<Output = ()> + Unpin)) -> Result<bool> {
+    let mut wait = Duration::from_secs(5);
+    let mut visible = 0;
     loop {
-        let (pending, cb) = connector.connect(jid, ns::JABBER_CLIENT, Timeouts::default()).await?;
-        let (features, stream) =
-            pending.recv_features::<FallibleStreamElement>().await.map_err(|e| anyhow::anyhow!("reading stream features: {e}"))?;
-        let offered = features.sasl_mechanisms;
-        let have_cb = !matches!(cb, ChannelBinding::None);
-        let mech = mechanism(have_cb);
-        if have_cb && !offered.contains(mech) {
-            // Without this, tokio-xmpp would move on to SCRAM-SHA-1-PLUS or PLAIN.
-            connector.channel_binding = false;
-            continue;
-        }
-        if !offered.contains(mech) {
-            let msg = format!("the server offers no {mech} (it offers: {offered:?}); refusing weaker mechanisms");
-            return Err(LoginRefused(msg).into());
-        }
-        let creds = Credentials::default()
-            .with_username(jid.node().map(|n| n.as_str()).unwrap_or_default())
-            .with_password(password)
-            .with_channel_binding(cb);
-        match client_login(stream, offered, creds).await {
-            Ok(_) => {
+        let (error, delay) = match connector.login_check(jid).await {
+            Ok(mech) => {
                 log::info!("Login check passed with {mech}");
-                return Ok(());
+                return Ok(true);
             }
-            Err(Error::Auth(e)) if have_cb => {
-                log::warn!("{mech} failed ({e}); retrying without channel binding");
-                connector.channel_binding = false;
+            Err(CheckError::Refused(why)) => return Err(LoginRefused(why).into()),
+            Err(CheckError::Net { error, visible: true }) => {
+                visible += 1;
+                (error, retry_spacing(visible))
             }
-            Err(Error::Auth(e)) => return Err(LoginRefused(format!("login as {jid} with {mech} failed: {e}")).into()),
-            Err(e) => bail!("login as {jid}: {e}"),
+            Err(CheckError::Net { error, visible: false }) => {
+                let d = wait;
+                wait = (wait * 2).min(Duration::from_secs(300));
+                (error, d)
+            }
+        };
+        log::warn!("login check: {error}; trying again in {} s", delay.as_secs());
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = &mut *stop => return Ok(false),
         }
     }
 }
@@ -214,21 +417,26 @@ fn avatar_items(avatar: &Avatar) -> (Element, Element) {
     (data, Element::builder("metadata", AVATAR_METADATA).append(info).build())
 }
 
-fn vcard(args: &Args, jid: &BareJid, avatar: Option<&[u8]>) -> Element {
+/// The bot's vCard. A client bot names no web site: its account may be on anyone's server.
+fn vcard(args: &Args, domain: &str, jid: &BareJid, avatar: Option<&[u8]>) -> Element {
     use base64::Engine;
+    let client = args.mode == BotMode::Client;
     let el = |name: &str, text: &str| Element::builder(name, ns::VCARD).append(text).build();
     let mut b = Element::builder("vCard", ns::VCARD)
         .append(el("VERSION", "3.0"))
         .append(el("FN", BOT_FULL_NAME))
         .append(el("NICKNAME", jid.node().map(|n| n.as_str()).unwrap_or_default()))
-        .append(el("TITLE", BOT_TITLE))
-        .append(el("ROLE", BOT_ROLE))
-        .append(el("URL", &format!("https://{}/", args.domain)))
-        .append(el("NOTE", BOT_NOTE))
+        .append(el("TITLE", if client { CLIENT_TITLE } else { BOT_TITLE }))
+        .append(el("ROLE", BOT_ROLE));
+    if !client {
+        b = b.append(el("URL", &format!("https://{domain}/")));
+    }
+    b = b
+        .append(el("NOTE", if client { CLIENT_NOTE } else { BOT_NOTE }))
         .append(el("SORT-STRING", &args.name))
         .append(Element::builder("N", ns::VCARD).append(el("GIVEN", BOT_FULL_NAME)));
     if let Some(org) = &args.org_name {
-        b = b.append(Element::builder("ORG", ns::VCARD).append(el("ORGNAME", org)).append(el("ORGUNIT", &args.domain)));
+        b = b.append(Element::builder("ORG", ns::VCARD).append(el("ORGNAME", org)).append(el("ORGUNIT", domain)));
     }
     if let Some(jpeg) = avatar {
         let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
@@ -374,9 +582,24 @@ fn acknowledgements(m: &Message, to: &Jid) -> Vec<Message> {
     acks
 }
 
+/// What the bot is for (`BOT_MODE`).
+enum Role {
+    /// Commands for the admin and users over ejabberdctl, on the XMPP server itself.
+    Admin(Box<Bot<Ejabberdctl>>),
+    /// A copy bot: logguard's messages for the admin, OMEMO-encrypted, else as OpenPGP files.
+    Client(Box<client::ClientCtx>),
+}
+
 struct Session {
     client: Client,
-    bot: Bot<Ejabberdctl>,
+    role: Role,
+    /// The admin's bare JID, lowercase.
+    admin_jid: String,
+    /// The bot's own bare JID, lowercase.
+    bot_jid: String,
+    /// The domain whose upload service the bot uses, and (admin mode) whose accounts it
+    /// manages: XMPP_DOMAIN, else the JID's.
+    domain: String,
     vcard: Element,
     avatar: Option<Avatar>,
     omemo: Option<omemo::OmemoCtx>,
@@ -387,15 +610,79 @@ struct Session {
     /// (sender, message id) of the latest messages.
     recent: VecDeque<(String, String)>,
     upload: upload::UploadCtx,
-    /// Bound and not disconnected since.
-    online: bool,
+    /// Until then [`Session::server_answers`] says no without asking (it just got no answer).
+    quiet_until: Option<Instant>,
 }
 
 impl Session {
-    async fn send(&mut self, stanza: impl Into<Stanza>) {
-        if let Err(e) = self.client.send_stanza(stanza.into()).await {
-            log::error!("sending: {e}");
+    /// The texts for `sender`: in their language in admin mode; client mode talks English
+    /// to its admin, as admin mode does.
+    fn texts(&self, sender: &str) -> &'static Texts {
+        match &self.role {
+            Role::Admin(bot) => bot.language_of(sender).texts(),
+            Role::Client(_) => crate::i18n::Language::En.texts(),
         }
+    }
+
+    /// Whether `jid` may write to the bot (and gets its presence).
+    fn may_use(&self, jid: &BareJid) -> bool {
+        let sender = jid.to_string().to_lowercase();
+        match &self.role {
+            // exactly our domain: the Python bot's suffix test let "evil<domain>" through
+            Role::Admin(bot) => jid.domain().as_str() == self.domain && bot.may_use(&sender),
+            // the admin, on whatever server
+            Role::Client(_) => sender == self.admin_jid,
+        }
+    }
+
+    /// Sends a stanza; true once it is written to the connection. tokio-xmpp waits for that,
+    /// which while the connection is down means until the reconnect: this waits at most
+    /// [`SEND_TIMEOUT`], so the main loop keeps going (and can stop). A stanza not written by
+    /// then may still go out after the reconnect.
+    async fn send(&mut self, stanza: impl Into<Stanza>) -> bool {
+        match tokio::time::timeout(SEND_TIMEOUT, self.client.send_stanza(stanza.into())).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                log::error!("sending: {e}");
+                false
+            }
+            Err(_) => {
+                log::warn!("sending: not written within {} s (connection down?)", SEND_TIMEOUT.as_secs());
+                false
+            }
+        }
+    }
+
+    /// Whether the server answers a ping now (XEP-0199; an error answer is an answer too).
+    /// tokio-xmpp reports no disconnection: a broken connection is "suspended" until it is
+    /// back, and stanzas written in the meantime may be lost. So delivery asks first.
+    pub(super) async fn server_answers(&mut self) -> bool {
+        if self.quiet_until.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        let ping = Element::builder("ping", ns::PING).build();
+        let answered = match self.iq(None, IqRequest::Get(ping)).await {
+            Ok(_) => true,
+            Err(e) => e.condition.is_some(),
+        };
+        self.quiet_until = (!answered).then(|| Instant::now() + QUIET_AFTER_NO_ANSWER);
+        answered
+    }
+
+    /// After sending: whether it reached the server. tokio-xmpp counts a stanza as sent once it
+    /// is in the socket's buffer, also on a connection that died unnoticed (a laptop that just
+    /// woke up), and when it then can't resume the session it drops what the server hadn't
+    /// acknowledged. The connection is ordered, so a ping answered on the same session proves
+    /// delivery; no answer, or a new session meanwhile, doesn't. The outbox then keeps the
+    /// message: it may arrive twice, never not at all.
+    pub(super) async fn delivered(&mut self) -> bool {
+        let before = self.backlog.len();
+        let answered = self.server_answers().await;
+        let reset = self.backlog.iter().skip(before).any(|e| matches!(e, Event::Online { resumed: false, .. }));
+        if reset {
+            log::warn!("a new session started while sending; what was sent is sent again");
+        }
+        answered && !reset
     }
 
     async fn on_online(&mut self) {
@@ -474,7 +761,7 @@ impl Session {
         let Some(from) = p.from else { return };
         let bare = from.to_bare();
         let sender = bare.to_string().to_lowercase();
-        if bare.domain().as_str() != self.bot.domain || !self.bot.may_use(&sender) {
+        if !self.may_use(&bare) {
             log::info!("subscription request from {sender} left unanswered");
             return;
         }
@@ -495,7 +782,8 @@ impl Session {
         log::info!("asked {jid} for a presence subscription");
     }
 
-    /// Makes the subscription mutual with the admin and every allowed user of our domain,
+    /// Makes the subscription mutual with the admin and every allowed user of our domain
+    /// (client mode: with the admin only),
     /// whether or not they ever added the bot as a contact: the bot approves them (which
     /// also answers a request that came before they were allowed) and asks for theirs
     /// (see [`Session::subscribe_to`]). Users who added the bot accept that automatically
@@ -509,11 +797,14 @@ impl Session {
             Ok(None) => return,
             Err(e) => return log::warn!("fetching the roster: {}", e.text),
         };
-        let mut users: Vec<String> = self.bot.state.users_with_bot_access().iter().map(|j| j.to_lowercase()).collect();
-        users.push(self.bot.admin_jid.clone());
+        let mut users: Vec<String> = match &self.role {
+            Role::Admin(bot) => bot.state.users_with_bot_access().iter().map(|j| j.to_lowercase()).collect(),
+            Role::Client(_) => vec![],
+        };
+        users.push(self.admin_jid.clone());
         for user in users {
             let Ok(jid) = user.parse::<BareJid>() else { continue };
-            if jid.domain().as_str() != self.bot.domain {
+            if !self.may_use(&jid) {
                 continue;
             }
             let item = roster.items.iter().find(|i| i.jid.to_string().to_lowercase() == user);
@@ -531,11 +822,14 @@ impl Session {
     }
 
     /// Runs a command; if it changed who may use the bot (/allow, /deny, /remove),
-    /// sets up the subscriptions of newly allowed users.
+    /// sets up the subscriptions of newly allowed users. Client mode has its own few.
     pub(super) async fn run_command(&mut self, sender: &str, device: Option<&str>, body: &str) -> Option<Response> {
-        let before = self.bot.state.users_with_bot_access().to_vec();
-        let response = self.bot.process_from(sender, device, body, chrono::Utc::now()).await;
-        if self.bot.state.users_with_bot_access().iter().any(|j| !before.contains(j)) {
+        let Role::Admin(bot) = &mut self.role else {
+            return Some(self.client_command(body));
+        };
+        let before = bot.state.users_with_bot_access().to_vec();
+        let response = bot.process_from(sender, device, body, chrono::Utc::now()).await;
+        if bot.state.users_with_bot_access().iter().any(|j| !before.contains(j)) {
             self.complete_subscriptions().await;
         }
         response
@@ -558,14 +852,10 @@ impl Session {
             return;
         }
         let Some(from) = m.from.clone() else { return };
-        // exactly our domain: the Python bot's suffix test let "evil<domain>" through
-        if from.domain().as_str() != self.bot.domain {
+        if !self.may_use(&from.to_bare()) {
             return;
         }
         let sender = from.to_bare().to_string().to_lowercase();
-        if !self.bot.may_use(&sender) {
-            return;
-        }
         if let Some(id) = &m.id {
             if self.seen_before(&sender, &id.0) {
                 log::info!("{sender}: message {} delivered again, ignored", id.0);
@@ -575,7 +865,7 @@ impl Session {
         for ack in acknowledgements(&m, &from) {
             self.send(ack).await;
         }
-        let t = self.bot.language_of(&sender).texts();
+        let t = self.texts(&sender);
         let stale = stale_reply(&m, chrono::Utc::now(), t);
         if stale.is_some() {
             log::info!("{sender}: delayed command not run ({}s late)", delayed_by(&m, chrono::Utc::now()).unwrap_or(0));
@@ -620,9 +910,8 @@ impl Session {
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
-    let _ = tokio_xmpp::rustls::crypto::ring::default_provider().install_default();
-
+/// Admin mode's command handler: ejabberdctl (checked to work), state.json, the settings.
+async fn admin_bot(args: &Args, domain: &str, bot_jid: &str) -> Result<Bot<Ejabberdctl>> {
     let run_as = if running_as_root() {
         let r = RunAs::lookup(&args.ejabberd_user).map_err(|e| crate::ConfigError(format!("EJABBERD_USER: {e}")))?;
         log::info!("ejabberdctl runs as {}", r.name);
@@ -635,8 +924,7 @@ pub async fn run(args: Args) -> Result<()> {
         bail!("ejabberdctl not found or not accessible: {e}");
     }
     let state = State::load(&args.state_path)?;
-    let bot_jid = args.jid.split('/').next().unwrap_or(&args.jid).to_lowercase();
-    let invite_url = args.invite_url.clone().unwrap_or_else(|| format!("https://{}:5281/invites", args.domain));
+    let invite_url = args.invite_url.clone().unwrap_or_else(|| format!("https://{domain}:5281/invites"));
     let retention = crate::commands::Retention {
         messages: args.retention_message_days,
         files: args.retention_file_days,
@@ -646,18 +934,73 @@ pub async fn run(args: Args) -> Result<()> {
         reports: args.abuse_report_days,
         security: args.security_record_days,
     };
-    // JIDs arrive with their domain in lower case (nodeprep/nameprep): compare with that
-    let domain = args.domain.trim().to_lowercase();
     let announce_languages = crate::i18n::parse_languages(&args.announce_languages)
         .map_err(|e| crate::ConfigError(format!("ANNOUNCE_LANGUAGES {}: {e}", args.announce_languages)))?;
-    let bot = Bot { domain, retention, invite_url, admin_jid: args.admin.to_lowercase(), bot_jid, state, ctl, announce_languages };
+    Ok(Bot {
+        domain: domain.to_owned(),
+        retention,
+        invite_url,
+        admin_jid: args.admin.to_lowercase(),
+        bot_jid: bot_jid.to_owned(),
+        state,
+        ctl,
+        announce_languages,
+    })
+}
+
+/// Where to connect: XMPP_SERVER and the port, else the JID's domain through its SRV records.
+fn dns_config(args: &Args, domain: &str) -> (DnsConfig, bool) {
+    let direct_tls = match args.tls {
+        Tls::Direct => true,
+        Tls::Starttls => false,
+        Tls::Auto => args.port == Some(5223),
+    };
+    let default_port = if direct_tls { 5223 } else { 5222 };
+    let port = args.port.unwrap_or(default_port);
+    let dns = match &args.server {
+        Some(server) => DnsConfig::no_srv(server, port),
+        None if direct_tls => DnsConfig::srv(domain, "_xmpps-client._tcp", port),
+        None => DnsConfig::srv(domain, "_xmpp-client._tcp", port),
+    };
+    (dns, direct_tls)
+}
+
+pub async fn run(args: Args) -> Result<()> {
+    let _ = tokio_xmpp::rustls::crypto::ring::default_provider().install_default();
 
     let jid: Jid = args.jid.parse().with_context(|| format!("--jid {}", args.jid))?;
     let jid: Jid = match jid.try_into_full() {
         Ok(full) => full.into(),
         Err(bare) => bare.with_resource_str("bot")?.into(),
     };
+    let bot_jid = jid.to_bare().to_string().to_lowercase();
+    let admin_jid = args.admin.trim().to_lowercase();
+    if admin_jid.parse::<BareJid>().is_err() || !admin_jid.contains('@') {
+        return Err(crate::ConfigError(format!("ADMIN_JID {} is not an account's JID", args.admin)).into());
+    }
+    if admin_jid == bot_jid {
+        return Err(crate::ConfigError("ADMIN_JID is the bot's own account".into()).into());
+    }
+    if default_canary(&jid.to_bare()) {
+        log::warn!(
+            "BOT_JID {bot_jid}: its name is one of logguard's default canary names ([canary] xmpp): on a server guarded by \
+             logguard with that list, every login of the bot is a critical alert and one failed login bans this address. Use \
+             another account, or add the name to [canary] except in the server's logguard.toml"
+        );
+    }
+    // JIDs arrive with their domain in lower case (nodeprep/nameprep): compare with that
+    let domain = args.domain.as_deref().unwrap_or(jid.domain().as_str()).trim().to_lowercase();
     let password = args.password.clone().unwrap_or_default();
+
+    let role = match args.mode {
+        BotMode::Admin => {
+            if args.openpgp_key.is_some() {
+                log::warn!("OPENPGP_KEY is for client mode (BOT_MODE=client); the admin bot sends files over OMEMO only");
+            }
+            Role::Admin(Box::new(admin_bot(&args, &domain, &bot_jid).await?))
+        }
+        BotMode::Client => Role::Client(Box::new(client::ClientCtx::new(&args)?)),
+    };
 
     let avatar = match &args.avatar_path {
         Some(p) => match prepare_avatar(p) {
@@ -685,33 +1028,53 @@ pub async fn run(args: Args) -> Result<()> {
                 crate::omemo::trust::pretty(&store.fingerprint())
             );
             let strict = args.omemo_trust == OmemoTrust::Pinned;
-            if !crate::omemo::trust::Pins::load(&trust_file, strict).has_pins(&args.admin.to_lowercase()) {
+            if !crate::omemo::trust::Pins::load(&trust_file, strict).has_pins(&admin_jid) {
                 let which = if strict { "none" } else { "any" };
                 log::warn!("no OMEMO key pinned for {} in {}: {which} of its devices is trusted", args.admin, trust_file.display());
             }
             Some(omemo::OmemoCtx::new(mode == OmemoMode::Required, strict, store, trust_file))
         }
     };
-    let attempts = Arc::new(AtomicU32::new(0));
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let gave_up = Arc::new(Notify::new());
-    let mut connector = Connector {
-        dns: DnsConfig::no_srv(&args.server, args.port),
-        direct_tls: match args.tls {
-            Tls::Direct => true,
-            Tls::Starttls => false,
-            Tls::Auto => args.port == 5223,
-        },
-        channel_binding: true,
-        attempts: attempts.clone(),
+    let (dns, direct_tls) = dns_config(&args, jid.domain().as_str());
+    // Client mode runs on laptops too: a connection that died during a sleep or a Wi-Fi change
+    // is noticed after 75 s of silence instead of 10 minutes (an <r/> or ping after 60 s).
+    let timeouts = if args.mode == BotMode::Client { Timeouts::tight() } else { Timeouts::default() };
+    let state = Arc::new(ConnState {
+        channel_binding: AtomicBool::new(true),
+        cb_confirmed: AtomicBool::new(false),
+        unsettled: AtomicU32::new(0),
+        pending_tls: AtomicBool::new(false),
+        refusal: std::sync::Mutex::new(None),
+    });
+    let connector = Connector {
+        dns,
+        direct_tls,
+        password: Arc::from(password.as_str()),
+        allow_sha1: args.allow_scram_sha1,
+        timeouts,
+        state: state.clone(),
         gave_up: gave_up.clone(),
     };
-    check_login(&mut connector, &jid, &password).await?;
-    attempts.store(0, Ordering::SeqCst);
+    {
+        let mut stop = std::pin::pin!(async {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+        });
+        if !startup_login(&connector, &jid, &mut stop).await? {
+            log::info!("Stopped before logging in");
+            return Ok(());
+        }
+    }
 
-    let vcard = vcard(&args, &jid.to_bare(), avatar.as_ref().map(|a| a.jpeg.as_slice()));
+    let vcard = vcard(&args, &domain, &jid.to_bare(), avatar.as_ref().map(|a| a.jpeg.as_slice()));
     let disco = disco_info(&args.name);
-    let caps = caps_of(&format!("https://{}/logguard-xmpp-bot", args.domain), &disco);
-    let client = Client::new_with_connector(jid, password, connector, Timeouts::default());
+    let caps = caps_of(&format!("https://{domain}/logguard-xmpp-bot"), &disco);
+    let client = Client::new_with_connector(jid, password, connector, timeouts);
     let upload = upload::UploadCtx {
         outbox: args.outbox_dir.clone().unwrap_or_else(|| args.state_path.parent().unwrap_or(Path::new(".")).join("outbox")),
         max_age: Duration::from_secs(u64::from(args.outbox_max_days) * 86400),
@@ -721,9 +1084,19 @@ pub async fn run(args: Args) -> Result<()> {
         },
         service: None,
     };
+    if args.mode == BotMode::Client {
+        log::info!(
+            "logguard-xmpp-bot {} in client mode as {bot_jid}; admin {admin_jid}; outbox {}",
+            env!("CARGO_PKG_VERSION"),
+            upload.outbox.display()
+        );
+    }
     let mut session = Session {
         client,
-        bot,
+        role,
+        admin_jid,
+        bot_jid,
+        domain,
         vcard,
         avatar,
         omemo,
@@ -732,11 +1105,9 @@ pub async fn run(args: Args) -> Result<()> {
         backlog: VecDeque::new(),
         recent: VecDeque::new(),
         upload,
-        online: false,
+        quiet_until: None,
     };
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
     // key rotation checks; the first tick is immediate (the keys were just refreshed)
     let mut maintenance = tokio::time::interval(Duration::from_secs(6 * 3600));
     // state.json cleanup; the first tick is now
@@ -761,7 +1132,9 @@ pub async fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 _ = prune.tick() => {
-                    session.bot.prune_state(chrono::Utc::now()).await;
+                    if let Role::Admin(bot) = &mut session.role {
+                        bot.prune_state(chrono::Utc::now()).await;
+                    }
                     continue;
                 }
                 _ = outbox.tick() => {
@@ -773,9 +1146,8 @@ pub async fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 _ = gave_up.notified() => {
-                    let msg = format!(
-                        "{MAX_FAILED_LOGINS} logins in a row failed (password changed?); stopping before mod_fail2ban bans this address"
-                    );
+                    let why = state.refusal.lock().ok().and_then(|mut r| r.take()).unwrap_or_default();
+                    let msg = format!("{why}; stopping before the server bans this address (mod_fail2ban, logguard)");
                     result = Err(LoginRefused(msg).into());
                     break;
                 }
@@ -786,8 +1158,8 @@ pub async fn run(args: Args) -> Result<()> {
         match event {
             None => break,
             Some(Event::Online { bound_jid, resumed, .. }) => {
-                attempts.store(0, Ordering::SeqCst);
-                session.online = true;
+                state.settled();
+                session.quiet_until = None;
                 if resumed {
                     log::info!("Stream resumed as {bound_jid}");
                 } else {
@@ -797,18 +1169,19 @@ pub async fn run(args: Args) -> Result<()> {
                     session.deliver_outbox().await;
                 }
             }
-            Some(Event::Disconnected(e)) => {
-                session.online = false;
-                log::warn!("Disconnected: {e}; reconnecting");
-            }
+            // (tokio-xmpp 6 doesn't report disconnections: see Session::server_answers)
+            Some(Event::Disconnected(e)) => log::warn!("Disconnected: {e}; reconnecting"),
             Some(Event::Stanza(Stanza::Message(m))) => session.on_message(m).await,
             Some(Event::Stanza(Stanza::Iq(iq))) => {
-                if let Some(reply) = iq_reply(iq, &session.bot.bot_jid, &session.disco) {
+                if let Some(reply) = iq_reply(iq, &session.bot_jid, &session.disco) {
                     session.send(reply).await;
                 }
             }
             Some(Event::Stanza(Stanza::Presence(p))) => session.on_presence(p).await,
         }
+    }
+    if let Role::Client(ctx) = &session.role {
+        log::info!("{}", ctx.summary());
     }
     log::info!("Shutting down");
     let _ = tokio::time::timeout(Duration::from_secs(5), session.client.send_end()).await;
@@ -851,6 +1224,114 @@ mod tests {
         assert!(matches!(reply(push(None)), Some(Iq::Result { .. })));
         assert!(matches!(reply(push(Some("bot@example.org"))), Some(Iq::Result { .. })));
         assert!(matches!(reply(push(Some("admin@example.org/phone"))), Some(Iq::Error { .. })));
+    }
+
+    #[test]
+    fn scram_sha_256_unless_sha_1_is_allowed() {
+        let offered = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<String>>();
+        // ejabberd: everything; the -PLUS variant wins with a channel binding
+        let all = offered(&["SCRAM-SHA-1", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS", "PLAIN"]);
+        assert_eq!(mechanism(&all, true), Some("SCRAM-SHA-256-PLUS"));
+        assert_eq!(mechanism(&all, false), Some("SCRAM-SHA-256"));
+        // Prosody before 13: SCRAM-SHA-1 only, refused unless allowed
+        let sha1 = offered(&["SCRAM-SHA-1", "SCRAM-SHA-1-PLUS", "PLAIN"]);
+        assert_eq!(mechanism(&sha1, true), Some("SCRAM-SHA-1-PLUS"));
+        assert!(!acceptable(mechanism(&sha1, true), false));
+        assert!(acceptable(mechanism(&sha1, true), true));
+        // PLAIN never, whatever is allowed
+        let plain = offered(&["PLAIN"]);
+        assert!(!acceptable(mechanism(&plain, false), true));
+        assert!(!acceptable(mechanism(&offered(&[]), false), true));
+    }
+
+    /// logguard's default scoring on the XMPP server (config.rs): points per event, a fast score
+    /// halving every 10 minutes banning at 100, a slow one halving every 12 hours banning at 200.
+    /// The bot's failed reconnects, spaced by `retry_spacing`, must stay under both.
+    #[test]
+    fn spaced_retries_stay_under_logguards_ban_scores() {
+        let peak = |points: f64, half_life: f64, events: u32| {
+            let (mut score, mut peak) = (0.0f64, 0.0f64);
+            for n in 0..events {
+                // the wait before attempt n+1 follows n failed attempts
+                let gap = retry_spacing(n).as_secs_f64();
+                score = score * 0.5f64.powf(gap / half_life) + points;
+                peak = peak.max(score);
+            }
+            peak
+        };
+        // failed TLS handshakes (40), the worst a broken connection can look like, for a day
+        assert!(peak(40.0, 600.0, 30) < 100.0, "fast score {}", peak(40.0, 600.0, 30));
+        // connections without a login (10, a network dropping mid-login) don't reach the slow ban
+        assert!(peak(10.0, 12.0 * 3600.0, 30) < 200.0, "slow score {}", peak(10.0, 12.0 * 3600.0, 30));
+        // failed logins (25 for a real account): the login check stops the bot after the second.
+        // (A canary name is 100 at once: no spacing helps, hence the warning at the start.)
+        assert!(peak(25.0, 600.0, 2) < 100.0 && peak(25.0, 12.0 * 3600.0, 2) < 200.0);
+        // and a reconnect after a sleep, which normally works, never waits
+        assert_eq!(retry_spacing(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn canary_names_are_recognized() {
+        let bare = |j: &str| j.parse::<BareJid>().unwrap();
+        assert!(default_canary(&bare("xmpp@example.net")));
+        assert!(default_canary(&bare("Test@example.org")), "nodeprep: any case");
+        assert!(!default_canary(&bare("bot@example.org")), "the live bot's name");
+        assert!(!default_canary(&bare("logguard@example.org")));
+        assert!(!default_canary(&bare("testbot@example.org")), "whole names only");
+    }
+
+    #[test]
+    fn only_attempts_that_reach_the_server_count() {
+        use std::io::{Error as IoError, ErrorKind};
+        let io = |k: ErrorKind| Error::Io(IoError::from(k));
+        // an offline laptop: retried freely
+        assert!(!server_visible(&io(ErrorKind::ConnectionRefused)));
+        assert!(!server_visible(&io(ErrorKind::NetworkUnreachable)));
+        assert!(!server_visible(&io(ErrorKind::HostUnreachable)));
+        assert!(!server_visible(&Error::Idna));
+        // the server saw something: spaced
+        assert!(server_visible(&io(ErrorKind::ConnectionReset)));
+        assert!(server_visible(&io(ErrorKind::TimedOut)));
+        assert!(server_visible(&Error::Disconnected));
+    }
+
+    #[test]
+    fn an_online_session_settles_the_count() {
+        let state = ConnState {
+            channel_binding: AtomicBool::new(true),
+            cb_confirmed: AtomicBool::new(false),
+            unsettled: AtomicU32::new(3),
+            pending_tls: AtomicBool::new(true),
+            refusal: std::sync::Mutex::new(None),
+        };
+        state.settled();
+        assert_eq!(state.unsettled.load(Ordering::SeqCst), 0);
+        assert!(!state.pending_tls.load(Ordering::SeqCst));
+        assert!(state.channel_binding.load(Ordering::SeqCst), "what was learned about the server stays");
+    }
+
+    #[test]
+    fn srv_records_without_xmpp_server() {
+        use clap::Parser;
+        let args = |extra: &[&str]| {
+            let mut v = vec!["logguard-xmpp-bot", "--mode", "client", "--jid", "bot@example.net", "--admin", "a@example.org"];
+            v.extend_from_slice(extra);
+            crate::Args::try_parse_from(v).unwrap()
+        };
+        let srv = |dns: &DnsConfig| match dns {
+            DnsConfig::UseSrv { host, srv, fallback_port, .. } => format!("{host} {srv} {fallback_port}"),
+            DnsConfig::NoSrv { host, port, .. } => format!("{host}:{port}"),
+            _ => "other".into(),
+        };
+        let (dns, direct) = dns_config(&args(&[]), "example.net");
+        assert_eq!((srv(&dns), direct), ("example.net _xmpp-client._tcp 5222".into(), false));
+        let (dns, direct) = dns_config(&args(&["--tls", "direct"]), "example.net");
+        assert_eq!((srv(&dns), direct), ("example.net _xmpps-client._tcp 5223".into(), true));
+        // the admin bot's config.env: the local server's direct TLS port
+        let (dns, direct) = dns_config(&args(&["--server", "127.0.0.1", "--port", "5223"]), "example.net");
+        assert_eq!((srv(&dns), direct), ("127.0.0.1:5223".into(), true));
+        let (dns, direct) = dns_config(&args(&["--server", "xmpp.example.net"]), "example.net");
+        assert_eq!((srv(&dns), direct), ("xmpp.example.net:5222".into(), false));
     }
 
     #[test]

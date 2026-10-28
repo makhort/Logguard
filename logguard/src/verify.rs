@@ -2,15 +2,17 @@
 //!
 //! - **Package files:** every program and library a package installed under `dirs` is
 //!   hashed and compared with the MD5 dpkg recorded for it (`/var/lib/dpkg/info/*.md5sums`),
-//!   like `debsums`. A replaced `/usr/bin/ssh` or `libpam` module is how a rootkit stays
-//!   hidden. Files diverted with `dpkg-divert` are left out; a mismatch is checked again
-//!   after the pass (an upgrade may have been running).
+//!   like `debsums`; with `package_manager = "dnf"`, with the digest rpm recorded (SHA-256 on
+//!   current Fedora and RHEL), like `rpm -Va`. A replaced `/usr/bin/ssh` or `libpam` module is
+//!   how a rootkit stays hidden. Files diverted with `dpkg-divert`, and rpm's `%config` and
+//!   `%ghost` files, are left out; a mismatch is checked again after the pass (an upgrade may
+//!   have been running).
 //! - **Set-uid and set-gid programs** under `suid_roots`: a new one, or a changed one, is how
 //!   an intruder keeps root. The list is learned on the first run.
 //!
 //! The pass reads at most `max_rate_mb` MB a second, so it never competes with the services.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::PackageManager;
 use crate::cronwatch::{Finding, Origin};
 use crate::engine::Severity;
 use crate::time::{self, Dur, Micros};
@@ -38,6 +41,11 @@ pub struct VerifyCfg {
     /// Read speed cap, MB per second.
     pub max_rate_mb: u64,
     pub dpkg_db: PathBuf,
+    /// Asked instead of dpkg's database with `package_manager = "dnf"`.
+    pub rpm: PathBuf,
+    /// The top-level `package_manager` (`Config::share_package_manager`).
+    #[serde(skip)]
+    pub package_manager: PackageManager,
 }
 
 impl Default for VerifyCfg {
@@ -53,6 +61,8 @@ impl Default for VerifyCfg {
             suid_exclude: ["/var/lib/docker", "/proc", "/sys"].map(PathBuf::from).to_vec(),
             max_rate_mb: 20,
             dpkg_db: "/var/lib/dpkg".into(),
+            rpm: "/usr/bin/rpm".into(),
+            package_manager: PackageManager::Apt,
         }
     }
 }
@@ -93,6 +103,8 @@ impl Suid {
 
 #[derive(Clone, Debug, Default)]
 pub struct VerifyReport {
+    /// Whose checksums the package files were compared with.
+    pub manager: PackageManager,
     pub started: Micros,
     pub finished: Micros,
     /// Package files hashed.
@@ -113,6 +125,9 @@ pub struct VerifyReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VerifyBaseline {
     pub last_run: Micros,
+    /// Package files the last pass checked: shown after a restart, until the next pass.
+    #[serde(default)]
+    pub checked: u64,
     /// Package files known to differ (path -> MD5 now): reported once.
     pub mismatched: BTreeMap<String, String>,
     pub suid: BTreeMap<String, Suid>,
@@ -156,22 +171,17 @@ fn pace(bytes: u64, rate_mb: u64, since: Instant) {
     }
 }
 
-/// MD5 of a file, without leaving it in the page cache: a pass reads gigabytes, and the cache
+/// A file's digest, without leaving it in the page cache: a pass reads gigabytes, and the cache
 /// they'd fill is charged to the service's memory limit (`MemoryHigh` throttles it).
-fn md5_uncached(path: &Path) -> std::io::Result<String> {
-    use md5::{Digest as _, Md5};
+fn digest_uncached(path: &Path, algo: crate::rpm::Algo) -> std::io::Result<String> {
     let mut f = crate::cronwatch::open_regular(path)?;
-    let mut h = Md5::new();
-    let mut buf = vec![0u8; 64 << 10];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
+    let digest = crate::rpm::hex_digest(algo, &mut f);
     drop_cache(&f);
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    digest
+}
+
+fn md5_uncached(path: &Path) -> std::io::Result<String> {
+    digest_uncached(path, crate::rpm::Algo::Md5)
 }
 
 /// Tells the kernel the file's cached pages aren't needed any more (Linux).
@@ -181,10 +191,9 @@ fn drop_cache(f: &std::fs::File) {
     extern "C" {
         fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
     }
-    const POSIX_FADV_DONTNEED: i32 = 4;
     // SAFETY: an advisory call on a file descriptor this function borrows; no memory is touched.
     unsafe {
-        posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED);
+        posix_fadvise(f.as_raw_fd(), 0, 0, crate::sys::POSIX_FADV_DONTNEED);
     }
 }
 
@@ -201,7 +210,7 @@ fn expected_md5(info: &Path, stem: &str, rel: &str) -> Option<String> {
 }
 
 /// Checks the package files under `cfg.dirs` against dpkg's checksums.
-fn check_packages(cfg: &VerifyCfg, r: &mut VerifyReport, stop: &dyn Fn() -> bool) {
+fn check_dpkg(cfg: &VerifyCfg, r: &mut VerifyReport, stop: &dyn Fn() -> bool) {
     let info = cfg.dpkg_db.join("info");
     let Ok(rd) = std::fs::read_dir(&info) else { return };
     let diverted = diversions(&cfg.dpkg_db);
@@ -249,6 +258,77 @@ fn check_packages(cfg: &VerifyCfg, r: &mut VerifyReport, stop: &dyn Fn() -> bool
         if !have.eq_ignore_ascii_case(&want) {
             let pkg = stem.split(':').next().unwrap_or(&stem).to_string();
             r.mismatched.insert(path, (pkg, have));
+        }
+    }
+}
+
+/// A package's files to check, by path: the package, the digest algorithm, and the digests
+/// accepted (a file two architectures' packages share, e.g. i686 and x86_64, is listed by
+/// both). Not `%config` (the admin's to edit) or `%ghost` files.
+fn rpm_wanted(cfg: &VerifyCfg, files: Vec<crate::rpm::FileEntry>) -> BTreeMap<String, (String, crate::rpm::Algo, Vec<String>)> {
+    let mut out: BTreeMap<String, (String, crate::rpm::Algo, Vec<String>)> = BTreeMap::new();
+    for e in files {
+        let Some(algo) = e.algo else { continue };
+        if e.config || e.ghost || e.digest.is_empty() || !wanted(cfg, &under_usr(&e.path[1..])) {
+            continue;
+        }
+        out.entry(e.path).or_insert_with(|| (e.package, algo, Vec::new())).2.push(e.digest);
+    }
+    out
+}
+
+/// Checks the package files under `cfg.dirs` against rpm's digests, a few packages at a time.
+fn check_rpm(cfg: &VerifyCfg, r: &mut VerifyReport, stop: &dyn Fn() -> bool) {
+    let names = match crate::rpm::packages(&cfg.rpm) {
+        Ok(n) => n,
+        Err(e) => return note_error(r, e),
+    };
+    // (path, package)
+    let mut suspects: Vec<(String, String)> = Vec::new();
+    for batch in names.chunks(crate::rpm::BATCH) {
+        let files = match crate::rpm::files(&cfg.rpm, batch) {
+            Ok(f) => f,
+            Err(e) => {
+                note_error(r, e);
+                continue;
+            }
+        };
+        for (path, (pkg, algo, want)) in rpm_wanted(cfg, files) {
+            if stop() {
+                return;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                r.missing += 1;
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let start = Instant::now();
+            match digest_uncached(Path::new(&path), algo) {
+                Ok(have) => {
+                    r.checked += 1;
+                    if !want.contains(&have) && suspects.len() < MAX_SUSPECTS {
+                        suspects.push((path, pkg));
+                    }
+                }
+                Err(e) => note_error(r, format!("{path}: {e}")),
+            }
+            pace(meta.len(), cfg.max_rate_mb, start);
+        }
+    }
+    // An upgrade during the pass changes both the file and its digest: look again.
+    let pkgs: Vec<String> = suspects.iter().map(|(_, p)| p.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let mut now: HashMap<String, (String, crate::rpm::Algo, Vec<String>)> = HashMap::new();
+    for batch in pkgs.chunks(crate::rpm::BATCH) {
+        now.extend(crate::rpm::files(&cfg.rpm, batch).map(|f| rpm_wanted(cfg, f)).unwrap_or_default());
+    }
+    for (path, pkg) in suspects {
+        let Some((_, algo, want)) = now.get(&path) else { continue }; // removed meanwhile
+        if let Ok(have) = digest_uncached(Path::new(&path), *algo) {
+            if !want.contains(&have) {
+                r.mismatched.insert(path, (pkg, have));
+            }
         }
     }
 }
@@ -356,15 +436,19 @@ fn find_suid(cfg: &VerifyCfg, r: &mut VerifyReport, stop: &dyn Fn() -> bool) {
 
 /// One pass; `stop` is asked between files (the daemon stopping).
 pub fn scan(cfg: &VerifyCfg, stop: &dyn Fn() -> bool) -> VerifyReport {
-    let mut r = VerifyReport { started: time::now(), ..Default::default() };
-    if !cfg.dpkg_db.as_os_str().is_empty() {
-        check_packages(cfg, &mut r, stop);
+    let mut r = VerifyReport { manager: cfg.package_manager, started: time::now(), ..Default::default() };
+    match cfg.package_manager {
+        PackageManager::Apt if !cfg.dpkg_db.as_os_str().is_empty() => check_dpkg(cfg, &mut r, stop),
+        PackageManager::Dnf if !cfg.rpm.as_os_str().is_empty() => check_rpm(cfg, &mut r, stop),
+        _ => {}
     }
     find_suid(cfg, &mut r, stop);
     let paths: Vec<String> = r.suid.keys().cloned().collect();
-    if !paths.is_empty() && !cfg.dpkg_db.as_os_str().is_empty() {
-        let o = crate::cronwatch::dpkg_origins(&cfg.dpkg_db, &paths);
-        r.origins = paths.into_iter().map(|p| (p.clone(), o.get(&p).cloned().unwrap_or(Origin::Local))).collect();
+    if !paths.is_empty() {
+        match crate::cronwatch::package_origins(cfg.package_manager, &cfg.dpkg_db, &cfg.rpm, &paths) {
+            Ok(o) => r.origins = paths.into_iter().map(|p| (p.clone(), o.get(&p).cloned().unwrap_or(Origin::Local))).collect(),
+            Err(e) => note_error(&mut r, e),
+        }
     }
     r.finished = time::now();
     r
@@ -389,10 +473,13 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
         evidence,
         notify,
         owner: None,
+        files: vec![],
     };
+    let with_files = |f: Finding, files: Vec<String>| Finding { files, ..f };
     let first = baseline.is_none();
     let b = baseline.get_or_insert_with(Default::default);
     b.last_run = r.finished;
+    b.checked = r.checked;
     if !r.errors.is_empty() {
         out.push(finding(
             format!("verify-errors:{}", r.finished),
@@ -403,6 +490,8 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
         ));
     }
 
+    let changed: Vec<String> =
+        r.mismatched.iter().filter(|(p, (_, md5))| b.mismatched.get(*p) != Some(md5)).map(|(p, _)| p.clone()).collect();
     let new_mismatch: Vec<String> = r
         .mismatched
         .iter()
@@ -413,14 +502,19 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
         let (severity, advice) = if first {
             (Severity::Warning, "first check: changed by hand, or by an intruder")
         } else {
-            (Severity::High, "if nobody here changed them, the server may be compromised (reinstall: apt install --reinstall <package>)")
+            (Severity::High, "if nobody here changed them, the server may be compromised")
         };
-        out.push(finding(
-            format!("verify-packages:{}", r.finished),
-            severity,
-            format!("{} package files differ from what dpkg installed - {advice}", new_mismatch.len()),
-            listed(&new_mismatch, 30),
-            true,
+        let advice =
+            if severity == Severity::High { format!("{advice} (reinstall: {})", r.manager.reinstall_command()) } else { advice.into() };
+        out.push(with_files(
+            finding(
+                format!("verify-packages:{}", r.finished),
+                severity,
+                format!("{} package files differ from what {} installed - {advice}", new_mismatch.len(), r.manager.db()),
+                listed(&new_mismatch, 30),
+                true,
+            ),
+            changed,
         ));
     }
     b.mismatched = r.mismatched.iter().map(|(p, (_, md5))| (p.clone(), md5.clone())).collect();
@@ -443,8 +537,9 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
             "verify-learned".into(),
             Severity::Info,
             format!(
-                "package check: {} files match dpkg's checksums; {} set-uid/set-gid programs learned, changes are reported from now on",
+                "package check: {} files match {}'s checksums; {} set-uid/set-gid programs learned, changes are reported from now on",
                 r.checked,
+                r.manager.db(),
                 r.suid.len()
             ),
             vec![],
@@ -454,7 +549,7 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
         return out;
     }
     let origin = |p: &str| r.origins.get(p).cloned().unwrap_or(Origin::Local);
-    let (mut more, mut more_severity) = (Vec::new(), Severity::Warning);
+    let (mut more, mut more_severity, mut more_files) = (Vec::new(), Severity::Warning, Vec::new());
     for (p, s) in &r.suid {
         let message = match b.suid.get(p) {
             None => format!("new {} program {p} (owner uid {}, mode {:o}; {})", s.kind(), s.uid, s.mode & 0o7777, origin_text(&origin(p))),
@@ -468,18 +563,25 @@ pub fn judge(baseline: &mut Option<VerifyBaseline>, r: &VerifyReport) -> Vec<Fin
         if out.iter().filter(|f| f.key.starts_with("suid:")).count() >= MAX_SUID_REPORTED {
             more.push(message);
             more_severity = more_severity.max(severity);
+            more_files.push(p.clone());
             continue;
         }
         let advice = if severity == Severity::High { " - if nobody here made it, the server may be compromised" } else { "" };
-        out.push(finding(format!("suid:{p}:{}", r.finished), severity, format!("integrity: {message}{advice}"), vec![], true));
+        out.push(with_files(
+            finding(format!("suid:{p}:{}", r.finished), severity, format!("integrity: {message}{advice}"), vec![], true),
+            vec![p.clone()],
+        ));
     }
     if !more.is_empty() {
-        out.push(finding(
-            format!("suid-more:{}", r.finished),
-            more_severity,
-            format!("integrity: {} more set-uid/set-gid programs are new or changed", more.len()),
-            listed(&more, 30),
-            true,
+        out.push(with_files(
+            finding(
+                format!("suid-more:{}", r.finished),
+                more_severity,
+                format!("integrity: {} more set-uid/set-gid programs are new or changed", more.len()),
+                listed(&more, 30),
+                true,
+            ),
+            more_files,
         ));
     }
     if r.suid_overflow > 0 {
@@ -579,6 +681,7 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].severity, Severity::High);
         assert!(f[0].message.contains("new set-uid program") && f[0].message.contains("not from any package"), "{}", f[0].message);
+        assert_eq!(f[0].files, [dir.join("sh").display().to_string()], "scanned when scans of changed files are on");
         // changed
         std::fs::write(dir.join("sh"), "#!/bin/sh\nid\n").unwrap();
         std::fs::set_permissions(dir.join("sh"), std::fs::Permissions::from_mode(0o4755)).unwrap();
@@ -638,5 +741,56 @@ mod tests {
         assert!(!wanted(&cfg, "/usr/lib/firmware/x.bin"));
         assert!(!wanted(&cfg, "/usr/library/x"), "a prefix of a name is not a directory");
         assert!(!wanted(&cfg, "/usr/share/doc/x"));
+    }
+
+    #[test]
+    fn checks_package_files_against_rpm() {
+        let dir = std::env::temp_dir().join(format!("logguard-verify-rpm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("usr").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sha = |t: &str| crate::rpm::hex_digest(crate::rpm::Algo::Sha256, &mut t.as_bytes()).unwrap();
+        let path = |n: &str| bin.join(n).display().to_string();
+        for (n, t) in [("good", "good\n"), ("evil", "trojan\n"), ("conf", "edited\n"), ("shared", "64-bit\n")] {
+            std::fs::write(bin.join(n), t).unwrap();
+        }
+        let line = |pkg: &str, flags: &str, digest: String, n: &str| format!("{pkg}\t8\t{flags}\t{digest}\t{}\n", path(n));
+        let files = [
+            line("coreutils", "", sha("good\n"), "good"),
+            line("coreutils", "", sha("original\n"), "evil"),
+            line("coreutils", "c", sha("original\n"), "conf"), // %config: the admin's to edit
+            line("coreutils", "g", String::new(), "ghost"),    // %ghost: never installed
+            line("coreutils", "", sha("x\n"), "gone"),
+            line("coreutils", "", sha("32-bit\n"), "shared"), // i686 and x86_64 both list it
+            line("coreutils", "", sha("64-bit\n"), "shared"),
+        ]
+        .concat();
+        let rpm = crate::rpm::tests::fake_rpm(&dir.join("rpmbin"), "coreutils\n", "", &files);
+        let cfg = VerifyCfg {
+            dirs: vec![dir.display().to_string()],
+            exclude: vec![],
+            suid_roots: vec![],
+            suid_exclude: vec![],
+            dpkg_db: PathBuf::new(),
+            rpm,
+            package_manager: PackageManager::Dnf,
+            max_rate_mb: 1000,
+            ..Default::default()
+        };
+        let r = scan(&cfg, &|| false);
+        assert_eq!((r.checked, r.missing), (3, 1), "{:?}", r.errors);
+        assert_eq!(r.mismatched.keys().cloned().collect::<Vec<_>>(), vec![path("evil")]);
+        assert_eq!(r.mismatched[&path("evil")], ("coreutils".to_string(), sha("trojan\n")));
+        let mut b = None;
+        let f = judge(&mut b, &r);
+        assert!(f.iter().any(|x| x.message.starts_with("1 package files differ from what rpm installed")), "{f:?}");
+        assert!(f.iter().any(|x| x.files == [path("evil")]), "the changed package file is scanned: {f:?}");
+        assert!(f.iter().any(|x| x.message.contains("match rpm's checksums")), "{f:?}");
+        assert_eq!(b.as_ref().map(|b| b.checked), Some(3), "kept for status after a restart");
+        // a second trojan, after the first pass: high, with dnf's advice
+        std::fs::write(bin.join("good"), "trojan too\n").unwrap();
+        let f = judge(&mut b, &scan(&cfg, &|| false));
+        assert!(f.iter().any(|x| x.severity == Severity::High && x.message.contains("dnf reinstall <package>")), "{f:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

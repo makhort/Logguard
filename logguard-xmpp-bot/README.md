@@ -1,7 +1,34 @@
 # logguard-xmpp-bot
 
-The Rust rewrite of the Python XMPP admin bot (`/opt/xmpp-bot/bot8.py`, before the rename below): the same
-chat commands over `ejabberdctl`, the same `state.json`, the same `config.env`.
+An XMPP bot for logguard, in one of two modes (`BOT_MODE` in `config.env`):
+
+- **admin** (the default): the Rust rewrite of the Python XMPP admin bot (`/opt/xmpp-bot/bot8.py`,
+  before the rename below), on the XMPP server itself: the same chat commands over `ejabberdctl`
+  for the admin and users, the same `state.json`, the same `config.env`, plus logguard's alerts
+  and weekly report for the admin (logguard's `[notify] bot_outbox`, with logguard's plain-text
+  fallback). Most of this README is about it.
+- **client**: a copy bot like logguard-tg-bot or logguard-matrix-bot, on any host (a VPN server,
+  a relay node, a desktop with logguard's desktop profile) with an account on any XMPP server. It
+  only sends logguard's alerts, daily digest and weekly abuse report to its admin, OMEMO-encrypted,
+  and as files encrypted to the admin's OpenPGP key when OMEMO can't reach the admin (logguard's
+  `[notify] xmpp_outbox`). No ejabberd, no commands but `/status`, `/omemo` and `/help`. See
+  "Client mode" below.
+
+Both share the login (SCRAM-SHA-256-PLUS, certificates verified, stop on a wrong password), the
+OMEMO code and trust pins, the no-archive hints and the outbox format.
+
+## Contents
+
+1. [What changed from the Python bot](#what-changed-from-the-python-bot)
+2. [OMEMO](#omemo)
+3. [Alerts from logguard](#alerts-from-logguard)
+4. [Weekly abuse report](#weekly-abuse-report)
+5. [Client mode](#client-mode)
+6. [Connection drops (sleep, Wi-Fi, server restarts)](#connection-drops-sleep-wi-fi-server-restarts)
+7. [Install from a release bundle](#install-from-a-release-bundle)
+8. [Install from a package](#install-from-a-package)
+9. [Build, test, deploy](#build-test-deploy)
+10. [Settings](#settings)
 
 ## What changed from the Python bot
 
@@ -13,8 +40,9 @@ chat commands over `ejabberdctl`, the same `state.json`, the same `config.env`.
 - **TLS certificates are verified** against the JID's domain, also when connecting to
   `127.0.0.1`. xmpppy didn't verify them.
 - **Wrong password: the bot stops** (exit 78, which the unit does not restart) instead of
-  retrying until mod_fail2ban bans the address. That holds at startup and also when the
-  password changes while the bot runs: after 3 failed logins in a row it stops.
+  retrying until mod_fail2ban (or logguard) bans the address. That holds at startup and also
+  when the password changes while the bot runs: it stops after the second failed login (see
+  "Connection drops").
 - **The bot runs as the `ejabberd` user**, the one ejabberd itself runs as, with no root and
   no capabilities. ejabberdctl then works for it directly, without switching users. The
   bot's password is removed from the environment of the commands it runs. (Run as root
@@ -276,24 +304,139 @@ interest in network and information security (GDPR art. 6(1)(f), recital 49).
 `systemctl start logguard-abuse-report`, then `journalctl -u logguard-abuse-report` and the
 bot's log (`outbox: … sent to the admin (OMEMO media)`).
 
-## Install from a release bundle
+## Client mode
 
-Without a Rust toolchain: every version tag `logguard-xmpp-bot-v<version>` gets its bundle, `logguard-xmpp-bot-<version>-<commit>-x86_64-linux-musl.zip`, as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit and logrotate files, `config.env.example`, `SHA256SUMS` and `install.sh`.
+`BOT_MODE=client` (template: `deploy/config-client.env.example`) makes the bot a copy bot for
+logguard's `[notify] xmpp_outbox`, as logguard-tg-bot is for `tg_outbox`: for a host without
+ejabberd, such as the VPN server, a relay node, or a Linux desktop with logguard's desktop profile
+(`deploy/logguard-desktop.toml` in logguard names the lines).
 
-**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the Release's page:
+- **Any XMPP server, for the bot and the admin.** The bot needs an account of its own anywhere
+  (a public server will do) and writes only to `ADMIN_JID`, on whatever server that is. Without
+  `XMPP_SERVER` it connects to the JID's domain through its SRV records (`_xmpp-client._tcp`, or
+  `_xmpps-client._tcp` with `XMPP_TLS=direct`), falling back to port 5222 (5223); the
+  certificate is verified against the JID's domain either way. The login is the admin bot's:
+  SCRAM-SHA-256(-PLUS) only, and exit 78 when the server offers nothing else or the password is
+  wrong. Prosody before 13 offers only SCRAM-SHA-1: `ALLOW_SCRAM_SHA1=yes` accepts it (never PLAIN).
+- **OMEMO first.** Alerts go out as OMEMO messages, files (the weekly abuse report) as OMEMO media
+  (XEP-0454) through the bot's server's HTTP File Upload, to the admin's trusted devices, exactly
+  as in admin mode: trust pins in `omemo-trust.txt`, blind trust while there are none (or
+  `OMEMO_TRUST=pinned`).
+- **OpenPGP when OMEMO can't reach the admin**: `OMEMO=off`, the admin's client publishes no OMEMO
+  device, none of the admin's devices is trusted (not pinned under `OMEMO_TRUST=pinned`, or no key
+  bundle), or encrypting fails. The message or file is then encrypted to the admin's OpenPGP key
+  (`OPENPGP_KEY`: a v4 RSA or Curve25519 key, as OpenKeychain and iPGMail export it; the same code
+  as logguard-matrix-bot's), uploaded under a neutral name (`message-<time>.txt.pgp`,
+  `report-<time>.txt.pgp`) and sent as a link (body and XEP-0066 `<x xmlns='jabber:x:oob'>`), which
+  Conversations shows as a download; open it with OpenKeychain (Android) or iPGMail (iPhone).
+  Without `OPENPGP_KEY` such messages wait. `OMEMO=off` without `OPENPGP_KEY` is refused at the
+  start (exit 78): the bot sends nothing in clear.
+- **In clear the server sees only** the links to the OpenPGP files (their content is encrypted)
+  and short notices, each kind at most once a day: why messages come as files now ("none of
+  admin@…'s 2 OMEMO device(s) is trusted and reachable …"), why they wait, how many alerts were
+  dropped. Every message carries the no-archive hint, as in admin mode.
+- **No fallback on logguard's side**, as for the other copy bots: an alert waits in the outbox until
+  it is sent or older than `ALERT_MAX_HOURS` (24; then dropped, and one notice says how many),
+  a file until `OUTBOX_MAX_DAYS` (7). logguard warns when copies wait longer than its
+  `bot_stuck_after`. The bot accepts any `To:` in the outbox: it has one admin.
+- **It answers only its admin**, plain or OMEMO: `/status` (what was sent since the start, what
+  waits, OMEMO, the fallback key's fingerprint), `/omemo` (fingerprints, as in admin mode) and
+  `/help`. Anyone else gets no answer and no presence. It asks the admin for a mutual
+  subscription at every start, as the admin bot does; accept it once.
+- **No ejabberdctl, no state.json, no users.** `BOT_STATE_PATH`'s directory holds the OMEMO keys,
+  the pins and the outbox. The admin-mode settings (`EJABBERDCTL`, `EJABBERD_DB`, `INVITE_URL`,
+  the retention days, `ANNOUNCE_LANGUAGES`) are ignored.
 
-```bash
-gh release download logguard-xmpp-bot-v0.2.0 --repo OWNER/REPO    # the zip, its .sha256 and .sigstore.json
-sha256sum -c logguard-xmpp-bot-*.zip.sha256                         # the download is intact (macOS: shasum -a 256 -c)
-gh attestation verify logguard-xmpp-bot-*.zip --repo OWNER/REPO --source-ref refs/tags/logguard-xmpp-bot-v0.2.0
+**Install** from the release bundle on the host, as root: `./install.sh --client` puts the client
+template in place as `/opt/logguard-xmpp-bot/config.env` (root-only until the bot is installed);
+fill in `BOT_JID`, `BOT_PASSWORD`, `ADMIN_JID`, copy your OpenPGP public key to
+`/opt/logguard-xmpp-bot/admin.asc` (or comment `OPENPGP_KEY` out), then run `./install.sh`
+again. Because the config says `BOT_MODE=client`, `install.sh` creates the system user
+`logguard-xmpp-bot` and installs `logguard-xmpp-bot-client.service` as `logguard-xmpp-bot.service` (the
+package keeps it under its own name: `systemctl enable --now logguard-xmpp-bot-client`):
+no ejabberd group, `ProtectSystem=strict`, `MemoryDenyWriteExecute` (no Erlang VM to start
+here). It skips every ejabberd step. Then, in logguard's `[notify]`:
+
+```toml
+enabled = true
+xmpp = false                                # no ejabberd on this host
+xmpp_outbox = "/opt/logguard-xmpp-bot/outbox"
+xmpp_user = "logguard-xmpp-bot"
 ```
 
-`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-xmpp-bot-*.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+and `systemctl restart logguard`, `logguard -c /etc/logguard/logguard.toml notify-test
+--xmpp-client`. The weekly abuse report job finds the outbox there too.
 
-On the XMPP server (`apt install unzip` if needed):
+Switching an existing install between the modes: change `BOT_MODE` and run `install.sh`; it
+moves the files to the other mode's user. The OMEMO device stays the same if the bot's account
+does. One logguard-xmpp-bot per host: logguard refuses `bot_outbox` and `xmpp_outbox` together.
+
+## Connection drops (sleep, Wi-Fi, server restarts)
+
+tokio-xmpp reconnects by itself, forever (backing off from 1 to 30 s), finds the server again
+through DNS each time, and resumes the session (XEP-0198) when the server still holds it. Three
+things it doesn't do are covered by the bot (since 2026-10-26, both modes):
+
+- **Nothing in the outbox is lost.** tokio-xmpp counts a stanza as sent once it is in the
+  socket's buffer, also on a connection that died unnoticed (a laptop that just woke up), and
+  drops what the server hadn't acknowledged when it can't resume the session (the server keeps
+  it 5 minutes on ejabberd's default). It reports no disconnection either. So before sending
+  outbox items the bot pings its server (XEP-0199) and waits if there is no answer (asking again
+  after 30 s at the earliest); after each alert or file it pings again and deletes the file only
+  if the answer came on the same session. Otherwise the file stays and goes out again later: an
+  alert may arrive twice, never not at all. Every send waits at most 30 s, so the bot keeps
+  answering stop signals while the connection is down.
+- **A dead connection is noticed sooner in client mode:** after 60 s of silence the bot asks
+  the server for a sign of life and gives up on the connection 15 s later (tokio-xmpp's tight
+  timeouts; admin mode, on localhost, keeps 5 + 5 minutes). Its timers stop while the machine
+  sleeps, so on a laptop that is 75 s after waking up at most.
+- **Failed reconnects can't get the bot banned, and a flaky network can't stop it.** The server
+  may be guarded by mod_fail2ban (5 failed logins) and by logguard: a failed login is 25 points
+  there, a connection without login 10, a failed TLS handshake 40; logguard bans at 100 points of
+  a score halving every 10 minutes, or 200 of one halving every 12 hours. A connection that
+  reached the server but didn't get the session online is followed by a wait of 2, 5, then 10
+  minutes (30 after six such attempts, 60 after twelve), which keeps even failed TLS handshakes
+  under both scores; attempts that never reach the server (no network, DNS down, connection
+  refused) aren't counted. Before the next attempt, the bot checks the login on a connection of
+  its own: only a rejected password (or no SCRAM-SHA-256) stops it, after two failed logins in
+  all, whereas a network that went away during the login just means trying again. The usual
+  reconnect after a sleep or a Wi-Fi change reaches the server and comes online at once, so it
+  never waits.
+- **The bot's account must be a real one, not a logguard canary.** logguard's `[canary] xmpp`
+  names (its shipped list: `test`, `info`, `support`, `user`, `guest`, `demo`, `xmpp`, `jabber`,
+  ...) are account-level tripwires: one failed login bans the address at once (100 points), and
+  every login is a critical alert. The spacing above can't help there. The bot warns at the
+  start when its name is on the shipped list; `install.sh` checks the list of the logguard on
+  the same host and refuses such an account in admin mode (warns in client mode, whose server is
+  usually elsewhere). The cure is another account, or the name in `[canary] except` on the
+  server.
+- **No network at the start** (a laptop that boots offline): the login check at startup waits and
+  tries again (5 s, doubling to 5 minutes) instead of exiting. The client unit therefore doesn't
+  pull in `network-online.target`, which slows booting on desktops.
+
+After a long sleep, logguard on the same machine may report once that the bot left a message
+unsent for hours: it measures the wait by the wall clock, which went on during the sleep.
+
+## Install from a release bundle
+
+Without a Rust toolchain: every version tag `logguard-xmpp-bot-v<version>` gets its bundle, `logguard-xmpp-bot-<version>-<commit>-<arch>.zip` for each architecture (`x86_64-linux-musl`, `aarch64-linux-musl` for arm64, `armv7-linux-musleabihf` for 32-bit ARMv7 with hardware floating point), as an asset of the tag's GitHub Release (see "Releases" in the [repository README](../README.md#deployment)); CI also keeps one for every commit as a workflow artifact (they expire and need a GitHub login), and `scripts/bundle.sh` builds it locally. It holds the static binary, the unit and logrotate files, `config.env.example`, `SHA256SUMS` and `install.sh`.
+
+**Download and verify** (on your machine, then copy the zip over, or on the server): take the zip for the server's architecture (`uname -m`: `x86_64`, `aarch64`, or `armv7l` for armv7) from the GitHub Release of the version's tag, with the [GitHub CLI](https://cli.github.com/) or from the [Releases page](https://github.com/makhort/Logguard/releases) (each crate's releases are tagged `logguard-xmpp-bot-v<version>`):
 
 ```bash
-unzip logguard-xmpp-bot-*-x86_64-linux-musl.zip && cd logguard-xmpp-bot-*-x86_64-linux-musl
+arch=x86_64-linux-musl     # the server's: aarch64-linux-musl (arm64), armv7-linux-musleabihf (32-bit ARM)
+gh release download logguard-xmpp-bot-v0.4.0 --repo makhort/Logguard --pattern "*-$arch.zip*"   # the zip, its .sha256 and .sigstore.json
+sha256sum -c logguard-xmpp-bot-*-$arch.zip.sha256              # the download is intact (macOS: shasum -a 256 -c)
+gh attestation verify logguard-xmpp-bot-*-$arch.zip --repo makhort/Logguard --source-ref refs/tags/logguard-xmpp-bot-v0.4.0
+```
+
+`gh attestation verify` (after `gh auth login`) checks the signed build provenance: that this repository's CI built exactly this zip from that tag. With `--bundle logguard-xmpp-bot-*-$arch.zip.sigstore.json` it checks the attestation attached to the Release instead of fetching it from GitHub. Only a public repository's releases have one (GitHub offers attestations for private repositories only with Enterprise Cloud).
+
+On the XMPP server (`apt install unzip` or `dnf install unzip` if needed):
+
+```bash
+arch=x86_64-linux-musl     # as above: aarch64-linux-musl, armv7-linux-musleabihf on ARM
+unzip logguard-xmpp-bot-*-$arch.zip && cd logguard-xmpp-bot-*-$arch
 sudo ./install.sh          # first time: only /opt/logguard-xmpp-bot/config.env, from the template
 sudoedit /opt/logguard-xmpp-bot/config.env                     # the bot's account, ADMIN_JID, XMPP_DOMAIN ("Settings")
 sudo ./install.sh          # installs and starts the bot; later: upgrades it
@@ -302,6 +445,20 @@ sudo ./install.sh rollback # back to the previous version
 
 It refuses to install while `config.env` still holds `REPLACE…` placeholders. It checks every file against `SHA256SUMS` in a copy only root can write, then runs the same `install.sh` as `deploy.sh` below (`./install.sh --check` only checks the files). An existing `/opt/xmpp-bot` (the bot's old name) is moved over as with `deploy.sh`.
 
+## Install from a package
+
+The same release has a package per architecture, for the distribution's package manager instead of `install.sh`: `logguard-xmpp-bot_<version>-1_<arch>.deb` (`amd64`, `arm64`, `armhf`; Debian, Ubuntu and their derivatives) and `logguard-xmpp-bot-<version>-1.<arch>.rpm` (`x86_64`, `aarch64`, `armv7hl`; Fedora, RHEL and its rebuilds), each with its `.sha256` and `.sigstore.json`, downloaded and verified as the bundle above (`--pattern "*.deb*"` or `"*.rpm*"`). CI keeps them for every commit as workflow artifacts, and `scripts/package.sh` builds them locally (`cargo install cargo-deb cargo-generate-rpm --locked` once; neither needs dpkg or rpm, so it runs on macOS too; `--target aarch64-unknown-linux-musl` or `armv7-unknown-linux-musleabihf` for the ARM ones). The package is for one host at a time: there is no apt or dnf repository.
+
+```bash
+sudo apt install ./logguard-xmpp-bot_0.4.0-1_amd64.deb     # Fedora, RHEL:  sudo dnf install ./logguard-xmpp-bot-0.4.0-1.x86_64.rpm
+sudoedit /opt/logguard-xmpp-bot/config.env                  # the first install put the template there ("Settings")
+sudo systemctl enable --now logguard-xmpp-bot               # admin mode; client mode:  logguard-xmpp-bot-client
+```
+
+The package puts the same files in the same places as `install.sh` (`/opt/logguard-xmpp-bot` with the binary and both templates, `/var/log/logguard-xmpp-bot`), with two units in `/usr/lib/systemd/system`: `logguard-xmpp-bot.service` for the admin bot (as the user ejabberd, on the XMPP server) and `logguard-xmpp-bot-client.service` for the client bot (`BOT_MODE=client`, its own user `logguard-xmpp-bot`, any host); you enable the one for the mode in `config.env`. The first install takes the admin template where the user `ejabberd` exists and the client template elsewhere. The post-install step does what `install.sh` does apart from copying files: the client mode's user, `config.env` the first time, the owners and modes for the mode's user, the outbox and the log directory, the logrotate rules for the mode (`/etc/logrotate.d/logguard-xmpp-bot`, and in admin mode `ejabberd-logs`, written from the copies in `/usr/share/logguard-xmpp-bot`), and the canary and `CTL_OVER_HTTP` checks as warnings. It refuses nothing: with `BOT_MODE=admin` and no user `ejabberd` it only says so. Switching modes: change `BOT_MODE`, run `dpkg-reconfigure logguard-xmpp-bot` (rpm: `dnf reinstall ./logguard-xmpp-bot-*.rpm`), then disable one unit and enable the other. In logguard's `[sources] services`, the client bot is `logguard-xmpp-bot-client.service`. `apt remove` stops the bot and keeps `/opt/logguard-xmpp-bot`; `apt purge` removes it with the state, OMEMO keys and pins, and the logrotate rules it wrote (rpm: by hand).
+
+**Nothing starts on its own.** The first install puts the template in place and prints what to fill in; you enable the service once it is filled in. An upgrade keeps the config and restarts the service only if it was running and the config is filled in. **Over a bundle or `deploy.sh` install** the package takes over: the config, state and keys stay; the bundle's unit in `/etc/systemd/system` (it would shadow the package's) and its rollback files go, and the service is enabled again on the package's unit if it was (logguard's integrity watch reports the removed unit as a warning once). **Replacing the config:** when a terminal is there, the install asks whether to replace the config with the new template (the old one kept with the suffix `.old`); Enter, a timeout of a minute, no terminal or `DEBIAN_FRONTEND=noninteractive` keep it. `LOGGUARD_PACKAGE_CONFIG=replace` (or `keep`) answers without asking: `sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./<file>.deb`. **Rollback** is installing the previous version's package (`apt install ./<old>.deb --allow-downgrades`, `dnf downgrade ./<old>.rpm`): there is no `.prev` file. A bundle's client-mode install ran under the admin unit's name; the takeover enables `logguard-xmpp-bot-client.service` instead.
+
 ## Build, test, deploy
 
 ```bash
@@ -309,7 +466,7 @@ It refuses to install while `config.env` still holds `REPLACE…` placeholders. 
 ./deploy/deploy.sh         # ci.sh, then copies (over SFTP only) to a fresh xmpp:/tmp/logguard-xmpp-bot-deploy.XXXX
 ```
 
-The static Linux build needs `rustup target add x86_64-unknown-linux-musl` and
+The static Linux build needs `rustup target add x86_64-unknown-linux-musl` (for ARM: `aarch64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`, built with `TARGET=... ./deploy/deploy.sh`) and
 `rustup component add llvm-tools` (see `.cargo/config.toml`).
 
 Then paste the command `deploy.sh` prints into a root shell on the server: it checks the
@@ -413,6 +570,13 @@ The unit drops every capability, keeps `/usr` and `/etc` read-only, and has
 delay) carries on when the bot restarts; a second one is refused while it runs.
 
 ## Settings
+
+`BOT_MODE` (`admin`, the default, or `client`). Since 2026-10-26 `XMPP_SERVER` (unset: the JID's
+domain through SRV records), `XMPP_DOMAIN` (unset: the JID's domain), `XMPP_PORT` (unset: 5222,
+or 5223 with `XMPP_TLS=direct`), `BOT_NAME` (`logguard`) and `BOT_STATE_PATH`
+(`/opt/logguard-xmpp-bot/state.json`) have defaults, and `ALLOW_SCRAM_SHA1` (no) is new; client
+mode adds `OPENPGP_KEY` and `ALERT_MAX_HOURS` (24) and uses the OMEMO, upload and outbox settings
+below.
 
 The variables in the existing `config.env`: `BOT_JID`, `BOT_PASSWORD`, `BOT_NAME`, `ADMIN_JID`,
 `XMPP_SERVER`, `XMPP_DOMAIN`, `XMPP_PORT`, `BOT_STATE_PATH`, `ORG_NAME`, `AVATAR_PATH`,

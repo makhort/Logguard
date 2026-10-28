@@ -1,0 +1,46 @@
+# Fuzz targets (cargo-fuzz, nightly):  cargo +nightly fuzz run http_request
+# See "Fuzzing" in ../README.md.
+[package]
+name = "logguard-web-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logguard-web = { path = ".." }
+
+# its own workspace, so the main crate's builds never pull in libFuzzer
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_request"
+path = "fuzz_targets/agent_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "abuse_report"
+path = "fuzz_targets/abuse_report.rs"
+test = false
+doc = false
+bench = false

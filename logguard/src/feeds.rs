@@ -98,7 +98,7 @@ pub struct FeedStatus {
 }
 
 /// Special-purpose ranges that must never be blocked (FireHOL level1 lists several).
-const BOGONS: &[&str] = &[
+pub(crate) const BOGONS: &[&str] = &[
     "0.0.0.0/8",
     "10.0.0.0/8",
     "100.64.0.0/10",
@@ -198,6 +198,12 @@ pub const MAX_DOWNLOAD: u64 = 16 << 20;
 /// Runs a fetch command (`curl ... <url>`), streaming its output into `out` and stopping
 /// at `max` bytes, so a huge or endless answer can't exhaust memory or disk.
 pub fn fetch_into(cmd: &[String], url: &str, out: &mut dyn std::io::Write, max: u64) -> Result<u64> {
+    fetch_into_with(cmd, url, None, out, max)
+}
+
+/// `fetch_into`, writing `input` to the command's stdin: a secret header for `curl -H @-`,
+/// which other local users can't read there as they can a command line.
+pub fn fetch_into_with(cmd: &[String], url: &str, input: Option<&[u8]>, out: &mut dyn std::io::Write, max: u64) -> Result<u64> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     let (prog, args) = cmd.split_first().context("empty fetch command")?;
@@ -206,13 +212,20 @@ pub fn fetch_into(cmd: &[String], url: &str, out: &mut dyn std::io::Write, max: 
     let mut child = Command::new(prog)
         .args(args)
         .arg(url)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .with_context(|| format!("running {prog}"))?;
     let group = child.id();
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+        });
+    }
     // Drained separately (only the start kept), so a chatty program can't block on it.
     let mut err_pipe = child.stderr.take().context("stderr")?;
     let errors = std::thread::spawn(move || {
@@ -260,12 +273,11 @@ fn kill_group(group: u32) {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    const SIGKILL: i32 = 9; // Linux and macOS
     let Ok(pgid) = i32::try_from(group) else { return };
     // SAFETY: kill(2) takes plain integers and touches no memory; a negative pid names a
     // process group, here the one of a child we started (see above).
     unsafe {
-        kill(-pgid, SIGKILL);
+        kill(-pgid, crate::sys::SIGKILL);
     }
 }
 
@@ -480,8 +492,8 @@ mod tests {
     fn parses_spamhaus_firehol_and_json() {
         let spamhaus = "; Spamhaus DROP List 2026/10/11\n; Last-Modified: x\n11.1.16.0/20 ; SBL256894\n11.2.32.0/22 ; SBL459831\n";
         let firehol = "#\n# firehol_level1\n#\n0.0.0.0/8\n11.1.16.0/20\n10.0.0.0/8\n11.3.10.0/23\n224.0.0.0/3\n";
-        let json = "{\"cidr\":\"11.16.56.0/22\",\"sblid\":\"SBL1\",\"rir\":\"ripencc\"}\n{\"type\":\"metadata\",\"timestamp\":1}\n";
-        let v6 = "3fff:110::/29 ; SBL300728\n";
+        let json = "{\"cidr\":\"11.19.56.0/22\",\"sblid\":\"SBL1\",\"rir\":\"ripencc\"}\n{\"type\":\"metadata\",\"timestamp\":1}\n";
+        let v6 = "3fff:140::/29 ; SBL300728\n";
         let all: Vec<Net> = [spamhaus, firehol, json, v6].iter().flat_map(|t| parse_feed(t)).collect();
         assert_eq!(all.len(), 9);
 
@@ -490,7 +502,7 @@ mod tests {
         assert_eq!(skipped, 4, "0/8, 10/8, 224/3 and the protected 11.3.10.0/23");
         let merged = aggregate(kept);
         let s: Vec<String> = merged.iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, vec!["3fff:110::/29", "11.1.16.0/20", "11.2.32.0/22", "11.16.56.0/22"]);
+        assert_eq!(s, vec!["3fff:140::/29", "11.1.16.0/20", "11.2.32.0/22", "11.19.56.0/22"]);
     }
 
     #[test]
@@ -535,9 +547,9 @@ mod tests {
     #[test]
     fn aggregate_removes_nested() {
         let nets: Vec<Net> =
-            ["11.29.0.0/16", "11.29.53.0/24", "11.29.53.7", "11.26.62.0/24", "11.26.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
+            ["11.35.0.0/16", "11.35.53.0/24", "11.35.53.7", "11.31.62.0/24", "11.31.0.0/16"].iter().map(|n| n.parse().unwrap()).collect();
         let s: Vec<String> = aggregate(nets).iter().map(|n| n.to_string()).collect();
-        assert_eq!(s, vec!["11.26.0.0/16", "11.29.0.0/16"]);
+        assert_eq!(s, vec!["11.31.0.0/16", "11.35.0.0/16"]);
     }
 
     #[test]
@@ -581,7 +593,7 @@ mod tests {
         assert_eq!(nets.len(), 2);
         assert!(st.error.as_deref().is_some_and(|e| e.contains("IPv4 addresses")), "{st:?}");
         // a few more small networks are normal growth
-        list("11.1.16.0/20\n11.2.32.0/22\n11.3.10.0/23\n11.16.56.0/22\n");
+        list("11.1.16.0/20\n11.2.32.0/22\n11.3.10.0/23\n11.19.56.0/22\n");
         let (nets, st) = refresh(&cfg, &[], &|_| None);
         assert_eq!((nets.len(), st.error), (4, None));
         // wider than the floor (/12): never loaded

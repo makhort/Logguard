@@ -1,0 +1,17 @@
+#!/bin/bash
+# logguard's package, before its files are unpacked. dpkg runs it as  preinst install|upgrade
+# [old-version], rpm as %pre with 1 (first install) or 2 (upgrade): the same script for both.
+# Saves the running version's defaults, so postinst's config-diff can tell new options and
+# changed defaults apart (as the bundle's install.sh does). The old binary is the package's
+# (/usr/bin/logguard) or a bundle's or deploy.sh's (/usr/local/bin/logguard), which the package
+# takes over.
+set -eu
+for old in /usr/bin/logguard /usr/local/bin/logguard; do
+    if [ -x "$old" ] && [ -f /etc/logguard/logguard.toml ]; then
+        mkdir -p -m 0700 /run/logguard-package
+        env -u LOGGUARD_CONFIG "$old" print-config > /run/logguard-package/old-defaults 2> /dev/null \
+            || rm -f /run/logguard-package/old-defaults
+        break
+    fi
+done
+exit 0

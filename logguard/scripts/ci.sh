@@ -30,10 +30,14 @@ elif ! cargo audit --quiet --deny unsound --deny yanked > /dev/null 2>&1; then
     fi
 fi
 step "static Linux binary"
-cargo build --release --quiet --target x86_64-unknown-linux-musl
-bin=target/x86_64-unknown-linux-musl/release/logguard
+# TARGET=aarch64-unknown-linux-musl or armv7-unknown-linux-musleabihf builds for ARM instead
+TARGET=${TARGET:-x86_64-unknown-linux-musl}
+cargo build --release --quiet --target "$TARGET"
+bin=target/$TARGET/release/logguard
 ls -l "$bin"
 step "bundled configs parse"
 for c in deploy/*.toml; do
     cargo run --quiet -- --config "$c" print-config > /dev/null && echo "ok  $c"
 done
+step "dnf template variants up to date"
+./scripts/dnf-templates.sh --check && echo ok

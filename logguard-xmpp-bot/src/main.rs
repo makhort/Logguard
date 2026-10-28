@@ -5,7 +5,7 @@ mod logger;
 mod timefmt;
 mod xmpp;
 
-use logguard_xmpp_bot::{omemo, outbox, state};
+use logguard_xmpp_bot::{omemo, outbox, seal, state};
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,13 +13,21 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 
-/// XMPP bot that exposes curated ejabberdctl commands in a chat.
+/// XMPP bot for logguard. As an admin bot (BOT_MODE=admin), on the XMPP server: curated
+/// ejabberdctl commands for the admin and users in a chat, and logguard's alerts and reports
+/// for the admin. As a client bot (BOT_MODE=client), on any host and XMPP server: only
+/// logguard's alerts, digests and reports for the admin, OMEMO-encrypted, else as files
+/// encrypted to the admin's OpenPGP key.
 ///
 /// Every option can also come from the environment variable named after it, so the
 /// Python bot's config.env works as an EnvironmentFile unchanged.
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Args {
+    /// admin: the admin bot on the XMPP server (ejabberdctl, commands for the admin and
+    /// users); client: a copy bot like logguard-tg-bot, for logguard's [notify] xmpp_outbox.
+    #[arg(long, env = "BOT_MODE", value_enum, default_value_t = BotMode::Admin)]
+    mode: BotMode,
     /// The bot's JID; a missing resource becomes "bot".
     #[arg(long, env = "BOT_JID")]
     jid: String,
@@ -31,25 +39,34 @@ pub struct Args {
     #[arg(long, env = "BOT_PASSWORD_FILE", conflicts_with = "password")]
     password_file: Option<PathBuf>,
     /// Sort name in the bot's vCard.
-    #[arg(long, env = "BOT_NAME")]
+    #[arg(long, env = "BOT_NAME", default_value = "logguard")]
     name: String,
-    /// The admin's bare JID: the only one with the admin commands.
+    /// The admin's bare JID: the only one with the admin commands (admin mode), the only one
+    /// the bot writes to (client mode; on any server).
     #[arg(long, env = "ADMIN_JID")]
     admin: String,
     /// Host to connect to (DNS name or IP). TLS is still verified against the JID's domain.
+    /// Unset: the JID's domain, through its SRV records (_xmpp-client, or _xmpps-client
+    /// with XMPP_TLS=direct).
     #[arg(long, env = "XMPP_SERVER")]
-    server: String,
-    /// The XMPP domain the bot manages accounts of.
+    server: Option<String>,
+    /// The XMPP domain the bot manages accounts of (admin mode) [default: the JID's domain].
     #[arg(long, env = "XMPP_DOMAIN")]
-    domain: String,
-    #[arg(long, env = "XMPP_PORT", default_value_t = 5222)]
-    port: u16,
+    domain: Option<String>,
+    /// [default: 5222, or 5223 with XMPP_TLS=direct; with SRV records only when they fail]
+    #[arg(long, env = "XMPP_PORT")]
+    port: Option<u16>,
     /// direct: TLS from the first byte (ejabberd's 5223); starttls: plain TCP upgraded
     /// to TLS (5222); auto: direct on port 5223, else starttls. Both verify the certificate.
     #[arg(long, env = "XMPP_TLS", value_enum, default_value_t = Tls::Auto)]
     tls: Tls,
-    /// The JSON state file (same format as the Python bot's).
-    #[arg(long, env = "BOT_STATE_PATH")]
+    /// Also log in with SCRAM-SHA-1 when the server offers no SCRAM-SHA-256 (Prosody before
+    /// 13 offers only SCRAM-SHA-1). Off: such a server is refused.
+    #[arg(long, env = "ALLOW_SCRAM_SHA1", default_value_t = false, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    allow_scram_sha1: bool,
+    /// The JSON state file (same format as the Python bot's; admin mode only). Its directory
+    /// holds the OMEMO keys, trust pins and outbox by default in both modes.
+    #[arg(long, env = "BOT_STATE_PATH", default_value = "/opt/logguard-xmpp-bot/state.json")]
     state_path: PathBuf,
     #[arg(long, env = "ORG_NAME")]
     org_name: Option<String>,
@@ -123,9 +140,24 @@ pub struct Args {
     /// The HTTP File Upload service (XEP-0363) [default: found with disco on the domain].
     #[arg(long, env = "UPLOAD_SERVICE")]
     upload_service: Option<String>,
+    /// Client mode: the admin's OpenPGP public key (armored or binary, v4: RSA or Curve25519).
+    /// When OMEMO can't reach the admin, messages and files go out encrypted to it, as files.
+    /// Without it they wait.
+    #[arg(long, env = "OPENPGP_KEY")]
+    openpgp_key: Option<PathBuf>,
+    /// Client mode: hours an alert may wait (offline, no way to encrypt it) before it is
+    /// dropped unsent.
+    #[arg(long, env = "ALERT_MAX_HOURS", default_value_t = 24)]
+    alert_max_hours: u32,
     /// Log here as well as to stderr.
     #[arg(long, env = "LOG_DIR", default_value = "/var/log/logguard-xmpp-bot")]
     log_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum BotMode {
+    Admin,
+    Client,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]

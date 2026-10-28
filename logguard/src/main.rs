@@ -49,21 +49,34 @@ enum Cmd {
     },
     /// Send a test XMPP notification through ejabberdctl (run on the server).
     NotifyTest {
-        /// Recipient JID (with --telegram or --mail: the first of [notify] admins, if any, when left out).
-        #[arg(required_unless_present_any = ["telegram", "mail"])]
+        /// Recipient JID (with --telegram, --mail, --signal, --matrix or --xmpp-client: the first
+        /// of [notify] admins, if any, when left out).
+        #[arg(required_unless_present_any = ["telegram", "mail", "signal", "matrix", "xmpp_client"])]
         jid: Option<String>,
         /// Through the admin bot's outbox ([notify] bot_outbox), OMEMO-encrypted, and wait
         /// until the bot has sent it. One it doesn't take, the running daemon sends unencrypted.
-        #[arg(long, conflicts_with_all = ["telegram", "mail"])]
+        #[arg(long, conflicts_with_all = ["telegram", "mail", "signal", "matrix", "xmpp_client"])]
         bot: bool,
         /// Only through the Telegram bot's outbox ([notify] tg_outbox), and wait until logguard-tg-bot
         /// has sent it.
-        #[arg(long, conflicts_with = "mail")]
+        #[arg(long, conflicts_with_all = ["mail", "signal", "matrix", "xmpp_client"])]
         telegram: bool,
         /// Only through the mail bot's outbox ([notify] mail_outbox), and wait until logguard-mail-bot
         /// has sent it.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["signal", "matrix", "xmpp_client"])]
         mail: bool,
+        /// Only through the Signal bot's outbox ([notify] signal_outbox), and wait until
+        /// logguard-signal-bot has sent it.
+        #[arg(long, conflicts_with_all = ["matrix", "xmpp_client"])]
+        signal: bool,
+        /// Only through the Matrix bot's outbox ([notify] matrix_outbox), and wait until
+        /// logguard-matrix-bot has sent it.
+        #[arg(long, conflicts_with = "xmpp_client")]
+        matrix: bool,
+        /// Only through the XMPP client bot's outbox ([notify] xmpp_outbox), and wait until
+        /// logguard-xmpp-bot (BOT_MODE=client) has sent it.
+        #[arg(long)]
+        xmpp_client: bool,
     },
     /// Interactive dashboard for a running daemon (or a saved snapshot).
     Tui {
@@ -111,6 +124,12 @@ enum Cmd {
     Allowed,
     /// Blocklist feeds: status, refresh now, or clear (empty the feed sets in one step).
     Feeds {
+        #[arg(value_parser = ["status", "refresh", "clear"], default_value = "status")]
+        action: String,
+    },
+    /// Addresses WAFs block ([waf]: CrowdSec, ...): status, read the sources now, or clear
+    /// (empty the list sets in one step; bans from WAFs stay).
+    Waf {
         #[arg(value_parser = ["status", "refresh", "clear"], default_value = "status")]
         action: String,
     },
@@ -179,6 +198,13 @@ enum Cmd {
     },
     /// Generate a new random cluster key (base64) for `[cluster] key`/`key_file`.
     ClusterKeygen,
+    /// Create this node's own signing key for `[cluster] identity_file` (mode 0600; an existing
+    /// file is kept) and print its public key, for `[cluster] nodes` on every node.
+    ClusterIdentity {
+        /// The key file, e.g. /etc/logguard/node.key.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Fingerprints of the cluster keys this node sends and accepts (the same key gives the
     /// same fingerprint on every node; the key itself isn't shown).
     ClusterKeyId {
@@ -190,8 +216,12 @@ enum Cmd {
     ClusterUfwRules {
         /// iptables/ip6tables commands instead, for hosts without ufw (add them to your
         /// persistent rules, e.g. /etc/iptables/rules.v4).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "firewalld")]
         iptables: bool,
+        /// firewall-cmd commands instead (permanent rich rules in the default zone; then
+        /// `firewall-cmd --reload`).
+        #[arg(long)]
+        firewalld: bool,
     },
     /// Print the effective configuration (the built-in defaults without --config).
     PrintConfig,
@@ -220,8 +250,19 @@ enum Cmd {
         #[arg(required = true)]
         files: Vec<String>,
     },
-    /// Run the patterns of your own ([[patterns]]) over log lines (journal JSON,
-    /// `journalctl` short output, or a log file's lines) and show what each finds.
+    /// Audit sshd's settings now (as `sshd -T` gives them) for this host's layout: a plain
+    /// VPS, a hosting panel, or a gateway like harden-vps.sh's. Read-only; works without the
+    /// daemon; run as root.
+    SshAudit {
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Also the notes (info), not only high problems and warnings.
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Run the patterns of your own ([[patterns]]) and those of [sources] apps over log lines
+    /// (journal JSON, `journalctl` short output, or a log file's lines) and show what each finds.
     TestPattern {
         files: Vec<PathBuf>,
         /// Only this pattern.
@@ -237,10 +278,23 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("logguard: {e:#}");
+            // In the journal at error priority, so a start that fails (a config error) shows in
+            // `journalctl -p warning` next to systemd's "Failed to start", not only at info.
+            let level = if stderr_is_journal() { "<3>" } else { "" };
+            eprintln!("{level}logguard: {e:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether stderr is systemd's journal stream (`JOURNAL_STREAM` names its device and inode),
+/// which reads a `<N>` prefix as the line's priority. Not so in a terminal, even one whose
+/// shell inherited the variable.
+fn stderr_is_journal() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(want) = std::env::var_os("JOURNAL_STREAM") else { return false };
+    let Ok(meta) = std::fs::metadata("/proc/self/fd/2") else { return false };
+    want.to_str() == Some(format!("{}:{}", meta.dev(), meta.ino()).as_str())
 }
 
 fn parse_net(s: &str) -> Result<logguard::net::Net> {
@@ -264,11 +318,10 @@ fn default_sigpipe() {
     extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
     }
-    const SIGPIPE: i32 = 13; // Linux and macOS
     const SIG_DFL: usize = 0;
     // SAFETY: restores the default disposition of one signal before any thread is started.
     unsafe {
-        signal(SIGPIPE, SIG_DFL);
+        signal(logguard::sys::SIGPIPE, SIG_DFL);
     }
 }
 
@@ -281,6 +334,14 @@ fn real_main() -> Result<()> {
         // No config needed: e.g. the local copy deploy.sh installs.
         let text = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
         println!("{}  {}", logguard::cluster::key_id(&logguard::cluster::decode_key(text.trim())?), f.display());
+        return Ok(());
+    }
+    if let Cmd::ClusterIdentity { out } = &cli.cmd {
+        // No config needed: run before [cluster] identity_file names the file.
+        let (id, new) = logguard::cluster::Identity::create(out)?;
+        let name = cli.config.as_deref().and_then(|p| Config::load(Some(p)).ok()).map(|c| c.cluster.node_name());
+        eprintln!("{} {}; pin its public key on every node:", if new { "created" } else { "kept the existing key in" }, out.display());
+        println!("{} = \"{}\"", name.unwrap_or_else(logguard::cluster::hostname), id.public());
         return Ok(());
     }
     if let Cmd::ConfigDiff { against, all } = &cli.cmd {
@@ -330,19 +391,21 @@ fn real_main() -> Result<()> {
             let source = match file {
                 Some(f) => tui::DataSource::File(f),
                 None if !actions.is_empty() => {
-                    let geo = cfg.geo.enabled.then(|| logguard::geo::GeoDb::load(&cfg.geo.dir).ok()).flatten();
+                    let geo = cfg.geo.enabled.then(|| logguard::geo::GeoDb::open(&cfg.geo).ok()).flatten();
                     tui::DataSource::Actions(actions, geo.map(Arc::new))
                 }
                 None => tui::DataSource::Socket(cfg.socket.clone()),
             };
             tui::run(source, cfg.digest.cert_warn_days)
         }
-        Cmd::NotifyTest { jid, bot, telegram, mail } => {
+        Cmd::NotifyTest { jid, bot, telegram, mail, signal, matrix, xmpp_client } => {
             let mut ncfg = cfg.notify.clone();
             ncfg.enabled = true;
             ncfg.validate()?;
-            if !ncfg.xmpp && !telegram && !mail {
-                anyhow::bail!("this node doesn't send XMPP messages ([notify] xmpp = false): use --telegram or --mail");
+            if !ncfg.xmpp && !telegram && !mail && !signal && !matrix && !xmpp_client {
+                anyhow::bail!(
+                    "this node doesn't send XMPP messages ([notify] xmpp = false): use --telegram, --mail, --signal, --matrix or --xmpp-client"
+                );
             }
             let Some(jid) = jid.or_else(|| ncfg.admin_recipients().first().cloned()) else {
                 anyhow::bail!("give a JID: [notify] admins is empty")
@@ -366,6 +429,18 @@ fn real_main() -> Result<()> {
                 let Some(dir) = ncfg.mail_outbox.clone() else { anyhow::bail!("[notify] mail_outbox is not set") };
                 return notify_test_copy(&notify::MAIL_BOT, dir, &ncfg.mail_user, "mail_user", &n);
             }
+            if signal {
+                let Some(dir) = ncfg.signal_outbox.clone() else { anyhow::bail!("[notify] signal_outbox is not set") };
+                return notify_test_copy(&notify::SIGNAL_BOT, dir, &ncfg.signal_user, "signal_user", &n);
+            }
+            if matrix {
+                let Some(dir) = ncfg.matrix_outbox.clone() else { anyhow::bail!("[notify] matrix_outbox is not set") };
+                return notify_test_copy(&notify::MATRIX_BOT, dir, &ncfg.matrix_user, "matrix_user", &n);
+            }
+            if xmpp_client {
+                let Some(dir) = ncfg.xmpp_outbox.clone() else { anyhow::bail!("[notify] xmpp_outbox is not set") };
+                return notify_test_copy(&notify::XMPP_BOT, dir, &ncfg.xmpp_user, "xmpp_user", &n);
+            }
             notify::send(&ncfg, &n)?;
             println!("sent to {} from {}", n.to, ncfg.from);
             Ok(())
@@ -376,7 +451,9 @@ fn real_main() -> Result<()> {
             let safe = |s: &str| logguard::event::clean(s, 1000);
             let snap: logguard::engine::Snapshot = serde_json::from_str(&daemon::fetch_snapshot(&cfg.socket)?)?;
             let now = snap.generated;
-            println!("mode {:?}, snapshot at {}", snap.mode, logguard::time::fmt_ts(now));
+            let backend =
+                snap.backend.as_ref().filter(|_| snap.mode == config::Mode::Enforce).map(|b| format!(" ({b})")).unwrap_or_default();
+            println!("mode {:?}{backend}, snapshot at {}", snap.mode, logguard::time::fmt_ts(now));
             let lines: Vec<String> = snap
                 .last_lines
                 .iter()
@@ -388,6 +465,8 @@ fn real_main() -> Result<()> {
                                 | logguard::record::Source::Kernel
                                 | logguard::record::Source::Systemd
                                 | logguard::record::Source::Privilege
+                                | logguard::record::Source::Auth
+                                | logguard::record::Source::Audit
                         )
                 })
                 .map(|(s, t)| format!("{} {} ago", s.name(), logguard::time::fmt_duration(now - t)))
@@ -421,6 +500,17 @@ fn real_main() -> Result<()> {
                         String::new()
                     } else {
                         format!(", rotation: also accepting {}", c.extra_key_ids.join(", "))
+                    }
+                );
+                let signs = if c.identity.is_empty() { "signs nothing".to_string() } else { format!("signs as {}", c.identity) };
+                println!(
+                    "  node identity: {signs}; {} node keys pinned{}{}",
+                    c.pinned,
+                    if cfg.cluster.require_signatures { ", others refused" } else { "" },
+                    if c.refused_signature > 0 {
+                        format!("; {} facts refused for their signature", c.refused_signature)
+                    } else {
+                        String::new()
                     }
                 );
                 for p in &c.peers {
@@ -461,7 +551,7 @@ fn real_main() -> Result<()> {
                     println!("  + {dynamic} short-lived sockets in allowed port ranges (e.g. TURN relays)");
                 }
                 for d in &r.dead_rules {
-                    println!("  dead ufw rule: {d} (nothing listens)");
+                    println!("  dead {} rule: {d} (nothing listens)", fw.name());
                 }
             }
             if !snap.allow_hosts.is_empty() {
@@ -473,7 +563,7 @@ fn real_main() -> Result<()> {
             }
             if let Some(v) = &snap.verify {
                 println!(
-                    "  packages: last check {}, {} files match dpkg, {} differ; {} set-uid/set-gid programs",
+                    "  packages: last check {}, {} files match their packages, {} differ; {} set-uid/set-gid programs",
                     logguard::time::fmt_ts(v.last_run),
                     v.checked,
                     v.mismatched,
@@ -544,23 +634,51 @@ fn real_main() -> Result<()> {
                     println!("  cannot read: {e}");
                 }
             }
+            if cfg.geoblock.enabled {
+                match &snap.geoblock {
+                    None => println!("\ngeoblock ({}): waiting for the [geo] databases", cfg.geoblock.describe()),
+                    Some(g) => {
+                        let state = match (&g.error, g.applied) {
+                            (Some(e), _) => format!("NOT loaded: {}", safe(e)),
+                            (None, true) => format!("active in {}", snap.backend.as_deref().unwrap_or("the firewall")),
+                            (None, false) => "NOT applied (shadow mode, or a backend without it: ufw, iptables)".into(),
+                        };
+                        println!(
+                            "\ngeoblock ({}): {} IPv4 + {} IPv6 networks, computed {}, {state}",
+                            g.what,
+                            g.v4,
+                            g.v6,
+                            logguard::time::fmt_ts(g.computed)
+                        );
+                    }
+                }
+            }
             if let Some(p) = &snap.patches {
                 println!("\npatches (read {} ago): {}", logguard::time::fmt_duration(now - p.read), safe(&p.summary()));
                 for e in &p.errors {
                     println!("  cannot read: {}", safe(e));
                 }
             }
+            if let Some(a) = &snap.ssh_audit {
+                println!("\nssh audit (read {} ago): {}", logguard::time::fmt_duration(now - a.read), safe(&a.summary()));
+                for i in a.issues.iter().filter(|i| i.severity >= logguard::engine::Severity::Warning) {
+                    println!("  {:?}: {}", i.severity, safe(&i.message));
+                }
+            }
             if !cfg.ratelimit.is_empty() && snap.mode == config::Mode::Enforce {
                 println!("\nrate limits (new connections per source address):");
-                match enforce::rate_limit_drops(&cfg.enforce.nft, &cfg.enforce.nft_table) {
-                    Ok(drops) => {
+                // only nftables has them (an older daemon doesn't say which backend it uses)
+                let backend = snap.backend.as_deref().filter(|b| *b != "nftables");
+                match backend.map_or_else(|| enforce::rate_limit_drops(&cfg.enforce.nft, &cfg.enforce.nft_table).map(Some), |_| Ok(None)) {
+                    Ok(None) => println!("  none: [[ratelimit]] needs the nftables backend; this daemon uses {}", backend.unwrap_or("?")),
+                    Ok(Some(drops)) => {
                         for (i, l) in cfg.ratelimit.iter().enumerate() {
                             let ports: Vec<String> = l.ports.iter().map(|p| p.to_string()).collect();
                             let n = drops.iter().find(|d| d.0 == i).map_or(0, |d| d.1);
                             println!("  {:<24} {:>12} burst {:<4} {n} packets dropped", ports.join(","), l.rate, l.burst);
                         }
                     }
-                    Err(e) => println!("  not readable ({e:#}); the ufw fallback has no rate limits"),
+                    Err(e) => println!("  not readable ({e:#}): only the nftables backend has rate limits"),
                 }
             }
             println!("\nrecent alerts:");
@@ -590,8 +708,9 @@ fn real_main() -> Result<()> {
         }
         Cmd::TestPattern { files, pattern, verbose } => {
             let mut out = std::io::stdout().lock();
+            let patterns: Vec<_> = cfg.all_patterns().cloned().collect();
             if files.is_empty() {
-                logguard::parse::custom::test(&cfg.patterns, pattern.as_deref(), std::io::stdin().lock(), verbose, &mut out)?;
+                logguard::parse::custom::test(&patterns, pattern.as_deref(), std::io::stdin().lock(), verbose, &mut out)?;
             }
             for f in &files {
                 let file = std::fs::File::open(f).with_context(|| format!("reading {}", f.display()))?;
@@ -602,7 +721,7 @@ fn real_main() -> Result<()> {
                 };
                 use std::io::Write as _;
                 writeln!(out, "== {}", f.display())?;
-                logguard::parse::custom::test(&cfg.patterns, pattern.as_deref(), reader, verbose, &mut out)?;
+                logguard::parse::custom::test(&patterns, pattern.as_deref(), reader, verbose, &mut out)?;
             }
             Ok(())
         }
@@ -624,7 +743,11 @@ fn real_main() -> Result<()> {
                         f.v6,
                         f.skipped,
                         logguard::time::fmt_ts(f.refreshed),
-                        if f.applied { "active in nftables" } else { "NOT applied (shadow mode, ufw backend, or cleared)" }
+                        if f.applied {
+                            format!("active in {}", snap.backend.as_deref().unwrap_or("the firewall"))
+                        } else {
+                            "NOT applied (shadow mode, a backend without feeds: firewalld, ufw, iptables; or cleared)".into()
+                        }
                     );
                     if f.asns > 0 {
                         let how = if f.asn_pending {
@@ -650,8 +773,53 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::Feeds { action } => send_control(&cfg, &format!("feeds {action}")),
+        Cmd::Waf { action } if action == "status" => {
+            let snap: logguard::engine::Snapshot = serde_json::from_str(&daemon::fetch_snapshot(&cfg.socket)?)?;
+            match snap.waf {
+                None if !cfg.waf.enabled => println!("[waf] is disabled (enabled = false)"),
+                None => println!("no [waf] refresh has completed yet (the first waits for the journal catch-up)"),
+                Some(w) => {
+                    println!("refreshed {}", logguard::time::fmt_ts(w.refreshed));
+                    for s in &w.sources {
+                        let state = match (&s.error, s.from_cache) {
+                            (Some(e), true) => format!("failed, using the last good copy: {e}"),
+                            (Some(e), false) => format!("failed: {e}"),
+                            _ => "ok".into(),
+                        };
+                        let what = match s.action {
+                            logguard::waf::WafAction::Ban => format!("{} bans ({} decisions made none)", s.banned, s.skipped),
+                            logguard::waf::WafAction::List => "into the list".into(),
+                        };
+                        let odd = if s.bad + s.ignored > 0 {
+                            format!(", {} not understood, {} left out", s.bad, s.ignored)
+                        } else {
+                            String::new()
+                        };
+                        println!("  {:<16} {:>6} decisions, {what}{odd}  {state}", s.name, s.decisions);
+                    }
+                    if w.sources.iter().any(|s| s.action == logguard::waf::WafAction::List) {
+                        println!(
+                            "  list: {} IPv4 + {} IPv6 networks, {} skipped, {}",
+                            w.list_v4,
+                            w.list_v6,
+                            w.list_skipped,
+                            if w.applied {
+                                format!("active in {}", snap.backend.as_deref().unwrap_or("the firewall"))
+                            } else {
+                                "NOT applied (shadow mode, a backend without lists: firewalld, ufw, iptables; empty, or cleared)".into()
+                            }
+                        );
+                    }
+                    if let Some(e) = w.error {
+                        println!("  note: {e}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Waf { action } => send_control(&cfg, &format!("waf {action}")),
         Cmd::Digest { send } => send_control(&cfg, if send { "digest send" } else { "digest" }),
-        Cmd::ClusterUfwRules { iptables } => {
+        Cmd::ClusterUfwRules { iptables, firewalld } => {
             let c = &cfg.cluster;
             if !c.enabled || c.listen.is_empty() {
                 return Ok(());
@@ -659,7 +827,13 @@ fn real_main() -> Result<()> {
             let port: std::net::SocketAddr = c.listen.parse()?;
             let cluster = logguard::cluster::Cluster::new(c)?;
             for net in cluster.peer_nets() {
-                if iptables {
+                if firewalld {
+                    let family = if net.is_v4() { "ipv4" } else { "ipv6" };
+                    println!(
+                        "firewall-cmd --permanent --add-rich-rule='rule family=\"{family}\" source address=\"{net}\" port port=\"{}\" protocol=\"tcp\" accept'",
+                        port.port()
+                    );
+                } else if iptables {
                     let cmd = if net.is_v4() { "iptables" } else { "ip6tables" };
                     println!("{cmd} -I INPUT -p tcp -s {net} --dport {} -j ACCEPT -m comment --comment 'logguard cluster'", port.port());
                 } else {
@@ -679,7 +853,7 @@ fn real_main() -> Result<()> {
                 }
             }
             let started = std::time::Instant::now();
-            let db = logguard::geo::GeoDb::load(&cfg.geo.dir)?;
+            let db = logguard::geo::GeoDb::open(&cfg.geo)?;
             println!("{} ({}, loaded in {:.1?})", cfg.geo.dir.display(), db.summary, started.elapsed());
             for ip in ips {
                 println!("{ip:<40} {}", db.label(ip).unwrap_or_else(|| "unknown".into()));
@@ -777,7 +951,7 @@ fn real_main() -> Result<()> {
                 report.offenders.truncate(top);
             }
             if cfg.geo.enabled {
-                if let Ok(db) = logguard::geo::GeoDb::load(&cfg.geo.dir) {
+                if let Ok(db) = logguard::geo::GeoDb::open(&cfg.geo) {
                     for o in report.offenders.iter_mut().filter(|o| o.place.is_none()) {
                         o.place = db.label(o.net.addr);
                     }
@@ -845,7 +1019,7 @@ fn real_main() -> Result<()> {
             let targets: Vec<&String> = cfg.cluster.peers.iter().filter(|p| peers.is_empty() || peers.contains(p)).collect();
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let c = logguard::cluster::Cluster::new(&cfg.cluster)?;
-            let frame = logguard::cluster::file_frame(c.key(), &c.node_id, &name, &content, logguard::time::now())
+            let frame = logguard::cluster::file_frame(c.key(), c.identity(), &c.node_id, &name, &content, logguard::time::now())
                 .with_context(|| format!("{} does not fit in one cluster message", file.display()))?;
             let mut failed = 0;
             for peer in &targets {
@@ -866,11 +1040,42 @@ fn real_main() -> Result<()> {
             println!("{}", logguard::cluster::generate_key());
             Ok(())
         }
+        Cmd::ClusterIdentity { .. } => unreachable!("handled before loading the config"),
         Cmd::PrintConfig => {
             print!("{}", toml::to_string_pretty(&*cfg)?);
             Ok(())
         }
         Cmd::ConfigDiff { .. } => unreachable!("handled before the config is loaded"),
+        Cmd::SshAudit { json, all } => {
+            let r = logguard::sshaudit::scan(&cfg.ssh_audit, logguard::time::now());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            let safe = |s: &str| logguard::event::plain_text(s);
+            println!("ssh audit: {}", safe(&r.summary()));
+            if let Some(v) = &r.version {
+                println!("  {}", safe(v));
+            }
+            for e in &r.errors {
+                println!("  cannot read: {}", safe(e));
+            }
+            for i in r.issues.iter().filter(|i| all || i.severity >= logguard::engine::Severity::Warning) {
+                let sev = format!("{:?}", i.severity).to_lowercase();
+                println!("\n{sev:>7}  {}\n         {}", safe(&i.message), safe(&i.id));
+                if !i.fix.is_empty() {
+                    println!("    fix  {}", safe(&i.fix));
+                }
+            }
+            let notes = r.issues.iter().filter(|i| i.severity < logguard::engine::Severity::Warning).count();
+            if !all && notes > 0 {
+                println!("\n(+{notes} notes: --all shows them; [ssh_audit] ignore = [\"id\"] hides any)");
+            }
+            if !cfg.ssh_audit.enabled {
+                println!("\n([ssh_audit] is disabled: the daemon doesn't run this)");
+            }
+            Ok(())
+        }
         Cmd::PrintNft { no_tripwires } => {
             // Exactly what the daemon loads: the allowlist plus cluster peers and this host's
             // own addresses (so `install.sh`'s `nft -c` dry run checks the real thing).
@@ -894,8 +1099,9 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// `notify-test --telegram` and `--mail`: a message through a copy bot's outbox (logguard-tg-bot's,
-/// logguard-mail-bot's), waiting for the bot.
+/// `notify-test --telegram`, `--mail`, `--signal`, `--matrix` and `--xmpp-client`: a message
+/// through a copy bot's outbox (logguard-tg-bot's, logguard-mail-bot's, logguard-signal-bot's,
+/// logguard-matrix-bot's, client-mode logguard-xmpp-bot's), waiting for the bot.
 fn notify_test_copy(kind: &notify::CopyKind, dir: PathBuf, user: &str, user_key: &str, n: &notify::Notice) -> Result<()> {
     use logguard::botbox::{self, BotBox};
     let unit = kind.unit;

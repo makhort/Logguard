@@ -5,7 +5,10 @@
 #                                      in place (/etc/logguard/logguard.toml) to edit first
 #   ./install.sh --template NAME       the template a new server starts from: one of configs/
 #                                      (logguard.toml: XMPP server, the default; logguard-standalone.toml:
-#                                      SSH and UFW only; logguard-tg.toml: Telegram relay node)
+#                                      SSH and UFW only; logguard-tg.toml: Telegram relay node;
+#                                      logguard-desktop.toml: a Linux desktop or laptop;
+#                                      each with a -dnf variant for Fedora and RHEL, the default
+#                                      on a host with dnf and no apt)
 #   ./install.sh --config FILE         a new server's finished config: installs it at once
 #   ./install.sh --cluster-key FILE    the cluster key of the other nodes (their
 #                                      /etc/logguard/cluster.key), for a node joining them
@@ -49,7 +52,7 @@ if [ "$check" = yes ]; then
     exit 0
 fi
 [ "$(id -u)" = 0 ] || die "run as root:  sudo ./install.sh"
-[ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || die "this bundle is for Linux on x86_64"
+[ "$(uname -s)" = Linux ] || die "this bundle is for Linux"
 command -v systemctl > /dev/null || die "logguard runs as a systemd service: no systemctl here"
 
 # The unzipped files may belong to another user, who could swap them while this runs:
@@ -65,11 +68,16 @@ done < SHA256SUMS
 cp SHA256SUMS "$work/"
 cd "$work"
 sha256sum -c --quiet --strict SHA256SUMS || die "files don't match SHA256SUMS: a damaged or altered bundle"
+# One bundle per architecture (TARGET: x86_64, aarch64 or armv7 hard-float): its program must run here.
+files/logguard --version > /dev/null 2>&1 || die "this bundle is for $(cat TARGET); this machine is $(uname -m): use its own bundle"
 bin=$work/files/logguard
 
 setting() { # the value of $2 in section [$1] of config $3, as logguard reads it
     "$bin" --config "$3" print-config \
         | awk -v sec="[$1]" -v key="$2" '/^\[/ { s = ($0 == sec) } s && $1 == key { gsub(/"/, "", $3); print $3 }'
+}
+top_setting() { # the value of top-level $1 (before any section) of config $2
+    "$bin" --config "$2" print-config | awk -v key="$1" '/^\[/ { exit } $1 == key { gsub(/"/, "", $3); print $3 }'
 }
 template_named() {
     local t
@@ -79,15 +87,20 @@ template_named() {
     die "no template '$1' in configs/: $(cd configs && echo *)"
 }
 
-# The template: named, or the one for this server's node id (upgrades), or logguard.toml.
+# The template: named, or the one for this server's node id and package manager (upgrades),
+# or logguard.toml (logguard-dnf.toml on a host with dnf and no apt).
 if [ -n "$template" ]; then
     tpl=$(template_named "$template")
 else
     tpl=configs/logguard.toml
+    if ! command -v apt-get > /dev/null && command -v dnf > /dev/null; then tpl=configs/logguard-dnf.toml; fi
     if [ -f "$CONF" ]; then
         node=$(setting cluster node_id "$CONF" 2> /dev/null || true)
+        pm=$(top_setting package_manager "$CONF" 2> /dev/null || true)
         for t in configs/*.toml; do
-            if [ -n "$node" ] && [ "$(setting cluster node_id "$t")" = "$node" ]; then tpl=$t; fi
+            if [ -n "$node" ] && [ "$(setting cluster node_id "$t")" = "$node" ] && [ "$(top_setting package_manager "$t")" = "$pm" ]; then
+                tpl=$t
+            fi
         done
     fi
 fi

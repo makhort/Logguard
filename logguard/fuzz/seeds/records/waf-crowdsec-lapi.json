@@ -1,0 +1,1 @@
+[{"duration":"3h59m56.9s","id":1,"origin":"crowdsec","scenario":"crowdsecurity/http-probing","scope":"Ip","type":"ban","value":"192.0.2.10"},{"duration":"-1s","origin":"CAPI","scope":"Range","type":"ban","value":"198.51.100.0/24","simulated":true}]

@@ -12,11 +12,14 @@ use crate::record::{self, YearGuess};
 use crate::time::SEC;
 
 /// The configuration the targets use: every source on, so every parser is reached, and
-/// patterns of your own on any line no built-in parser reads (journal exports and syslog
-/// text carry no sender fields, so they apply).
+/// patterns of your own and every app's built-in ones on any line no built-in parser reads
+/// (journal exports and syslog text carry no sender fields, so they apply).
 pub fn config() -> Arc<Config> {
-    let mut cfg = Config::from_toml(
+    let apps: Vec<String> = crate::parse::apps::APPS.iter().map(|a| format!("\"{}\"", a.name)).collect();
+    let mut cfg = Config::from_toml(&format!(
         r#"
+        [sources]
+        apps = [{}]
         [[patterns]]
         name = "auth"
         identifier = "fuzz"
@@ -35,9 +38,10 @@ pub fn config() -> Arc<Config> {
         kind = "success"
         regex = 'accepted (?P<user>\S+) from (?P<ip>\S+)'
         "#,
-    )
+        apps.join(", ")
+    ))
     .expect("valid fuzzing config");
-    cfg.sources.nextcloud = true;
+    cfg.sources.nextcloud_aio = true;
     cfg.sources.services = vec!["logguard-xmpp-bot.service".into(), "ejabberd.service".into()];
     Arc::new(cfg)
 }
@@ -63,10 +67,42 @@ pub fn records(cfg: &Arc<Config>, data: &[u8]) {
         for ident in ["su", "sudo"] {
             let _ = crate::parse::privilege::parse(ident, &rec.msg);
         }
+        for ident in ["login", "useradd", "usermod", "gpasswd", "passwd"] {
+            let _ = crate::parse::auth::pam(ident, &rec.msg);
+        }
+        let _ = crate::parse::auth::audit(&rec.msg, &["*".to_string()]);
         let _ = crate::patches::parse_apt_simulation(&rec.msg);
         let _ = crate::procwatch::odd_exe(&rec.msg);
         let _ = crate::feeds::parse_asns(&rec.msg);
     }
     pipe.tick(last.saturating_add(86_400 * SEC));
     let _ = pipe.snapshot(10);
+    waf(&text);
+}
+
+/// What `[waf]` sources give out (a WAF's API answer, a file another program writes) in
+/// every format: whatever it holds, a parse ends, with decisions or an error.
+pub fn waf(text: &str) {
+    use crate::waf::{Format, WafSource};
+    let base = WafSource { name: "fuzz".into(), file: Some("/dev/null".into()), ..Default::default() };
+    let sources = [
+        WafSource { format: Format::Plain, ..base.clone() },
+        WafSource { format: Format::Crowdsec, ..base.clone() },
+        WafSource {
+            format: Format::Json,
+            items: "result.items".into(),
+            duration_field: "ttl".into(),
+            until_field: "meta.until".into(),
+            reason_field: "comment".into(),
+            ..base.clone()
+        },
+        WafSource { format: Format::Csv, ip_field: "2".into(), duration_field: "ttl".into(), header: true, ..base.clone() },
+        WafSource { format: Format::Regex, pattern: r"(?P<ip>\S+) (?P<duration>\S+) (?P<reason>.*)".into(), ..base },
+    ];
+    for s in &sources {
+        if let Ok(mut p) = crate::waf::parse(s, text, 1_790_000_000 * SEC) {
+            crate::waf::filter(s, &mut p);
+            let _ = crate::waf::by_net(&p.decisions);
+        }
+    }
 }

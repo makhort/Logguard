@@ -84,8 +84,12 @@ impl Session {
     /// next): tokio-xmpp's queue holds only 16 events, and once it is full the answer
     /// itself would not get through until the timeout.
     pub(super) async fn iq_within(&mut self, to: Option<Jid>, req: IqRequest, timeout: Duration) -> Result<Option<Element>, IqError> {
-        let token = self.client.send_iq(to, req).await;
-        let deadline = tokio::time::sleep(timeout);
+        // queuing waits too once tokio-xmpp's queue is full (while the connection is down)
+        let deadline = tokio::time::Instant::now() + timeout;
+        let Ok(token) = tokio::time::timeout_at(deadline, self.client.send_iq(to, req)).await else {
+            return Err(IqError { condition: None, text: "not sent (connection down?)".into() });
+        };
+        let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(token, deadline);
         let response = loop {
             tokio::select! {

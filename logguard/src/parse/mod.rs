@@ -1,5 +1,7 @@
 //! Turns raw records into security events.
 
+pub mod apps;
+pub mod auth;
 pub mod custom;
 pub mod ejabberd;
 pub mod kernel;
@@ -24,6 +26,11 @@ pub struct Parsers {
     sources: crate::config::SourcesCfg,
     ports: crate::config::PortsCfg,
     canary: crate::config::CanaryCfg,
+    /// The built-in patterns of Nextcloud's and ownCloud's failed logins in use: their
+    /// accounts are checked against `[canary] nextcloud` too.
+    cloud_logins: Vec<String>,
+    /// PAM services whose failed logins an app source of `[sources] apps` scores already.
+    auth_scored_elsewhere: Vec<&'static str>,
     /// Recent tripwire hits: the same blocked SYN may be logged by UFW and by logguard's own
     /// nftables rule (`[ports] kernel_tripwires`), and must count once.
     trips: std::collections::HashMap<(std::net::IpAddr, u16), Micros>,
@@ -39,11 +46,28 @@ impl Parsers {
         Parsers {
             ejabberd: ejabberd::EjabberdParser::new(cfg.xmpp.c2s_ports.clone(), cfg.xmpp.noauth_grace.micros()),
             ssh: ssh::SshParser::default(),
-            custom: custom::Patterns::new(&cfg.patterns),
+            custom: custom::Patterns::new(cfg.all_patterns()),
             pattern_seen: Vec::new(),
             sources: cfg.sources.clone(),
             ports: cfg.ports.clone(),
             canary: cfg.canary.clone(),
+            cloud_logins: cfg
+                .app_patterns
+                .iter()
+                .filter(|p| matches!(p.name.as_str(), "nextcloud_auth" | "owncloud_auth"))
+                .map(|p| p.name.clone())
+                .collect(),
+            auth_scored_elsewhere: cfg
+                .sources
+                .apps
+                .iter()
+                .flat_map(|a| match a.as_str() {
+                    "dovecot" => &["dovecot"][..],
+                    "postfix" => &["smtp", "smtps", "submission"][..],
+                    _ => &[][..],
+                })
+                .copied()
+                .collect(),
             trips: Default::default(),
         }
     }
@@ -59,9 +83,10 @@ impl Parsers {
             Source::Ufw => ufw::feed(rec, out),
             Source::Nextcloud => nextcloud::feed(rec, out),
             Source::Custom => self.pattern_seen = self.custom.feed(rec, out).into_iter().map(|(name, o)| (name.to_string(), o)).collect(),
-            // out-of-memory kills, service failures and su/sudo become alerts in the pipeline;
-            // peer evidence arrives as cluster facts
-            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege => {}
+            Source::Auth => self.auth(rec, out),
+            // out-of-memory kills, service failures, su/sudo and the audit log become alerts
+            // in the pipeline; peer evidence arrives as cluster facts
+            Source::Peer | Source::Kernel | Source::Systemd | Source::Privilege | Source::Audit => {}
         }
         self.drop_whitelisted(out, start);
         for e in &mut out[start..] {
@@ -72,6 +97,20 @@ impl Parsers {
             self.mark_canary(e);
         }
         self.drop_trip_twins(out, start);
+    }
+
+    /// A failed login PAM logged from an address on the internet, at a service no other
+    /// parser reads.
+    fn auth(&self, rec: &Record, out: &mut Vec<Event>) {
+        let ident = rec.sender.as_ref().and_then(|s| s.ident.as_deref()).unwrap_or("");
+        let Some(auth::Auth::Failure(f)) = auth::pam(ident, &rec.msg) else { return };
+        let auth::Rhost::Addr(ip) = f.rhost else { return };
+        if self.auth_scored_elsewhere.contains(&f.service.as_str()) {
+            return;
+        }
+        let account = format!("{}:{}", f.service, f.user);
+        let detail = format!("failed {} password for {}", f.service, f.user);
+        out.push(Event::new(rec.ts, ip, Signal::PamAuthFail).account(Some(&account)).detail(detail));
     }
 
     /// Drops a tripwire hit logged a second time (by UFW and by logguard's own rule).
@@ -101,6 +140,18 @@ impl Parsers {
     /// Login attempts (and XMPP registrations) on canary accounts become `*_canary` events;
     /// a *successful* login to one too, so it never earns the address any trust.
     fn mark_canary(&self, e: &mut Event) {
+        // Nextcloud's and ownCloud's failed logins from the apps' patterns:
+        // `nextcloud_auth:admin`, ownCloud's quoted `owncloud_auth:'admin'`
+        if e.signal == Signal::CustomFailure {
+            let Some((pattern, user)) = e.account.as_deref().and_then(|a| a.split_once(':')) else { return };
+            let user = user.trim_matches('\'');
+            if self.cloud_logins.iter().any(|p| p == pattern) && self.canary.is_canary(Source::Nextcloud, user) {
+                e.detail = format!("login attempt on canary account {user}");
+                e.signal = Signal::NcCanary;
+                e.points = None; // the canary's weight, not the pattern's
+            }
+            return;
+        }
         let candidate =
             e.signal.is_auth_failure() || e.signal.is_success() || matches!(e.signal, Signal::XmppRegister | Signal::XmppTokenFail);
         let Some(acct) = e.account.as_deref().filter(|_| candidate) else { return };
@@ -232,6 +283,48 @@ mod tests {
         assert!(Config::from_toml("[canary]\nxmpp = [\"*\"]\nexcept = [\"a\"]").is_err());
     }
 
+    /// `[canary] nextcloud` covers the apps' Nextcloud and ownCloud logins too.
+    #[test]
+    fn canary_accounts_of_the_cloud_apps() {
+        let cfg = Config::from_toml(
+            "[sources]\napps = [\"nextcloud\", \"owncloud\"]\n[sources.app_logs]\nnextcloud = \"/srv/nc.log\"\nowncloud = \"/srv/oc.log\"\n\
+             [canary]\nnextcloud = [\"test\", \"Guest\"]\nexcept = [\"admin\"]",
+        )
+        .unwrap();
+        let mut p = Parsers::new(&cfg);
+        let line = |file: &str, ip: &str, msg: &str| Record {
+            ts: 0,
+            source: Source::Custom,
+            pid: 0,
+            msg: format!(
+                r#"{{"reqId":"a","level":2,"time":"2026-10-26T10:00:00+00:00","remoteAddr":"{ip}","user":"--","app":"core","method":"POST","url":"/login","message":"{msg}"}}"#
+            ),
+            cursor: None,
+            sender: Some(Box::new(crate::record::Sender { file: Some(file.into()), ..Default::default() })),
+        };
+        let mut out = vec![];
+        p.feed(&line("/srv/nc.log", "203.0.113.1", "Login failed: test (Remote IP: 203.0.113.1)"), &mut out);
+        p.feed(&line("/srv/oc.log", "203.0.113.2", "Login failed: 'guest' (Remote IP: '203.0.113.2')"), &mut out);
+        p.feed(&line("/srv/nc.log", "203.0.113.3", "Login failed: alice (Remote IP: 203.0.113.3)"), &mut out);
+        p.feed(&line("/srv/oc.log", "203.0.113.4", "Login failed: 'admin' (Remote IP: '203.0.113.4')"), &mut out);
+        let got: Vec<(Signal, Option<f64>, String)> = out.iter().map(|e| (e.signal, e.points, e.detail.clone())).collect();
+        assert_eq!(got[0], (Signal::NcCanary, None, "login attempt on canary account test".into()));
+        assert_eq!((got[1].0, got[1].2.as_str()), (Signal::NcCanary, "login attempt on canary account guest"), "ownCloud's quotes");
+        assert_eq!((got[2].0, got[2].1), (Signal::CustomFailure, Some(25.0)), "not a canary");
+        assert_eq!(got[3].0, Signal::CustomFailure, "except");
+        assert_eq!(cfg.weight(Signal::NcCanary), 100.0, "one attempt bans");
+
+        // a pattern of your own with the same name, the app not in use: left alone
+        let mine = Config::from_toml(
+            "[canary]\nnextcloud = [\"test\"]\n[[patterns]]\nname = \"nextcloud_auth\"\nfile = \"/srv/nc.log\"\nregex = '\"remoteAddr\":\"(?P<ip>[0-9.]+)\".*Login failed: (?P<user>\\S+)'",
+        )
+        .unwrap();
+        let mut p = Parsers::new(&mine);
+        let mut out = vec![];
+        p.feed(&line("/srv/nc.log", "203.0.113.1", "Login failed: test (Remote IP: 203.0.113.1)"), &mut out);
+        assert_eq!(out[0].signal, Signal::CustomFailure);
+    }
+
     /// Log lines carry attacker-controlled text: no input may panic a parser (a panic aborts
     /// the daemon). Random splices of real message fragments, multi-byte characters and
     /// truncations, through every record format and parser, and on into the engine.
@@ -291,6 +384,26 @@ mod tests {
             "{",
             "}",
             "\"remoteAddr\":\"9.9.9.9\"",
+            "pam_unix(",
+            "login:auth): ",
+            "authentication failure; logname= uid=0 euid=0 tty=",
+            " rhost=",
+            " ruser=",
+            " user=",
+            "type=USER_AUTH msg=audit(1.2:3): ",
+            "USER_LOGIN ",
+            "SYSCALL ",
+            "msg='",
+            "acct=",
+            "726F6F74",
+            "\"",
+            "'",
+            "\u{1d}AUID=",
+            "key=",
+            "add '",
+            "' to group '",
+            "new user: name=",
+            "change user '",
             "\"message\":\"Login failed: x (Remote IP: 1.1.1.1)\"",
             "Login failed",
             "\"",
@@ -309,7 +422,8 @@ mod tests {
             "\u{202e}",
             "🦀",
         ];
-        let cfg = Config::from_toml("[sources]\nnextcloud = true\n[canary]\nxmpp = [\"test\"]\nssh = [\"*\"]\nexcept = [\"gw\"]").unwrap();
+        let cfg =
+            Config::from_toml("[sources]\nnextcloud_aio = true\n[canary]\nxmpp = [\"test\"]\nssh = [\"*\"]\nexcept = [\"gw\"]").unwrap();
         let mut parsers = Parsers::new(&cfg);
         let mut engine = crate::engine::Engine::new(std::sync::Arc::new(cfg.clone()), 0);
         let mut years = crate::record::YearGuess::new(2026);
@@ -330,10 +444,14 @@ mod tests {
             let cut = (0..=cut).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
             let line = &line[..cut];
             let mut out = Vec::new();
-            for source in [Source::Ejabberd, Source::Ssh, Source::Ufw, Source::Nextcloud] {
+            for source in [Source::Ejabberd, Source::Ssh, Source::Ufw, Source::Nextcloud, Source::Auth] {
                 let rec = Record { ts: round, source, pid: (next() % 3) as u32, msg: line.to_string(), cursor: None, sender: None };
                 parsers.feed(&rec, &mut out);
             }
+            for ident in ["login", "useradd", "usermod", "gpasswd", "passwd"] {
+                let _ = auth::pam(ident, line);
+            }
+            let _ = auth::audit(line, &["*".to_string()]);
             let _ = crate::record::parse_syslog_line(line, &mut years);
             let _ = crate::record::parse_journal_json(line);
             if let Some(rec) = crate::record::parse_nextcloud_line(line) {

@@ -1,0 +1,10 @@
+#!/bin/bash
+# logguard-web's package, before its files are removed. dpkg runs it as  prerm remove|
+# upgrade..., rpm as %preun with 0 (removal) or 1 (upgrade): the same script for both. On
+# removal the service stops; an upgrade keeps it running (postinst restarts it).
+set -eu
+case ${1:-} in remove | 0) ;; *) exit 0 ;; esac
+if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+    systemctl disable --now -q logguard-web.service 2> /dev/null || true
+fi
+exit 0

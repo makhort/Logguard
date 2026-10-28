@@ -1,9 +1,10 @@
 [package]
 name = "logguard"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 description = "Near-realtime behaviour-based protection for SSH, ejabberd and UFW logs"
 license = "MIT"
+repository = "https://github.com/makhort/Logguard"
 
 [dependencies]
 anyhow = "1"
@@ -11,6 +12,8 @@ base64 = "0.22"
 chacha20poly1305 = { version = "0.10", features = ["std", "getrandom"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
+# [cluster] identity_file: each node signs its own facts (pure Rust; keys come from OsRng above)
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 md-5 = { version = "0.10", default-features = false }
 # line_count: the exact height of wrapped text, for the details pane and popups
@@ -33,3 +36,72 @@ panic = "abort"
 # The sample replays in tests/ scan a month of logs; keep them fast.
 [profile.test]
 opt-level = 2
+
+# The distribution packages (scripts/package.sh builds them with cargo-deb and
+# cargo-generate-rpm; README, "Install from a package"). The deploy files come from
+# target/package/stage/, where package.sh puts deploy/'s files with the package's paths; the
+# maintainer scripts are deploy/pkg/. Both tables list the same files.
+[package.metadata.deb]
+maintainer = "makhort <makhort@users.noreply.github.com>"
+copyright = "2026 The logguard contributors"
+license-file = ["target/package/stage/LICENSE", "0"]
+section = "admin"
+priority = "optional"
+depends = "systemd"
+recommends = "logrotate, curl"
+extended-description = """logguard follows the systemd journal (sshd, ejabberd, the kernel's firewall log, Nextcloud, common services), scores every remote address by what it does, and bans attackers in nftables, firewalld, ufw, iptables or ipset within seconds. Nodes share bans over an encrypted cluster link; optional bots and a web console carry its alerts, digests and abuse reports. The config template goes to /etc/logguard/logguard.toml on a new host; nothing is started until it is edited."""
+maintainer-scripts = "deploy/pkg"
+assets = [
+    ["target/release/logguard", "usr/bin/", "755"],
+    ["target/package/stage/logguard-avscan.sh", "usr/bin/logguard-avscan", "755"],
+    ["target/package/stage/logguard-abuse-report.sh", "usr/bin/logguard-abuse-report", "755"],
+    ["target/package/stage/logguard.service", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-avscan.service", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-avscan.timer", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-abuse-report.service", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard-abuse-report.timer", "usr/lib/systemd/system/", "644"],
+    ["target/package/stage/logguard.logrotate", "etc/logrotate.d/logguard", "644"],
+    ["target/package/stage/logguard-avscan.default", "etc/default/logguard-avscan", "644"],
+    ["target/package/stage/logguard-abuse-report.default", "etc/default/logguard-abuse-report", "644"],
+    ["target/package/stage/*.toml", "usr/share/logguard/templates/", "644"],
+    ["README.md", "usr/share/doc/logguard/", "644"],
+    ["TESTING-fedora.md", "usr/share/doc/logguard/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Behaviour-based protection for SSH, XMPP, firewall and application logs"
+url = "https://github.com/makhort/Logguard"
+release = "1"
+auto-req = "no"
+pre_install_script = "deploy/pkg/preinst"
+pre_install_script_prog = ["/bin/bash"]
+post_install_script = "deploy/pkg/postinst"
+post_install_script_prog = ["/bin/bash"]
+pre_uninstall_script = "deploy/pkg/prerm"
+pre_uninstall_script_prog = ["/bin/bash"]
+post_uninstall_script = "deploy/pkg/postrm"
+post_uninstall_script_prog = ["/bin/bash"]
+assets = [
+    { source = "target/release/logguard", dest = "/usr/bin/logguard", mode = "755" },
+    { source = "target/package/stage/logguard-avscan.sh", dest = "/usr/bin/logguard-avscan", mode = "755" },
+    { source = "target/package/stage/logguard-abuse-report.sh", dest = "/usr/bin/logguard-abuse-report", mode = "755" },
+    { source = "target/package/stage/logguard.service", dest = "/usr/lib/systemd/system/logguard.service", mode = "644" },
+    { source = "target/package/stage/logguard-avscan.service", dest = "/usr/lib/systemd/system/logguard-avscan.service", mode = "644" },
+    { source = "target/package/stage/logguard-avscan.timer", dest = "/usr/lib/systemd/system/logguard-avscan.timer", mode = "644" },
+    { source = "target/package/stage/logguard-abuse-report.service", dest = "/usr/lib/systemd/system/logguard-abuse-report.service", mode = "644" },
+    { source = "target/package/stage/logguard-abuse-report.timer", dest = "/usr/lib/systemd/system/logguard-abuse-report.timer", mode = "644" },
+    { source = "target/package/stage/logguard.logrotate", dest = "/etc/logrotate.d/logguard", mode = "644", config = "noreplace" },
+    { source = "target/package/stage/logguard-avscan.default", dest = "/etc/default/logguard-avscan", mode = "644", config = "noreplace" },
+    { source = "target/package/stage/logguard-abuse-report.default", dest = "/etc/default/logguard-abuse-report", mode = "644", config = "noreplace" },
+    { source = "target/package/stage/*.toml", dest = "/usr/share/logguard/templates/", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/logguard/README.md", mode = "644", doc = true },
+    { source = "TESTING-fedora.md", dest = "/usr/share/doc/logguard/TESTING-fedora.md", mode = "644", doc = true },
+    { source = "target/package/stage/LICENSE", dest = "/usr/share/doc/logguard/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+
+[package.metadata.generate-rpm.recommends]
+logrotate = "*"
+curl = "*"

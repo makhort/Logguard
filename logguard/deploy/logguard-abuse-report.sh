@@ -1,7 +1,8 @@
 #!/bin/bash
 # Weekly abuse report, delivered encrypted by the XMPP admin bot (logguard-xmpp-bot) and, optionally,
-# on Telegram by logguard-tg-bot and by mail by logguard-mail-bot. Run by logguard-abuse-report.timer;
-# settings in /etc/default/logguard-abuse-report.
+# on Telegram by logguard-tg-bot, by mail by logguard-mail-bot, on Signal by logguard-signal-bot, on
+# Matrix by logguard-matrix-bot and over XMPP by logguard-xmpp-bot in client mode. Run by
+# logguard-abuse-report.timer; settings in /etc/default/logguard-abuse-report.
 #
 # Every server exports its own report (JSON, every source: --min-events, --top and the
 # RDAP --contacts lookups only make sense after merging). Then, by ABUSE_REPORT_ROLE:
@@ -10,18 +11,22 @@
 #   merge  merges it with the peers' reports from the inbox (none on a server without
 #          cluster peers) and puts the text report in each bot's outbox: logguard-xmpp-bot uploads it
 #          encrypted (OMEMO media sharing) and sends it to the admin, logguard-tg-bot and
-#          logguard-mail-bot send it encrypted to the admins' OpenPGP keys. With
+#          logguard-mail-bot send it encrypted to the admins' OpenPGP keys, logguard-signal-bot,
+#          logguard-matrix-bot and the XMPP client bot end-to-end encrypted (else to the
+#          OpenPGP key). With
 #          ABUSE_REPORT_FORWARD_TO the text report goes to those peers (a relay node). The
 #          XMPP server, or any server with a bot
 #   relay  sends it to the peers like send, then waits for the merged text report from the
-#          merging peer (its ABUSE_REPORT_FORWARD_TO) and puts it in the Telegram and mail
-#          bots' outboxes. If none arrives in time (no merging peer), it merges here instead.
-#          A node with [notify] xmpp = false that only runs logguard-tg-bot or logguard-mail-bot
+#          merging peer (its ABUSE_REPORT_FORWARD_TO) and puts it in the copy bots' outboxes
+#          (Telegram, mail, Signal, Matrix, XMPP client). If none arrives in time (no merging peer), it
+#          merges here instead. A node with [notify] xmpp = false that only runs copy bots
 #   auto   relay on a node with [notify] xmpp = false and cluster peers, else merge where a
 #          bot's outbox exists, else send if there are cluster peers, else off (default)
 #   off    nothing
-# The bots' outboxes come from logguard's [notify] bot_outbox, tg_outbox and mail_outbox (else
-# /opt/logguard-xmpp-bot/outbox), unless ABUSE_REPORT_OUTBOX / _TG_OUTBOX / _MAIL_OUTBOX say otherwise.
+# The bots' outboxes come from logguard's [notify] bot_outbox, tg_outbox, mail_outbox, signal_outbox,
+# matrix_outbox and xmpp_outbox (bot_outbox else /opt/logguard-xmpp-bot/outbox, unless xmpp_outbox
+# is set: the client bot's is there), unless ABUSE_REPORT_OUTBOX / _TG_OUTBOX / _MAIL_OUTBOX /
+# _SIGNAL_OUTBOX / _MATRIX_OUTBOX / _XMPP_OUTBOX say otherwise.
 # No copy stays behind here: the work files are in a private directory under /run (tmpfs)
 # that is removed on exit; peers' reports are deleted once merged or relayed (on a send
 # node, at its next run; or after 8 days); the bot deletes the outbox file once it is sent.
@@ -44,9 +49,17 @@ if [ "$(setting cluster enabled)" = true ] \
     peered=yes
 fi
 
-# The XMPP bot's outbox and user (logguard-xmpp-bot): logguard's [notify] bot_outbox and bot_user.
+# The XMPP client bot's outbox and user (logguard-xmpp-bot, BOT_MODE=client): logguard's [notify]
+# xmpp_outbox and xmpp_user. Empty: no client bot.
+XMPP_OUTBOX=${ABUSE_REPORT_XMPP_OUTBOX-$(setting notify xmpp_outbox)}
+XMPP_OWNER=${ABUSE_REPORT_XMPP_OWNER:-$(setting notify xmpp_user)}
+XMPP_OWNER=${XMPP_OWNER:-logguard-xmpp-bot}
+# The XMPP admin bot's outbox and user (logguard-xmpp-bot): logguard's [notify] bot_outbox and
+# bot_user. Its default path is the client bot's too: not taken when there is one.
 OUTBOX=${ABUSE_REPORT_OUTBOX:-$(setting notify bot_outbox)}
-OUTBOX=${OUTBOX:-/opt/logguard-xmpp-bot/outbox}
+if [ -z "$XMPP_OUTBOX" ]; then
+    OUTBOX=${OUTBOX:-/opt/logguard-xmpp-bot/outbox}
+fi
 OWNER=${ABUSE_REPORT_OWNER:-$(setting notify bot_user)}
 OWNER=${OWNER:-ejabberd}
 # The Telegram bot's outbox and user (logguard-tg-bot): logguard's [notify] tg_outbox and tg_user.
@@ -59,6 +72,16 @@ TG_OWNER=${TG_OWNER:-logguard-tg-bot}
 MAIL_OUTBOX=${ABUSE_REPORT_MAIL_OUTBOX-$(setting notify mail_outbox)}
 MAIL_OWNER=${ABUSE_REPORT_MAIL_OWNER:-$(setting notify mail_user)}
 MAIL_OWNER=${MAIL_OWNER:-logguard-mail-bot}
+# The Signal bot's outbox and user (logguard-signal-bot): logguard's [notify] signal_outbox and
+# signal_user. Empty: no copy on Signal.
+SIGNAL_OUTBOX=${ABUSE_REPORT_SIGNAL_OUTBOX-$(setting notify signal_outbox)}
+SIGNAL_OWNER=${ABUSE_REPORT_SIGNAL_OWNER:-$(setting notify signal_user)}
+SIGNAL_OWNER=${SIGNAL_OWNER:-logguard-signal-bot}
+# The Matrix bot's outbox and user (logguard-matrix-bot): logguard's [notify] matrix_outbox and
+# matrix_user. Empty: no copy on Matrix.
+MATRIX_OUTBOX=${ABUSE_REPORT_MATRIX_OUTBOX-$(setting notify matrix_outbox)}
+MATRIX_OWNER=${ABUSE_REPORT_MATRIX_OWNER:-$(setting notify matrix_user)}
+MATRIX_OWNER=${MATRIX_OWNER:-logguard-matrix-bot}
 # send, relay: the peers (host:port as in [cluster] peers) to send this server's report to.
 # Empty: all of them.
 SEND_TO=${ABUSE_REPORT_SEND_TO:-}
@@ -82,7 +105,10 @@ if [ "$ROLE" = auto ]; then
     if [ "$(setting notify xmpp)" = false ] && [ "$peered" = yes ]; then
         ROLE=relay
     elif [ -d "$OUTBOX" ] || { [ -n "$TG_OUTBOX" ] && [ -d "$TG_OUTBOX" ]; } \
-        || { [ -n "$MAIL_OUTBOX" ] && [ -d "$MAIL_OUTBOX" ]; }; then
+        || { [ -n "$MAIL_OUTBOX" ] && [ -d "$MAIL_OUTBOX" ]; } \
+        || { [ -n "$SIGNAL_OUTBOX" ] && [ -d "$SIGNAL_OUTBOX" ]; } \
+        || { [ -n "$MATRIX_OUTBOX" ] && [ -d "$MATRIX_OUTBOX" ]; } \
+        || { [ -n "$XMPP_OUTBOX" ] && [ -d "$XMPP_OUTBOX" ]; }; then
         ROLE=merge
     elif [ "$peered" = yes ]; then
         ROLE=send
@@ -115,8 +141,8 @@ fi
 
 # The bots' outboxes, as dir:owner.
 outboxes=()
-if [ "$ROLE" = merge ]; then
-    [ -d "$OUTBOX" ] && outboxes+=("$OUTBOX:$OWNER")
+if [ "$ROLE" = merge ] && [ -n "$OUTBOX" ] && [ -d "$OUTBOX" ]; then
+    outboxes+=("$OUTBOX:$OWNER")
 fi
 if [ "$ROLE" != send ] && [ -n "$TG_OUTBOX" ]; then
     if [ -d "$TG_OUTBOX" ]; then
@@ -132,12 +158,33 @@ if [ "$ROLE" != send ] && [ -n "$MAIL_OUTBOX" ]; then
         echo "WARNING: no mail bot outbox $MAIL_OUTBOX ([notify] mail_outbox or ABUSE_REPORT_MAIL_OUTBOX); no copy by mail"
     fi
 fi
+if [ "$ROLE" != send ] && [ -n "$SIGNAL_OUTBOX" ]; then
+    if [ -d "$SIGNAL_OUTBOX" ]; then
+        outboxes+=("$SIGNAL_OUTBOX:$SIGNAL_OWNER")
+    else
+        echo "WARNING: no Signal bot outbox $SIGNAL_OUTBOX ([notify] signal_outbox or ABUSE_REPORT_SIGNAL_OUTBOX); no copy on Signal"
+    fi
+fi
+if [ "$ROLE" != send ] && [ -n "$MATRIX_OUTBOX" ]; then
+    if [ -d "$MATRIX_OUTBOX" ]; then
+        outboxes+=("$MATRIX_OUTBOX:$MATRIX_OWNER")
+    else
+        echo "WARNING: no Matrix bot outbox $MATRIX_OUTBOX ([notify] matrix_outbox or ABUSE_REPORT_MATRIX_OUTBOX); no copy on Matrix"
+    fi
+fi
+if [ "$ROLE" != send ] && [ -n "$XMPP_OUTBOX" ]; then
+    if [ -d "$XMPP_OUTBOX" ]; then
+        outboxes+=("$XMPP_OUTBOX:$XMPP_OWNER")
+    else
+        echo "WARNING: no XMPP client bot outbox $XMPP_OUTBOX ([notify] xmpp_outbox or ABUSE_REPORT_XMPP_OUTBOX); no copy over XMPP"
+    fi
+fi
 if [ "$ROLE" = relay ] && [ "${#outboxes[@]}" = 0 ]; then
-    echo "relay: set [notify] tg_outbox or mail_outbox (or ABUSE_REPORT_TG_OUTBOX / _MAIL_OUTBOX) to the bot's outbox, and install the bot" >&2
+    echo "relay: set [notify] tg_outbox, mail_outbox, signal_outbox, matrix_outbox or xmpp_outbox (or ABUSE_REPORT_TG_OUTBOX / _MAIL_OUTBOX / _SIGNAL_OUTBOX / _MATRIX_OUTBOX / _XMPP_OUTBOX) to the bot's outbox, and install the bot" >&2
     exit 1
 fi
 if [ "$ROLE" = merge ] && [ "${#outboxes[@]}" = 0 ] && [ -z "$FORWARD_TO" ]; then
-    echo "no bot outbox: $OUTBOX is missing and there is no logguard-tg-bot or logguard-mail-bot outbox (install a bot first, or set [notify] bot_outbox / tg_outbox / mail_outbox)" >&2
+    echo "no bot outbox: ${OUTBOX:-the XMPP admin bot outbox} is missing and there is no copy bot outbox (install a bot first, or set [notify] bot_outbox / tg_outbox / mail_outbox / signal_outbox / matrix_outbox / xmpp_outbox)" >&2
     exit 1
 fi
 

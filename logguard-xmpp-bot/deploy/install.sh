@@ -1,6 +1,9 @@
 #!/bin/bash
 # Installs the bot. Run as root from the directory holding logguard-xmpp-bot,
-# logguard-xmpp-bot.service and logguard-xmpp-bot.logrotate (deploy.sh copies them there).
+# logguard-xmpp-bot.service, logguard-xmpp-bot-client.service and logguard-xmpp-bot.logrotate
+# (deploy.sh copies them there). BOT_MODE in config.env picks the kind: admin (default) runs
+# as the user ejabberd runs as, on the XMPP server; client runs as its own user
+# logguard-xmpp-bot, anywhere, with the client unit.
 #
 #   bash install.sh            install and restart
 #   bash install.sh rollback   back to the previous binary and unit (a copy of this script
@@ -135,6 +138,76 @@ setting() { # the value of $1 in config.env, quotes removed
     grep -E "^$1=" "$DIR/config.env" | tail -n 1 | cut -d= -f2- | tr -d "\"'" || true
 }
 
+MODE=$(setting BOT_MODE); MODE=${MODE:-admin}
+
+# logguard's [canary] xmpp names (or `except`, with $1 = except) on this host, lower case, one
+# per line: from its effective config, where arrays span several lines.
+canary_list() {
+    [ -x /usr/local/bin/logguard ] && [ -f /etc/logguard/logguard.toml ] || return 0
+    /usr/local/bin/logguard --config /etc/logguard/logguard.toml print-config 2> /dev/null | awk -v key="${1:-xmpp}" '
+        /^\[/ { sec = $0; inlist = 0 }
+        sec == "[canary]" && $1 == key && $2 == "=" { inlist = 1 }
+        inlist {
+            line = $0
+            while (match(line, /"[^"]*"/)) { print tolower(substr(line, RSTART + 1, RLENGTH - 2)); line = substr(line, RSTART + RLENGTH) }
+            if ($0 ~ /\]/) inlist = 0
+        }'
+}
+# Whether the bot's account is a canary there: listed by name or full JID, not excepted.
+bot_is_canary() {
+    local jid local_part
+    jid=$(setting BOT_JID | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')
+    local_part=${jid%%@*}
+    [ -n "$jid" ] || return 1
+    canary_list except | grep -qxF -e "$jid" -e "$local_part" && return 1
+    canary_list xmpp | grep -qxF -e "$jid" -e "$local_part"
+}
+if bot_is_canary; then
+    # A canary is an account-level tripwire: one failed login = immediate ban of the address,
+    # every login = a critical alert.
+    if [ "$MODE" = admin ]; then
+        echo "BOT_JID $(setting BOT_JID) is a [canary] xmpp name in /etc/logguard/logguard.toml: every login of" >&2
+        echo "  the bot would be a critical alert, and one failed login would ban it. Use another account, or" >&2
+        echo "  add the name to [canary] except there (then: systemctl restart logguard)." >&2
+        exit 1
+    fi
+    echo "WARNING: BOT_JID $(setting BOT_JID) is a [canary] xmpp name in this host's logguard config; if the bot's"
+    echo "  XMPP server runs logguard with the same list, every login is a critical alert there and one failed"
+    echo "  login bans this address. Use another account, or add it to [canary] except on that server."
+fi
+case $MODE in
+    admin) UNIT_SRC=logguard-xmpp-bot.service ;;
+    client) UNIT_SRC=logguard-xmpp-bot-client.service ;;
+    *) echo "BOT_MODE must be admin or client, not '$MODE'" >&2; exit 1 ;;
+esac
+
+# logguard's integrity watch covers the account files: announce what useradd (or a rename)
+# wrote, so it is logged instead of raised as a high alert.
+announce_accounts() {
+    [ -x /usr/local/bin/logguard ] && [ -f /etc/logguard/logguard.toml ] || return 0
+    local f files=()
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do [ -f "$f" ] && files+=("$f"); done
+    /usr/local/bin/logguard --config /etc/logguard/logguard.toml expect-change "${files[@]}" 2> /dev/null || true
+}
+
+if [ "$MODE" = client ]; then
+    # A system user of its own, without a home or a shell: no ejabberd here.
+    BOT=logguard-xmpp-bot
+    if ! id "$BOT" > /dev/null 2>&1; then
+        useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$BOT"
+        echo "created the system user $BOT"
+        announce_accounts
+    fi
+    # the admin's OpenPGP public key: root's, the bot only reads it
+    PGPKEY=$(setting OPENPGP_KEY)
+    if [ -n "$PGPKEY" ] && [ -f "$PGPKEY" ]; then
+        chown root:"$BOT" "$PGPKEY"
+        chmod 640 "$PGPKEY"
+    elif [ -n "$PGPKEY" ]; then
+        echo "WARNING: OPENPGP_KEY=$PGPKEY does not exist, so the bot won't start. Export your public"
+        echo "  key from OpenKeychain or iPGMail and copy it there (root:$BOT 640), or comment OPENPGP_KEY out."
+    fi
+else
 # The bot runs as the user ejabberd runs as (the unit says User=ejabberd), so that
 # ejabberdctl works for it without root.
 BOT=ejabberd
@@ -157,17 +230,19 @@ fi
 
 # /export's JSON file reads ejabberd's database with the sqlite3 tool.
 if [ -n "$(setting EJABBERD_DB)" ]; then
-    command -v sqlite3 > /dev/null || echo "WARNING: EJABBERD_DB is set but sqlite3 is missing (apt install sqlite3): /export sends no file"
+    command -v sqlite3 > /dev/null || echo "WARNING: EJABBERD_DB is set but sqlite3 is missing (apt install sqlite3, or dnf install sqlite): /export sends no file"
 else
     echo "note: /export sends its full JSON file only with EJABBERD_DB set in config.env, e.g."
     echo "  EJABBERD_DB=/opt/ejabberd/database/example.org.v2.db"
 fi
+fi
 
 # Owners and modes. The directory is sticky: the bot may replace its own files (state and
-# OMEMO keys are written to a temporary file and renamed), but not root's ones.
-#   config.env (the password), omemo-trust.txt, avatar
-#                                         root:ejabberd 640  (the bot reads them)
-#   state.json, omemo.json                ejabberd 600       (the bot writes them)
+# OMEMO keys are written to a temporary file and renamed), but not root's ones. $BOT is
+# ejabberd in admin mode, logguard-xmpp-bot in client mode.
+#   config.env (the password), omemo-trust.txt, avatar, OPENPGP_KEY
+#                                         root:$BOT 640  (the bot reads them)
+#   state.json, omemo.json                $BOT 600       (the bot writes them)
 #   logguard-xmpp-bot, backups            root
 chown root:"$BOT" "$DIR"
 chmod 1770 "$DIR"
@@ -205,12 +280,16 @@ OUTBOX=$(setting OUTBOX_DIR); OUTBOX=${OUTBOX:-$(dirname "${SP:-$DIR/state.json}
 mkdir -p "$OUTBOX"
 chown root:"$BOT" "$OUTBOX"
 chmod 1770 "$OUTBOX"
-if [ "$OUTBOX" != /opt/logguard-xmpp-bot/outbox ]; then
+# files waiting there from the other mode's user: the bot could not delete them once sent
+find "$OUTBOX" -maxdepth 1 -type f ! -user "$BOT" -exec chown "$BOT:$BOT" {} +
+if [ "$MODE" = admin ] && [ "$OUTBOX" != /opt/logguard-xmpp-bot/outbox ]; then
     echo "note: the outbox is $OUTBOX; set ABUSE_REPORT_OUTBOX=$OUTBOX in /etc/default/logguard-abuse-report"
 fi
 
-cp -p "$DIR/state.json" "$DIR/state.json.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-chown root:root "$DIR"/state.json.bak-* 2>/dev/null || true
+if [ "$MODE" = admin ]; then
+    cp -p "$DIR/state.json" "$DIR/state.json.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    chown root:root "$DIR"/state.json.bak-* 2>/dev/null || true
+fi
 # The running version becomes the rollback target, unless it is failing (restarting).
 if [ "$migrated" = yes ]; then
     : # the version running under the old name became it above
@@ -230,17 +309,20 @@ if [ -x /usr/local/bin/logguard ] && [ -f /etc/logguard/logguard.toml ]; then
     /usr/local/bin/logguard --config /etc/logguard/logguard.toml expect-change "$UNIT=logguard-xmpp-bot.service" \
         "/etc/systemd/system/multi-user.target.wants/logguard-xmpp-bot.service=logguard-xmpp-bot.service" 2> /dev/null || true
 fi
-install -m 0644 logguard-xmpp-bot.service "$UNIT"
-install -m 0644 logguard-xmpp-bot.logrotate /etc/logrotate.d/logguard-xmpp-bot
+install -m 0644 "$UNIT_SRC" "$UNIT"
+sed "s/^\([[:space:]]*su\) ejabberd ejabberd\$/\1 $BOT $BOT/" logguard-xmpp-bot.logrotate > /etc/logrotate.d/logguard-xmpp-bot
+chmod 0644 /etc/logrotate.d/logguard-xmpp-bot
 # ejabberd's own log files, 14 days at most like the rest (/privacy). Not when another
 # rule already covers them: logrotate refuses duplicate entries.
-if grep -lqs '/opt/ejabberd/logs' /etc/logrotate.d/* 2>/dev/null && ! [ -f /etc/logrotate.d/ejabberd-logs ]; then
+if [ "$MODE" = client ]; then
+    : # no ejabberd here
+elif grep -lqs '/opt/ejabberd/logs' /etc/logrotate.d/* 2>/dev/null && ! [ -f /etc/logrotate.d/ejabberd-logs ]; then
     echo "WARNING: another logrotate rule covers /opt/ejabberd/logs; ejabberd-logs not installed:"
     grep -ls '/opt/ejabberd/logs' /etc/logrotate.d/*
 else
     install -m 0644 ejabberd-logs.logrotate /etc/logrotate.d/ejabberd-logs
 fi
-if ! grep -qE '^log_rotate_size:[[:space:]]*infinity' /opt/ejabberd/conf/ejabberd.yml 2>/dev/null; then
+if [ "$MODE" = admin ] && ! grep -qE '^log_rotate_size:[[:space:]]*infinity' /opt/ejabberd/conf/ejabberd.yml 2>/dev/null; then
     echo "note: ejabberd rotates its logs by size itself; for 14 days at most, set"
     echo "  log_rotate_size: infinity   in /opt/ejabberd/conf/ejabberd.yml (logrotate does it then)"
 fi
@@ -251,7 +333,19 @@ systemctl enable -q logguard-xmpp-bot
 start=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl restart logguard-xmpp-bot
 show_start "$start"
-if systemctl is-active -q logguard-xmpp-bot; then
+if [ "$MODE" = client ] && systemctl is-active -q logguard-xmpp-bot; then
+    echo "OK: logguard-xmpp-bot is running in client mode. Accept its subscription request in your"
+    echo "client, and send it /status."
+    # logguard feeds the bot only when its config says so (off by default)
+    LG=/etc/logguard/logguard.toml
+    if [ -f "$LG" ] && ! grep -qE "^[[:space:]]*xmpp_outbox[[:space:]]*=[[:space:]]*\"$OUTBOX\"" "$LG"; then
+        echo "logguard doesn't write to this outbox yet. In [notify] of $LG set"
+        echo "  xmpp_outbox = \"$OUTBOX\""
+        echo "  xmpp_user = \"$BOT\""
+        echo "(the weekly abuse report job reads it from there too)"
+        echo "then: systemctl restart logguard, and test: logguard -c $LG notify-test --xmpp"
+    fi
+elif systemctl is-active -q logguard-xmpp-bot; then
     echo "OK: logguard-xmpp-bot is running. Send /help from Conversations to check."
     if [ ! -s "$DIR/omemo-trust.txt" ] && ! grep -qi '^OMEMO=off' "$DIR/config.env"; then
         echo "OMEMO: no keys pinned yet, so any device of an allowed user is trusted. To pin yours,"

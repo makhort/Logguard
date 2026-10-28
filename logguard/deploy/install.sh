@@ -15,8 +15,10 @@ if [ -x /usr/local/bin/logguard ]; then
 fi
 
 # The files below are in the integrity watch: announce their new content first, so the
-# running daemon logs these changes instead of raising "may be compromised" alerts.
-if [ -f /etc/logguard/logguard.toml ]; then
+# running daemon logs these changes instead of raising "may be compromised" alerts. Not on a
+# first install (a release bundle's puts the config in place first): nothing watches them yet,
+# and there is no state directory to announce them in.
+if [ -f /etc/logguard/logguard.toml ] && [ -x /usr/local/bin/logguard ]; then
     sysd=/etc/systemd/system
     prev=""
     [ -x /usr/local/bin/logguard ] && prev=/usr/local/bin/logguard.prev=/usr/local/bin/logguard
@@ -87,7 +89,21 @@ if command -v nft > /dev/null; then
     fi
 fi
 
-if command -v ufw > /dev/null; then
+if command -v firewall-cmd > /dev/null && firewall-cmd --state > /dev/null 2>&1; then
+    # firewalld (Fedora, RHEL): the peers' rich rules in the default zone, kept across reloads
+    rules=$(/usr/local/bin/logguard --config /etc/logguard/logguard.toml cluster-ufw-rules --firewalld)
+    if [ -n "$rules" ]; then
+        echo "$rules" | while read -r rule; do
+            echo "+ $rule"
+            eval "$rule" > /dev/null
+        done
+        firewall-cmd --reload > /dev/null
+    fi
+    if [ "$(firewall-cmd --get-log-denied)" = off ]; then
+        echo "NOTE: firewalld doesn't log denied packets; enable it for firewall-based detection:"
+        echo "    firewall-cmd --set-log-denied=unicast"
+    fi
+elif command -v ufw > /dev/null; then
     /usr/local/bin/logguard --config /etc/logguard/logguard.toml cluster-ufw-rules | while read -r rule; do
         echo "+ $rule"
         eval "$rule"
@@ -126,7 +142,7 @@ if [ "$(setting antivirus enabled)" = true ]; then
             echo "      (each clamscan loads ~1-1.5 GB of signatures) - logguard-avscan.timer replaces it"
         fi
     else
-        echo "WARNING: [antivirus] is enabled but ClamAV is not installed:  apt install clamav clamav-freshclam"
+        echo "WARNING: [antivirus] is enabled but ClamAV is not installed:  apt install clamav clamav-freshclam  (Fedora, RHEL: dnf install clamav clamav-update)"
     fi
 elif systemctl is-enabled --quiet logguard-avscan.timer 2> /dev/null; then
     systemctl disable --now logguard-avscan.timer

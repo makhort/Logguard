@@ -1,0 +1,278 @@
+#!/bin/bash
+# logguard-xmpp-bot's package, after its files are unpacked. dpkg runs it as  postinst
+# configure [old-version]  (also for dpkg-reconfigure), rpm as %post with 1 (first install)
+# or 2 (upgrade): the same script for both.
+#
+# What the bundle's install.sh does, less the files the package puts in place itself. BOT_MODE
+# in config.env picks the kind: admin (the default on a host with the user ejabberd) runs as
+# the user ejabberd runs as, with logguard-xmpp-bot.service; client (the default elsewhere)
+# runs as its own user logguard-xmpp-bot, with logguard-xmpp-bot-client.service. The package
+# ships both units; this script sets the users, owners and modes of /opt/logguard-xmpp-bot,
+# the outbox and log directory, and writes the logrotate rules for the mode. It also takes
+# over an install from a bundle or deploy.sh: its unit in /etc/systemd/system (it would
+# shadow the package's) and its rollback files go; config.env, state, OMEMO keys and pins
+# stay. The bot is restarted only when it was running and its config has no placeholders
+# left; a first install prints what to fill in and starts nothing.
+#
+# Asked, when a terminal is there: whether to replace config.env with this version's template
+# (the old one kept as config.env.old). Enter, a timeout, no terminal, or
+# DEBIAN_FRONTEND=noninteractive keep it. LOGGUARD_PACKAGE_CONFIG=keep|replace answers without
+# asking (sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./logguard-xmpp-bot_*.deb).
+set -eu
+
+NAME=logguard-xmpp-bot
+DIR=/opt/$NAME
+SHARE=/usr/share/$NAME
+OLD_UNIT=/etc/systemd/system/$NAME.service
+OLD_WANTS=/etc/systemd/system/multi-user.target.wants/$NAME.service
+
+case ${1:-} in
+    configure | 1 | 2 | [3-9]*) ;;
+    *) exit 0 ;;   # abort-upgrade and the like: nothing to do
+esac
+systemd() { [ -d /run/systemd/system ] && command -v systemctl > /dev/null; }
+sc() { systemctl "$@" 2> /dev/null || true; }
+note() { echo "$NAME: $*"; }
+setting() { # the value of $1 in config.env, quotes removed
+    grep -E "^$1=" "$DIR/config.env" 2> /dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"'" || true
+}
+# logguard's integrity watch covers the account files and the enabled units: announce what
+# changes, so it is logged instead of raised as a high alert. logguard is the package's
+# (/usr/bin) or a bundle's (/usr/local/bin).
+LG=""
+LGCONF=/etc/logguard/logguard.toml
+for b in /usr/bin/logguard /usr/local/bin/logguard; do
+    if [ -x "$b" ] && [ -f "$LGCONF" ]; then LG=$b; break; fi
+done
+announce() { [ -n "$LG" ] && "$LG" --config "$LGCONF" expect-change "$@" 2> /dev/null || true; }
+announce_accounts() {
+    local f files=()
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do [ -f "$f" ] && files+=("$f"); done
+    announce "${files[@]}"
+}
+
+mkdir -p "$DIR"
+first=no
+if [ ! -f "$DIR/config.env" ]; then
+    # the admin bot's template where ejabberd runs, the client bot's elsewhere
+    template=config.env.example
+    id ejabberd > /dev/null 2>&1 || template=config-client.env.example
+    install -m 0600 -o root -g root "$DIR/$template" "$DIR/config.env"
+    first=yes
+    note "new $DIR/config.env from the template $template"
+else
+    # The config stays (the default), or this version's template replaces it.
+    replace=${LOGGUARD_PACKAGE_CONFIG:-}
+    if [ -z "$replace" ] && [ "${DEBIAN_FRONTEND:-}" != noninteractive ] && [ -c /dev/tty ] && { : < /dev/tty; } 2> /dev/null; then
+        echo
+        echo "$NAME: $DIR/config.env exists. Keep it (compare it with this version's templates,"
+        echo "$DIR/config.env.example and config-client.env.example), or replace it with the"
+        echo "template of its BOT_MODE (the old file kept as config.env.old)?"
+        ans=""
+        read -r -t 60 -p "$NAME: replace the config? [y/N] " ans < /dev/tty > /dev/tty || ans=""
+        case $ans in y | Y | yes | YES) replace=replace ;; *) replace=keep ;; esac
+    fi
+    if [ "$replace" = replace ]; then
+        template=config.env.example
+        [ "$(setting BOT_MODE)" = client ] && template=config-client.env.example
+        cp -p "$DIR/config.env" "$DIR/config.env.old"
+        install -m 0600 -o root -g root "$DIR/$template" "$DIR/config.env"
+        note "replaced $DIR/config.env with $template; the old file is $DIR/config.env.old (compare: diff $DIR/config.env.old $DIR/config.env)"
+    else
+        note "kept $DIR/config.env (this version's templates: $DIR/config.env.example, config-client.env.example)"
+    fi
+fi
+
+MODE=$(setting BOT_MODE); MODE=${MODE:-admin}
+case $MODE in
+    admin) BOT=ejabberd UNIT=$NAME.service ;;
+    client) BOT=$NAME UNIT=$NAME-client.service ;;
+    *) note "BOT_MODE must be admin or client, not '$MODE': fix $DIR/config.env, then  dpkg-reconfigure $NAME  (rpm: dnf reinstall)"; exit 0 ;;
+esac
+WANTS=/etc/systemd/system/multi-user.target.wants/$UNIT
+
+if [ "$MODE" = client ]; then
+    # A system user of its own, without a home or a shell: no ejabberd here.
+    if ! id "$BOT" > /dev/null 2>&1; then
+        useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$BOT"
+        note "created the system user $BOT"
+        announce_accounts
+    fi
+elif ! id "$BOT" > /dev/null 2>&1; then
+    # The admin bot runs as the user ejabberd runs as (the unit says User=ejabberd), so that
+    # ejabberdctl works for it without root.
+    note "no user 'ejabberd': the admin bot runs on the XMPP server, as the user ejabberd runs as. Install"
+    echo "  ejabberd first, or set BOT_MODE=client in $DIR/config.env (any host; README, \"Client mode\"),"
+    echo "  then:  dpkg-reconfigure $NAME  (rpm: dnf reinstall $NAME)"
+    exit 0
+else
+    have=$(systemctl show -p User --value ejabberd 2> /dev/null || true)
+    if [ -n "$have" ] && [ "$have" != "$BOT" ]; then
+        note "WARNING: ejabberd runs as '$have', but $UNIT runs the bot as '$BOT'"
+    fi
+    # ejabberdctl's CTL_OVER_HTTP mode puts arguments into JSON unescaped: line breaks and
+    # quotes break commands, and replies with non-ASCII text come back empty.
+    ctlcfg=/opt/ejabberd/conf/ejabberdctl.cfg
+    if grep -qE '^[[:space:]]*CTL_OVER_HTTP=[^[:space:]]' "$ctlcfg" 2> /dev/null; then
+        note "WARNING: CTL_OVER_HTTP is on in $ctlcfg: /maintenance, /restart, multi-line announcements"
+        echo "  and replies with non-ASCII text will fail. To turn it off:  sed -i 's/^CTL_OVER_HTTP=/#CTL_OVER_HTTP=/' $ctlcfg"
+    fi
+fi
+
+# A [canary] xmpp name is an account-level tripwire: one failed login = immediate ban of the
+# address, every login = a critical alert. The bot's account must not be one.
+canary_list() { # logguard's [canary] xmpp names (or `except`, $1 = except) on this host, lower case
+    [ -n "$LG" ] || return 0
+    "$LG" --config "$LGCONF" print-config 2> /dev/null | awk -v key="${1:-xmpp}" '
+        /^\[/ { sec = $0; inlist = 0 }
+        sec == "[canary]" && $1 == key && $2 == "=" { inlist = 1 }
+        inlist {
+            line = $0
+            while (match(line, /"[^"]*"/)) { print tolower(substr(line, RSTART + 1, RLENGTH - 2)); line = substr(line, RSTART + RLENGTH) }
+            if ($0 ~ /\]/) inlist = 0
+        }'
+}
+jid=$(setting BOT_JID | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')
+if [ -n "$jid" ] && ! canary_list except | grep -qxF -e "$jid" -e "${jid%%@*}" && canary_list xmpp | grep -qxF -e "$jid" -e "${jid%%@*}"; then
+    note "WARNING: BOT_JID $(setting BOT_JID) is a [canary] xmpp name in $LGCONF: every login of the bot would be"
+    echo "  a critical alert, and one failed login would ban it. Use another account, or add the name to"
+    echo "  [canary] except there (then: systemctl restart logguard)."
+fi
+
+# Owners and modes, as install.sh sets them. The directory is sticky: the bot may replace its
+# own files (state and OMEMO keys are written to a temporary file and renamed), but not
+# root's ones. $BOT is ejabberd in admin mode, logguard-xmpp-bot in client mode.
+#   config.env (the password), omemo-trust.txt, avatar, OPENPGP_KEY   root:$BOT 640  (the bot reads them)
+#   state.json, omemo.json                                            $BOT 600       (the bot writes them)
+#   the binary, the templates, backups                                root
+chown root:"$BOT" "$DIR"
+chmod 1770 "$DIR"
+chown root:"$BOT" "$DIR/config.env"
+chmod 640 "$DIR/config.env"
+for f in "$DIR/omemo-trust.txt" "$(setting AVATAR_PATH)" "$(setting OPENPGP_KEY)"; do
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        chown root:"$BOT" "$f"
+        chmod 640 "$f"
+    fi
+done
+PGPKEY=$(setting OPENPGP_KEY)
+if [ -n "$PGPKEY" ] && [ ! -f "$PGPKEY" ]; then
+    note "OPENPGP_KEY=$PGPKEY does not exist yet: export your public key and copy it there (root:$BOT 640), or comment OPENPGP_KEY out"
+fi
+SP=$(setting BOT_STATE_PATH); SP=${SP:-$DIR/state.json}
+for f in "$SP" "$DIR/state.json" "$DIR/omemo.json" "$(setting OMEMO_STORE)"; do
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        chown "$BOT:$BOT" "$f"
+        chmod 600 "$f"
+    fi
+done
+# leftovers of an interrupted write, possibly root's: the bot could not replace them
+rm -f "${DIR:?}"/*.tmp
+LOGDIR=$(setting LOG_DIR); LOGDIR=${LOGDIR:-/var/log/$NAME}
+mkdir -p "$LOGDIR"
+chown "$BOT:$BOT" "$LOGDIR"
+chmod 700 "$LOGDIR"
+# copies from the older, longer rotation (8 weeks): /privacy promises 14 days at most
+rm -f "${LOGDIR:?}"/bot.log.[2-9]* "${LOGDIR:?}"/bot.log.1.gz
+if [ -f "$LOGDIR/bot.log" ]; then
+    chown "$BOT:$BOT" "$LOGDIR/bot.log"
+    chmod 600 "$LOGDIR/bot.log"
+fi
+# Outbox: files for the admin (logguard's alerts and weekly abuse report, written by root and
+# handed to the bot, which sends them encrypted and deletes them). Sticky like $DIR.
+OUTBOX=$(setting OUTBOX_DIR); OUTBOX=${OUTBOX:-$(dirname "$SP")/outbox}
+mkdir -p "$OUTBOX"
+chown root:"$BOT" "$OUTBOX"
+chmod 1770 "$OUTBOX"
+# files waiting there from the other mode's user: the bot could not delete them once sent
+find "$OUTBOX" -maxdepth 1 -type f ! -user "$BOT" -exec chown "$BOT:$BOT" {} +
+if [ "$MODE" = admin ] && [ "$OUTBOX" != "$DIR/outbox" ]; then
+    note "the outbox is $OUTBOX; set ABUSE_REPORT_OUTBOX=$OUTBOX in /etc/default/logguard-abuse-report"
+fi
+if [ "$MODE" = admin ] && [ -f "$DIR/state.json" ] && [ "$first" = no ]; then
+    cp -p "$DIR/state.json" "$DIR/state.json.bak-$(date +%Y%m%d-%H%M%S)"
+    chown root:root "$DIR"/state.json.bak-* 2> /dev/null || true
+fi
+
+# The logrotate rules for this mode (the package's copies are in /usr/share/logguard-xmpp-bot):
+# the bot's log rotated as its user; in admin mode ejabberd's own logs too, 14 days at most
+# like the rest (/privacy), unless another rule already covers them (logrotate refuses
+# duplicate entries).
+sed "s/^\([[:space:]]*su\) ejabberd ejabberd\$/\1 $BOT $BOT/" "$SHARE/$NAME.logrotate" > /etc/logrotate.d/$NAME
+chmod 0644 /etc/logrotate.d/$NAME
+if [ "$MODE" = admin ]; then
+    if grep -lqs '/opt/ejabberd/logs' /etc/logrotate.d/* 2> /dev/null && [ ! -f /etc/logrotate.d/ejabberd-logs ]; then
+        note "WARNING: another logrotate rule covers /opt/ejabberd/logs; ejabberd-logs not installed:"
+        grep -ls '/opt/ejabberd/logs' /etc/logrotate.d/* | sed 's/^/  /'
+    else
+        install -m 0644 "$SHARE/ejabberd-logs.logrotate" /etc/logrotate.d/ejabberd-logs
+    fi
+    if ! grep -qE '^log_rotate_size:[[:space:]]*infinity' /opt/ejabberd/conf/ejabberd.yml 2> /dev/null; then
+        note "ejabberd rotates its logs by size itself; for 14 days at most, set  log_rotate_size: infinity"
+        echo "  in /opt/ejabberd/conf/ejabberd.yml (logrotate does it then)"
+    fi
+fi
+
+# An install from a bundle or deploy.sh: its unit in /etc/systemd/system (the admin or the
+# client unit, under the admin unit's name) would shadow the package's. It goes, with the
+# rollback files its install.sh kept; the bot is enabled again on the package's unit for its
+# mode if it was. (logguard's watch reports the removed unit as a warning once.)
+was_active=no
+if systemd && systemctl is-active -q "$NAME.service"; then was_active=yes; fi
+if [ -f "$OLD_UNIT" ] && [ ! -L "$OLD_UNIT" ]; then
+    note "taking over the install from the bundle (or deploy.sh): its unit and rollback files go; config.env, state and keys stay"
+    was_enabled=no
+    if systemd && systemctl is-enabled -q "$NAME.service" 2> /dev/null; then was_enabled=yes; fi
+    rm -f "${OLD_UNIT:?}" "${OLD_WANTS:?}"
+    echo "  removed $OLD_UNIT"
+    for f in "$DIR/$NAME.prev" "$DIR/$NAME.service.prev" "$DIR/install.sh"; do
+        [ -e "$f" ] || continue
+        rm -f "${f:?}"
+        echo "  removed $f"
+    done
+    systemd && sc daemon-reload
+    if [ "$was_enabled" = yes ] && systemd; then
+        announce "$WANTS=/usr/lib/systemd/system/$UNIT"
+        sc enable -q "$UNIT"
+    fi
+elif systemd && systemctl is-active -q "$UNIT"; then
+    was_active=yes
+fi
+systemd && sc daemon-reload
+
+# Filled in? config.env.example's placeholders are REPLACE...
+configured=yes
+if grep -qE '^[A-Z_]+=REPLACE' "$DIR/config.env"; then configured=no; fi
+
+if [ "$configured" = yes ] && [ "$was_active" = yes ] && systemd; then
+    sc restart "$UNIT"
+    sleep 3
+    if systemctl is-active -q "$UNIT"; then
+        note "restarted: $("$DIR/$NAME" --version) ($MODE mode, $UNIT)"
+    else
+        note "WARNING: $UNIT is not running after the restart:  journalctl -u $UNIT -n 20"
+    fi
+elif [ "$configured" = yes ]; then
+    note "not started (it wasn't running):  systemctl enable --now $UNIT"
+else
+    note "not started: $DIR/config.env still has placeholders: $(grep -oE '^[A-Z_]+=REPLACE' "$DIR/config.env" | cut -d= -f1 | xargs)"
+    echo "  Fill it in (BOT_JID, BOT_PASSWORD, ADMIN_JID, ...; README, \"Settings\"), then:"
+    echo "    systemctl enable --now $UNIT"
+    if [ "$MODE" = client ]; then
+        echo "  (client mode: $UNIT; its OPENPGP_KEY, root:$BOT 640, is the fallback when OMEMO can't reach you)"
+    else
+        echo "  (admin mode, as the user ejabberd; for the client bot on a host without ejabberd set BOT_MODE=client)"
+    fi
+fi
+if [ "$MODE" = client ] && [ -f "$LGCONF" ] && ! grep -qE "^[[:space:]]*xmpp_outbox[[:space:]]*=[[:space:]]*\"$OUTBOX\"" "$LGCONF"; then
+    note "logguard doesn't write to this outbox yet. In [notify] of $LGCONF set"
+    echo "  xmpp_outbox = \"$OUTBOX\""
+    echo "  xmpp_user = \"$BOT\""
+    echo "  (the weekly abuse report job reads it from there too)"
+    echo "  then: systemctl restart logguard, and test: logguard -c $LGCONF notify-test --xmpp-client"
+fi
+if [ "$MODE" = admin ] && [ "$configured" = yes ] && [ ! -s "$DIR/omemo-trust.txt" ] && ! grep -qi '^OMEMO=off' "$DIR/config.env"; then
+    note "OMEMO: no keys pinned yet, so any device of an allowed user is trusted. To pin yours, send /omemo to"
+    echo "  the bot, then add '<your jid> <fingerprint>' lines to $DIR/omemo-trust.txt (root:$BOT 640)"
+fi
+exit 0

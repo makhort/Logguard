@@ -1,0 +1,31 @@
+#!/bin/bash
+# The checks to pass before deploying (deploy/deploy.sh runs them first).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+step() { printf '\n==> %s\n' "$*"; }
+
+step "format"
+cargo fmt --check
+step "clippy"
+cargo clippy --all-targets --quiet -- -D warnings
+step "tests"
+cargo test --quiet
+step "dependency advisories (cargo audit)"
+if [ "${LOGGUARD_SIGNAL_BOT_SKIP_AUDIT:-}" = 1 ]; then
+    echo "skipped (LOGGUARD_SIGNAL_BOT_SKIP_AUDIT=1)"
+elif ! cargo audit --version > /dev/null 2>&1; then
+    echo "cargo-audit is not installed:  cargo install cargo-audit --locked   (or LOGGUARD_SIGNAL_BOT_SKIP_AUDIT=1)" >&2
+    exit 1
+elif ! cargo audit --quiet --deny unsound --deny yanked > /dev/null 2>&1; then
+    if cargo audit --quiet --no-fetch --stale --deny unsound --deny yanked; then
+        echo "note: advisory database not updated (offline?); checked against the copy on disk"
+    else
+        exit 1
+    fi
+fi
+step "static Linux binary"
+# TARGET=aarch64-unknown-linux-musl or armv7-unknown-linux-musleabihf builds for ARM instead
+TARGET=${TARGET:-x86_64-unknown-linux-musl}
+cargo build --release --quiet --target "$TARGET"
+ls -l target/$TARGET/release/logguard-signal-bot

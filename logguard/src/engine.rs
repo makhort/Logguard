@@ -30,6 +30,8 @@ const RECENT_ALERTS: usize = 50;
 const MAX_DIGEST_POINTS: usize = 50_000;
 const EVIDENCE_PER_IP: usize = 8;
 const HISTORY_MINUTES: usize = 180;
+/// Hourly figures kept for the web console's longer charts: 7 days (since the start).
+const HISTORY_HOURS: usize = 7 * 24;
 /// Accounts tracked for failed logins (names are attacker-chosen) and known to log in.
 const MAX_ACCOUNTS: usize = 50_000;
 /// Addresses remembered per attacked account: enough to see a distributed attack, bounded
@@ -40,6 +42,9 @@ const MAX_ALERT_GATE: usize = 50_000;
 /// Integrity alerts about one local user's own files and processes sent per hour (see
 /// `Engine::findings`).
 const USER_ALERTS_PER_HOUR: usize = 5;
+/// Files of one local user's own sent to the scan of changed files per hour: each scan may
+/// load a scanner's gigabyte of signatures, and any account can change its files every minute.
+const USER_SCANS_PER_HOUR: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -324,6 +329,27 @@ pub struct IpState {
     report_points: f64,
 }
 
+/// Most files waiting for the scan of changed files; more are dropped (a flood of changes is
+/// news enough).
+const MAX_SCAN_QUEUE: usize = 1000;
+
+/// Whether `uid` may have one more of `limit` things an hour (and counts it if so).
+fn hourly_budget(used: &mut HashMap<u32, VecDeque<Micros>>, uid: u32, now: Micros, limit: usize) -> bool {
+    let hour = 3600 * crate::time::SEC;
+    if used.len() >= 1000 && !used.contains_key(&uid) {
+        used.retain(|_, times| times.back().is_some_and(|t| now - t < hour));
+    }
+    let times = used.entry(uid).or_default();
+    while times.front().is_some_and(|t| now - t >= hour) {
+        times.pop_front();
+    }
+    if times.len() >= limit {
+        return false;
+    }
+    times.push_back(now);
+    true
+}
+
 /// Digest category of a ban, from the dominant signal.
 fn category_of(s: Signal) -> &'static str {
     match s {
@@ -335,6 +361,7 @@ fn category_of(s: Signal) -> &'static str {
         s if s.source() == Source::Ejabberd => "xmpp",
         s if s.source() == Source::Nextcloud => "web",
         s if s.source() == Source::Custom => "custom",
+        s if s.source() == Source::Auth => "pam",
         _ => "other",
     }
 }
@@ -461,9 +488,31 @@ pub struct Stats {
     pub bans: u64,
     pub alerts: u64,
     pub history: VecDeque<MinuteBucket>,
+    /// Events and bans per hour, the last [`HISTORY_HOURS`] (since the start).
+    #[serde(default)]
+    pub hours: VecDeque<HourBucket>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HourBucket {
+    pub hour: Micros,
+    pub events: u64,
+    pub bans: u64,
 }
 
 impl Stats {
+    fn hour(&mut self, ts: Micros) -> Option<&mut HourBucket> {
+        let hour = ts - ts.rem_euclid(60 * MIN);
+        if self.hours.back().is_none_or(|b| hour > b.hour) {
+            if self.hours.len() == HISTORY_HOURS {
+                self.hours.pop_front();
+            }
+            self.hours.push_back(HourBucket { hour, ..Default::default() });
+            return self.hours.back_mut();
+        }
+        self.hours.iter_mut().rev().find(|b| b.hour == hour)
+    }
+
     fn bucket(&mut self, ts: Micros) -> Option<&mut MinuteBucket> {
         let minute = ts - ts.rem_euclid(MIN);
         if self.history.back().is_none_or(|b| minute > b.minute) {
@@ -508,6 +557,9 @@ pub struct AccountView {
 /// Everything the TUI and reports need, serialised as one JSON document.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// logguard's version.
+    #[serde(default)]
+    pub version: String,
     pub generated: Micros,
     pub started: Micros,
     pub mode: Mode,
@@ -533,6 +585,12 @@ pub struct Snapshot {
     pub allowed: Vec<OperAllow>,
     #[serde(default)]
     pub feeds: Option<crate::feeds::FeedStatus>,
+    /// What `[waf]` loaded last.
+    #[serde(default)]
+    pub waf: Option<crate::waf::WafStatus>,
+    /// What `[geoblock]` loaded last (countries and networks dropped).
+    #[serde(default)]
+    pub geoblock: Option<crate::geo::GeoblockStatus>,
     #[serde(default)]
     pub certs: Vec<crate::digest::CertStatus>,
     /// Time of the newest line per log source.
@@ -563,12 +621,19 @@ pub struct Snapshot {
     /// Outbound connections learned (`[procwatch]`).
     #[serde(default)]
     pub procwatch: Option<crate::procwatch::ProcView>,
+    /// The latest SSH hardening audit (`[ssh_audit]`).
+    #[serde(default)]
+    pub ssh_audit: Option<crate::sshaudit::SshAuditReport>,
     /// Addresses the `[allowlist] hosts` names resolve to now.
     #[serde(default)]
     pub allow_hosts: Vec<Net>,
     /// The `[[patterns]]` entries and what each found.
     #[serde(default)]
     pub patterns: Vec<crate::parse::custom::PatternView>,
+    /// The firewall backend the daemon enforces with (`Enforcer::name`: "nftables",
+    /// "firewalld", ...); missing from snapshots of older daemons and decision logs.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// Where the trouble comes from, for the Countries and Map tabs.
@@ -695,6 +760,9 @@ pub struct PersistedState {
     /// Outbound connections learned (None until the first scan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procwatch: Option<crate::procwatch::ProcBaseline>,
+    /// What the SSH audit reported (None until the first reading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_audit: Option<crate::sshaudit::SshAuditBaseline>,
     /// What each `[[patterns]]` entry found, for the Patterns tab.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<crate::parse::custom::PatternStats>,
@@ -753,6 +821,9 @@ pub struct Engine {
     pub digest: DigestStats,
     pub digest_last_sent: Micros,
     pub feeds: Option<crate::feeds::FeedStatus>,
+    pub waf: Option<crate::waf::WafStatus>,
+    /// What `[geoblock]` loaded last.
+    pub geoblock: Option<crate::geo::GeoblockStatus>,
     pub certs: Vec<crate::digest::CertStatus>,
     /// Set by the daemon after each `[resources]` reading.
     pub resources: Option<crate::resources::Report>,
@@ -785,15 +856,25 @@ pub struct Engine {
     ssh_keys: HashMap<String, SshKeys>,
     /// Failed su/sudo attempts per user: (count, first, last).
     priv_fails: HashMap<String, (u32, Micros, Micros)>,
+    /// The same for failed logins PAM or the audit log report here (per service and who or
+    /// where): count, first, last.
+    auth_fails: HashMap<String, (u32, Micros, Micros)>,
     /// When integrity alerts about each local user's own things were sent, the last hour.
     user_alerts: HashMap<u32, VecDeque<Micros>>,
+    /// The same for each local user's files sent to the scan of changed files.
+    user_scans: HashMap<u32, VecDeque<Micros>>,
     /// Set by the daemon after each `[patches]` reading.
     pub patches: Option<crate::patches::PatchReport>,
     verify: Option<crate::verify::VerifyBaseline>,
     verify_view: Option<crate::verify::VerifyView>,
     procwatch: Option<crate::procwatch::ProcBaseline>,
     proc_view: Option<crate::procwatch::ProcView>,
-    /// One per `[[patterns]]` entry, in the configuration's order.
+    ssh_audit: Option<crate::sshaudit::SshAuditBaseline>,
+    ssh_audit_last: Option<crate::sshaudit::SshAuditReport>,
+    /// Files the integrity watches reported new or changed, waiting for their scan
+    /// (`[antivirus] scan_changed`). Not kept across restarts.
+    scan_queue: Vec<crate::filescan::Job>,
+    /// One per `[[patterns]]` entry, in the configuration's order, then the built-in ones.
     pattern_stats: Vec<crate::parse::custom::PatternStats>,
 }
 
@@ -805,6 +886,8 @@ struct SilenceState {
     lines_since_event: BTreeMap<Source, u64>,
     quiet: BTreeSet<Source>,
     blind: BTreeSet<Source>,
+    /// Logs of `[silence.apps]` reported quiet.
+    quiet_apps: BTreeSet<String>,
 }
 
 impl Engine {
@@ -836,6 +919,8 @@ impl Engine {
             digest: DigestStats { since: now, ..Default::default() },
             digest_last_sent: 0,
             feeds: None,
+            waf: None,
+            geoblock: None,
             certs: vec![],
             resources: None,
             stats: Stats::default(),
@@ -856,12 +941,17 @@ impl Engine {
             last_ssh: HashMap::new(),
             ssh_keys: HashMap::new(),
             priv_fails: HashMap::new(),
+            auth_fails: HashMap::new(),
+            scan_queue: Vec::new(),
             user_alerts: HashMap::new(),
+            user_scans: HashMap::new(),
             patches: None,
             verify: None,
             verify_view: None,
             procwatch: None,
             proc_view: None,
+            ssh_audit: None,
+            ssh_audit_last: None,
             pattern_stats: Vec::new(),
         };
         e.set_pattern_stats(Vec::new());
@@ -873,8 +963,7 @@ impl Engine {
     fn set_pattern_stats(&mut self, mut saved: Vec<crate::parse::custom::PatternStats>) {
         self.pattern_stats = self
             .cfg
-            .patterns
-            .iter()
+            .all_patterns()
             .map(|p| match saved.iter().position(|s| s.name == p.name) {
                 Some(i) => saved.swap_remove(i),
                 None => crate::parse::custom::PatternStats::new(&p.name),
@@ -1001,6 +1090,42 @@ impl Engine {
                 ));
             }
         }
+        out.extend(self.check_quiet_apps(now));
+        out
+    }
+
+    /// `[silence.apps]`: a log of an app (`nginx_access`) with no line for its time. Its
+    /// lines are counted by its first pattern, which reads every line of it.
+    fn check_quiet_apps(&mut self, now: Micros) -> Vec<Action> {
+        let mut out = Vec::new();
+        let cfg = Arc::clone(&self.cfg);
+        for (log, quiet) in &cfg.silence.apps {
+            let Some((app, stream)) = crate::parse::apps::stream(log) else { continue };
+            let Some(first) = stream.rules.first() else { continue };
+            let Some(pattern) = cfg.app_patterns.iter().find(|p| p.name == first.name) else { continue };
+            let last = self.pattern_stats.iter().find(|s| s.name == first.name).and_then(|s| s.last_line);
+            let since = last.unwrap_or(0).max(self.started);
+            let quiet = quiet.micros();
+            if quiet > 0 && now - since >= quiet {
+                self.silence.quiet_apps.insert(log.clone());
+                let seen = match last {
+                    Some(t) => format!("last one at {}", fmt_ts(t)),
+                    None => "none since logguard started".into(),
+                };
+                let msg = format!(
+                    "no lines in the {} {} for {} ({seen}): its built-in patterns see nothing - is {} running, and does it still log to {}?",
+                    app.about,
+                    stream.about,
+                    crate::time::fmt_duration(now - since),
+                    app.name,
+                    pattern.from()
+                );
+                out.extend(self.system_alert(&format!("silent:app:{log}"), 86_400 * crate::time::SEC, Severity::Warning, msg));
+            } else if quiet > 0 && self.silence.quiet_apps.remove(log) {
+                let msg = format!("lines in the {} {} are arriving again", app.about, stream.about);
+                out.extend(self.system_alert(&format!("silent-back:app:{log}"), MIN, Severity::Info, msg));
+            }
+        }
         out
     }
 
@@ -1060,6 +1185,19 @@ impl Engine {
                 }
                 self.alert_gate.insert(f.key, self.now);
             }
+            // the files it names go to the scan of changed files (a user's own, a few an hour)
+            if self.cfg.antivirus.scan_changed != crate::filescan::Scanners::None {
+                let why = crate::event::clean(&f.message, 100);
+                for path in f.files {
+                    if self.scan_queue.len() >= MAX_SCAN_QUEUE || self.scan_queue.iter().any(|j| j.path == path) {
+                        continue;
+                    }
+                    if f.owner.is_some_and(|uid| !hourly_budget(&mut self.user_scans, uid, self.now, USER_SCANS_PER_HOUR)) {
+                        break;
+                    }
+                    self.scan_queue.push(crate::filescan::Job { path, why: why.clone(), owner: f.owner });
+                }
+            }
             let mut message = f.message;
             let mut notify = f.notify;
             if let Some(uid) = f.owner.filter(|_| notify) {
@@ -1115,19 +1253,7 @@ impl Engine {
     /// Whether one more integrity alert about local user `uid`'s own things may go to the
     /// admins this hour (and counts it if so).
     fn user_alert_allowed(&mut self, uid: u32) -> bool {
-        let (now, hour) = (self.now, 3600 * crate::time::SEC);
-        if self.user_alerts.len() >= 1000 && !self.user_alerts.contains_key(&uid) {
-            self.user_alerts.retain(|_, sent| sent.back().is_some_and(|t| now - t < hour));
-        }
-        let sent = self.user_alerts.entry(uid).or_default();
-        while sent.front().is_some_and(|t| now - t >= hour) {
-            sent.pop_front();
-        }
-        if sent.len() >= USER_ALERTS_PER_HOUR {
-            return false;
-        }
-        sent.push_back(now);
-        true
+        hourly_budget(&mut self.user_alerts, uid, self.now, USER_ALERTS_PER_HOUR)
     }
 
     /// Raises an operational alert (not tied to an address), rate-limited per key.
@@ -1244,6 +1370,9 @@ impl Engine {
                 self.stats.bans += 1;
                 if let Some(b) = self.stats.bucket(a.ts) {
                     b.bans += 1;
+                }
+                if let Some(h) = self.stats.hour(a.ts) {
+                    h.bans += 1;
                 }
                 let cat = a.category.clone().unwrap_or_else(|| "other".into());
                 *self.digest.bans_by_category.entry(cat).or_default() += 1;
@@ -1415,6 +1544,9 @@ impl Engine {
         self.silence.lines_since_event.insert(src, 0);
         if let Some(b) = self.stats.bucket(ev.ts) {
             b.count(src);
+        }
+        if let Some(h) = self.stats.hour(ev.ts) {
+            h.events += 1;
         }
         if self.ips.len() >= self.cfg.scoring.max_tracked_ips {
             self.gc(true);
@@ -1627,6 +1759,9 @@ impl Engine {
                 if let Some(b) = self.stats.bucket(now) {
                     b.count(Source::Peer);
                 }
+                if let Some(h) = self.stats.hour(now) {
+                    h.events += 1;
+                }
                 let st = self.ips.entry(*ip).or_insert_with(|| Box::new(IpState { first_seen: now, updated: now, ..Default::default() }));
                 st.advance(now, &cfg);
                 st.counts.bump(Signal::PeerReport);
@@ -1825,6 +1960,83 @@ impl Engine {
         Ok(out)
     }
 
+    /// The bans `[waf]` source `source` holds now (decided here, not relayed by peers).
+    pub fn waf_bans(&self, source: &str) -> Vec<Net> {
+        let prefix = crate::waf::reason_prefix(source);
+        self.bans.values().filter(|b| b.origin.is_none() && b.reason.starts_with(&prefix)).map(|b| b.net).collect()
+    }
+
+    /// Makes the bans of an `action = "ban"` source what its `decisions` are now: a ban for
+    /// each, as long as it lasts (`[waf] default_ban` if it doesn't say, `max_ban` at most),
+    /// lifted when the source drops it. Protected as an operator ban is, and recent logins
+    /// too: a WAF's mistake about an address must not lock out someone who just logged in.
+    /// Returns the actions and how many decisions made no ban (protected, too wide).
+    pub fn waf_sync(&mut self, src: &crate::waf::WafSource, decisions: &[crate::waf::Decision]) -> (Vec<Action>, usize) {
+        let mut out = Vec::new();
+        let now = self.now;
+        let name = &src.name;
+        let (default_ban, max_ban) = (self.cfg.waf.default_ban.micros(), self.cfg.waf.max_ban.micros());
+        let current: Vec<crate::waf::Decision> = decisions.iter().filter(|d| d.until.is_none_or(|u| u > now)).cloned().collect();
+        let wanted = crate::waf::by_net(&current);
+        for net in self.waf_bans(name).into_iter().filter(|n| !wanted.contains_key(n)) {
+            let why = format!("lifted by waf {name}");
+            self.unban(net, &why, Severity::Info, &mut out);
+            if let Some(ob) = self.outbox.as_mut().filter(|_| src.share) {
+                ob.push(FactBody::Unban { net, reason: why });
+            }
+        }
+        let mut skipped = 0;
+        for (net, d) in wanted {
+            let until = d.until.unwrap_or(now + default_ban).min(now + max_ban);
+            if until <= now {
+                continue;
+            }
+            // Blocked for long enough already (by this ban, or a wider one). An end moves by
+            // seconds between reads, and a list without durations asks for `default_ban` from
+            // now each time: renewed only once less than half of it is left.
+            if let Some(b) = self.covering_ban(&net) {
+                if b.until - now >= (until - now) / 2 {
+                    continue;
+                }
+                if b.net != net {
+                    continue; // inside a wider ban ending sooner: banned on its own after it
+                }
+            }
+            let protected = if net.is_host() { self.protection(net.addr).is_some() } else { self.net_protected(&net) };
+            if protected || self.wider_than_own_bans(&net) {
+                skipped += 1;
+                continue;
+            }
+            // nftables keeps an element's timeout when it is added again: lift the old ban first
+            if self.bans.contains_key(&net) {
+                self.unban(net, &format!("renewed by waf {name}"), Severity::Info, &mut out);
+            }
+            let forgive = self.cfg.bans.forgive_after.micros();
+            let off = self.offenders.entry(net).or_default();
+            if now - off.last_ban > forgive {
+                off.count = 0;
+            }
+            off.count += 1;
+            off.last_ban = now;
+            let offence = off.count;
+            let why = if d.reason.is_empty() { "decision".to_string() } else { d.reason.clone() };
+            let reason = format!("{}{why}", crate::waf::reason_prefix(name));
+            if let Some(ob) = self.outbox.as_mut().filter(|_| src.share) {
+                ob.push(FactBody::Ban { net, until, reason: reason.clone(), forgeable: false });
+            }
+            let place = self.place(net.addr).map(|p| format!(" [{p}]")).unwrap_or_default();
+            let message = format!("ban {net}{place} for {} (waf {name}): {why}", crate::time::fmt_duration(until - now));
+            let evidence = [&d.kind, &d.origin]
+                .iter()
+                .any(|s| !s.is_empty())
+                .then(|| format!("{name} decision: type {}, origin {}", d.kind, d.origin))
+                .into_iter()
+                .collect();
+            self.insert_ban(net, until, offence, reason, None, message, evidence, "waf", &mut out);
+        }
+        (out, skipped)
+    }
+
     /// The addresses `[allowlist] hosts` resolve to now. A newly allowlisted address's ban is
     /// lifted and its score forgotten, as for `logguard allow`.
     pub fn set_allow_hosts(&mut self, nets: Vec<Net>) -> Vec<Action> {
@@ -1952,6 +2164,158 @@ impl Engine {
         out
     }
 
+    /// A PAM, account tool or audit line (see `parse::auth`). A failed login at the console,
+    /// a desktop, polkit or the web console is high, like a failed `su`; elsewhere on record
+    /// only, unless it came from the internet, where its event scores the address instead.
+    /// Failures count per service and who asked (polkit's user) or where (the terminal): a
+    /// local user trying every account there is can't use up the hour's messages.
+    pub fn on_auth(&mut self, a: &crate::parse::auth::Auth, ts: Micros) -> Vec<Action> {
+        use crate::parse::auth::{Auth, Rhost};
+        let mut out = Vec::new();
+        self.now = self.now.max(ts);
+        let now = self.now;
+        let f = match a {
+            Auth::Notice(n) => {
+                let topic = (n.severity > Severity::Info).then_some(n.topic);
+                self.alert_about(format!("auth:{}", n.key), n.every, n.severity, None, n.message.clone(), topic, vec![], None, &mut out);
+                return out;
+            }
+            Auth::Failure(f) => f,
+        };
+        let place = match &f.rhost {
+            Rhost::Addr(ip) if !is_non_global(*ip) => return out,
+            Rhost::Addr(ip) => format!(" from {ip}"),
+            Rhost::Name(h) => format!(" from {h}"),
+            Rhost::Unclear => " from an unclear address (the line names more than one remote host)".into(),
+            Rhost::Local if f.tty.is_empty() => String::new(),
+            Rhost::Local => format!(" on {}", f.tty),
+        };
+        let who = [&f.ruser, &f.tty].into_iter().find(|w| !w.is_empty()).map_or("-", |w| w.as_str());
+        let key = format!("{}:{who}", f.service);
+        let window = 30 * MIN;
+        if self.auth_fails.len() >= 1000 {
+            self.auth_fails.retain(|_, c| now - c.2 < window);
+        }
+        let c = self.auth_fails.entry(key.clone()).or_insert((0, now, now));
+        // PAM's line and the audit record of the same failure come within a moment
+        if c.0 > 0 && now - c.2 < crate::time::SEC {
+            return out;
+        }
+        if now - c.2 >= window {
+            *c = (0, now, now);
+        }
+        c.0 += 1;
+        c.2 = now;
+        let times = if c.0 > 1 { format!(", {} failures in {}", c.0, crate::time::fmt_duration(now - c.1)) } else { String::new() };
+        let asked = if f.ruser.is_empty() { String::new() } else { format!(" for {}", f.ruser) };
+        let last = match self.last_ssh.get(&f.ruser) {
+            Some((ip, t)) => format!(" ({}'s last SSH login: {}, {} ago)", f.ruser, self.ip_place(*ip), crate::time::fmt_duration(now - t)),
+            None => String::new(),
+        };
+        let (service, user) = (&f.service, &f.user);
+        let message = format!("login as {user}{place} failed ({service}){asked}{times}{last}");
+        if crate::parse::auth::console_service(service) {
+            let message = format!("{message} - if it wasn't you, someone is trying {user}'s password");
+            self.alert_about(
+                format!("auth-fail:{key}"),
+                10 * MIN,
+                Severity::High,
+                None,
+                message,
+                Some(Topic::Compromise),
+                vec![],
+                None,
+                &mut out,
+            );
+        } else {
+            self.alert_about(format!("auth-fail:{key}"), 10 * MIN, Severity::Info, None, message, None, vec![], None, &mut out);
+        }
+        out
+    }
+
+    /// Up to `max` files waiting for the scan of changed files, oldest first.
+    pub fn take_scans(&mut self, max: usize) -> Vec<crate::filescan::Job> {
+        let n = max.min(self.scan_queue.len());
+        self.scan_queue.drain(..n).collect()
+    }
+
+    /// A scan of changed files (see `filescan`): an alert for each infected file, a warning
+    /// when a scanner failed, and the scan itself on record.
+    pub fn on_file_scan(&mut self, r: &crate::filescan::ScanReport) -> Vec<Action> {
+        let day = 86_400 * crate::time::SEC;
+        let finding = |key: String, every, severity, message: String, evidence: Vec<String>, notify, owner| crate::cronwatch::Finding {
+            key,
+            every,
+            severity,
+            message,
+            evidence,
+            notify,
+            owner,
+            files: vec![],
+        };
+        let mut found = Vec::new();
+        for f in r.infected() {
+            found.push(finding(
+                format!("scan-hit:{}:{}", f.path, f.hits.join(",")),
+                day,
+                Severity::High,
+                format!(
+                    "malware in {}: {} (it was scanned because: {}) - if nobody here put it there, the server may be compromised: \
+                     move it aside, and find out how it got there",
+                    f.path,
+                    f.hits.join("; "),
+                    f.why
+                ),
+                f.hits.clone(),
+                true,
+                // a user's own file: their alert budget (a flood of test signatures is theirs)
+                f.owner,
+            ));
+        }
+        for e in &r.errors {
+            let short: String = e.chars().take(60).collect();
+            found.push(finding(
+                format!("scan-error:{short}"),
+                day,
+                Severity::Warning,
+                format!("scan of changed files: {e}"),
+                vec![],
+                true,
+                None,
+            ));
+        }
+        let infected = r.infected().count();
+        let skipped = r.files.iter().filter(|f| f.hits.is_empty() && f.note.is_some()).count();
+        let scanned = r.files.len() - r.files.iter().filter(|f| f.note.as_deref().is_some_and(|n| n.starts_with("not scanned"))).count();
+        let with = if r.scanners.is_empty() { String::new() } else { format!(" with {}", r.scanners) };
+        let result = match (infected, skipped) {
+            (0, 0) => "nothing found".to_string(),
+            (0, s) => format!("nothing found, {s} not scanned or unreadable"),
+            (i, 0) => format!("{i} infected"),
+            (i, s) => format!("{i} infected, {s} not scanned or unreadable"),
+        };
+        let evidence = r
+            .files
+            .iter()
+            .take(50)
+            .map(|f| match (&f.hits[..], &f.note) {
+                ([], None) => format!("{}: clean", f.path),
+                ([], Some(n)) => format!("{}: {n}", f.path),
+                (h, _) => format!("{}: {}", f.path, h.join("; ")),
+            })
+            .collect();
+        found.push(finding(
+            format!("scan:{}", r.finished),
+            0,
+            Severity::Info,
+            format!("scanned {scanned} of {} changed files{with}: {result}", r.files.len()),
+            evidence,
+            false,
+            None,
+        ));
+        self.findings(found, r.finished)
+    }
+
     /// The latest `[patches]` reading (shown in the digest and the dashboard).
     pub fn on_patches(&mut self, r: crate::patches::PatchReport) {
         self.patches = Some(r);
@@ -1973,6 +2337,18 @@ impl Engine {
         });
         self.changes += 1;
         self.findings(findings, r.finished)
+    }
+
+    /// An SSH hardening audit (see `sshaudit`).
+    pub fn on_ssh_audit(&mut self, r: crate::sshaudit::SshAuditReport) -> Vec<Action> {
+        let before = self.ssh_audit.clone();
+        let findings = crate::sshaudit::judge(&mut self.ssh_audit, &r, &self.cfg.ssh_audit);
+        if before != self.ssh_audit {
+            self.changes += 1;
+        }
+        let wall = r.read;
+        self.ssh_audit_last = Some(r);
+        self.findings(findings, wall)
     }
 
     /// A process watch scan (see `procwatch`).
@@ -2306,7 +2682,10 @@ impl Engine {
                 day,
                 Severity::Warning,
                 None,
-                format!("ufw allows {rule} from anywhere, but nothing listens on it publicly - remove the rule or it exposes whatever binds there next"),
+                format!(
+                    "{} allows {rule} from anywhere, but nothing listens on it publicly - remove the rule or it exposes whatever binds there next",
+                    fw.name()
+                ),
                 Some(Topic::Exposure),
                 vec![],
                 None,
@@ -2570,7 +2949,7 @@ impl Engine {
     }
 
     /// The latest lines of what these addresses did, so the actions log keeps proof for a
-    /// network ban too: "10-11 05:03:08 11.47.29.77 block TCP/23".
+    /// network ban too: "10-11 05:03:08 11.54.29.77 block TCP/23".
     fn members_evidence(&self, ips: impl Iterator<Item = IpAddr>) -> Vec<String> {
         let mut out = Vec::new();
         for ip in ips {
@@ -2711,6 +3090,7 @@ impl Engine {
         trusted.sort_by_key(|t| std::cmp::Reverse(t.1));
 
         Snapshot {
+            version: env!("CARGO_PKG_VERSION").into(),
             generated: self.now,
             started: self.started,
             mode: cfg.mode,
@@ -2729,6 +3109,8 @@ impl Engine {
             cluster: None,
             allowed: self.allowed.values().cloned().collect(),
             feeds: self.feeds.clone(),
+            waf: self.waf.clone(),
+            geoblock: self.geoblock.clone(),
             certs: self.certs.clone(),
             last_lines: self.silence.last_line.clone(),
             cron: self.cron_view.clone(),
@@ -2741,16 +3123,17 @@ impl Engine {
             verify: self.verify_view.clone().or_else(|| {
                 self.verify.as_ref().map(|b| crate::verify::VerifyView {
                     last_run: b.last_run,
+                    checked: b.checked,
                     mismatched: b.mismatched.len(),
                     suid: b.suid.len(),
-                    ..Default::default()
                 })
             }),
             procwatch: self.proc_view.clone(),
+            ssh_audit: self.ssh_audit_last.clone(),
             allow_hosts: self.allow_hosts.clone(),
+            backend: None,
             patterns: cfg
-                .patterns
-                .iter()
+                .all_patterns()
                 .zip(&self.pattern_stats)
                 .map(|(p, st)| crate::parse::custom::PatternView {
                     kind: p.kind,
@@ -2926,6 +3309,7 @@ impl Engine {
             ssh_keys: self.ssh_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             verify: self.verify.clone(),
             procwatch: self.procwatch.clone(),
+            ssh_audit: self.ssh_audit.clone(),
             patterns: self.pattern_stats.iter().filter(|s| s.since > 0).cloned().collect(),
         }
     }
@@ -2978,6 +3362,7 @@ impl Engine {
         self.ssh_keys = st.ssh_keys.into_iter().take(MAX_KEY_ACCOUNTS).collect();
         self.verify = st.verify;
         self.procwatch = st.procwatch;
+        self.ssh_audit = st.ssh_audit;
         self.set_pattern_stats(
             st.patterns
                 .into_iter()
@@ -2996,11 +3381,24 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hourly_history() {
+        let mut s = Stats::default();
+        for h in 0..(HISTORY_HOURS as i64 + 5) {
+            s.hour(h * 60 * MIN + 5).unwrap().events += 1;
+        }
+        assert_eq!(s.hours.len(), HISTORY_HOURS, "7 days kept");
+        assert_eq!(s.hours.front().unwrap().hour, 5 * 60 * MIN);
+        s.hour(10 * 60 * MIN + 1).unwrap().bans += 1;
+        assert_eq!(s.hours.iter().find(|b| b.hour == 10 * 60 * MIN).unwrap().bans, 1, "a late event finds its hour");
+        assert!(s.hour(MIN).is_none(), "one older than the week is dropped");
+    }
     use crate::time::SEC;
 
     fn engine() -> Engine {
         let mut cfg = Config::default();
-        cfg.allowlist.nets.push("11.42.43.31".parse().unwrap());
+        cfg.allowlist.nets.push("11.48.43.31".parse().unwrap());
         Engine::new(Arc::new(cfg), 0)
     }
 
@@ -3010,6 +3408,146 @@ mod tests {
 
     fn bans(actions: &[Action]) -> Vec<String> {
         actions.iter().filter(|a| a.kind == ActionKind::Ban).map(|a| a.target.unwrap().to_string()).collect()
+    }
+
+    /// `[silence.apps]`: an app's log with no line for its time, counted by its first pattern.
+    #[test]
+    fn quiet_app_logs() {
+        let h = 3600 * SEC;
+        let cfg = Config::from_toml(
+            "[sources]\napps = [\"nextcloud\", \"owncloud\"]\n[sources.app_logs]\nnextcloud = \"/srv/nc.log\"\nowncloud = \"/srv/oc.log\"\n\
+             [silence.apps]\nnextcloud = \"7d\"",
+        )
+        .unwrap();
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        e.started = 100 * h;
+        let quiet = |a: Vec<Action>| a.into_iter().filter(|a| a.message.contains("nextcloud.log")).map(|a| a.message).collect::<Vec<_>>();
+        e.count_pattern("nextcloud_auth", 101 * h, crate::parse::custom::Outcome::Read, "x");
+        assert!(quiet(e.check_silence(101 * h + 7 * 24 * h - SEC)).is_empty());
+        let m = quiet(e.check_silence(101 * h + 7 * 24 * h));
+        assert_eq!(m.len(), 1);
+        assert!(m[0].starts_with("no lines in the Nextcloud without AIO") && m[0].contains("file /srv/nc.log"), "{m:?}");
+        assert!(quiet(e.check_silence(101 * h + 7 * 24 * h + h)).is_empty(), "once a day");
+        e.count_pattern("nextcloud_auth", 300 * h, crate::parse::custom::Outcome::Read, "x");
+        let back: Vec<String> = e.check_silence(300 * h).into_iter().map(|a| a.message).collect();
+        assert!(back.iter().any(|m| m.starts_with("lines in the Nextcloud without AIO") && m.ends_with("are arriving again")), "{back:?}");
+        // owncloud has none set: never
+        assert!(e.check_silence(5000 * h).iter().all(|a| !a.message.contains("ownCloud")));
+        let err = |t: &str| Config::from_toml(t).unwrap_err().to_string();
+        assert!(err("[silence.apps]\nnginx = \"1h\"").contains("unknown log"));
+        assert!(err("[silence.apps]\nnginx_access = \"1h\"").contains("isn't in [sources] apps"));
+    }
+
+    /// Files the integrity watches report are queued for the scan of changed files, once; a
+    /// scan's infected files are high alerts, its failures warnings, the scan itself on record.
+    #[test]
+    fn changed_files_are_scanned_and_infections_alert() {
+        use crate::filescan::{FileResult, ScanReport};
+        let finding = |key: &str, files: &[&str]| crate::cronwatch::Finding {
+            key: key.into(),
+            every: 0,
+            severity: Severity::High,
+            message: format!("cron: {key} changed"),
+            evidence: vec![],
+            notify: true,
+            owner: None,
+            files: files.iter().map(|f| f.to_string()).collect(),
+        };
+        let off = Engine::new(Arc::new(Config::default()), 0);
+        let mut off = off;
+        off.findings(vec![finding("a", &["/tmp/x"])], 10 * SEC);
+        assert!(off.take_scans(10).is_empty(), "scan_changed = none: nothing queued");
+
+        let cfg = Config::from_toml("[antivirus]\nscan_changed = \"clamav\"").unwrap();
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        e.findings(vec![finding("a", &["/tmp/x", "/opt/y"]), finding("b", &["/tmp/x"])], 10 * SEC);
+        let jobs = e.take_scans(10);
+        assert_eq!(jobs.iter().map(|j| j.path.as_str()).collect::<Vec<_>>(), ["/tmp/x", "/opt/y"], "each file once");
+        assert_eq!(jobs[0].why, "cron: a changed");
+        assert!(e.take_scans(10).is_empty());
+
+        let report = ScanReport {
+            started: 20 * SEC,
+            finished: 30 * SEC,
+            scanners: "ClamAV (clamd)".into(),
+            files: vec![
+                FileResult {
+                    path: "/tmp/x".into(),
+                    why: "cron: a changed".into(),
+                    hits: vec!["ClamAV: Unix.Trojan.Mirai-1".into()],
+                    ..Default::default()
+                },
+                FileResult { path: "/opt/y".into(), why: "cron: a changed".into(), ..Default::default() },
+                FileResult {
+                    path: "/opt/z".into(),
+                    why: "x".into(),
+                    note: Some("not scanned: no longer there".into()),
+                    ..Default::default()
+                },
+            ],
+            errors: vec!["YARA (1 rule file) failed: syntax error".into()],
+        };
+        let a = e.on_file_scan(&report);
+        let hit = a.iter().find(|a| a.severity == Severity::High).unwrap();
+        assert_eq!(hit.topic, Some(Topic::Integrity));
+        assert!(
+            hit.message.starts_with("malware in /tmp/x: ClamAV: Unix.Trojan.Mirai-1 (it was scanned because: cron: a changed)"),
+            "{}",
+            hit.message
+        );
+        let warn = a.iter().find(|a| a.severity == Severity::Warning).unwrap();
+        assert!(warn.message.contains("syntax error") && warn.topic == Some(Topic::Integrity));
+        let rec = a.iter().find(|a| a.severity == Severity::Info).unwrap();
+        assert_eq!(rec.message, "scanned 2 of 3 changed files with ClamAV (clamd): 1 infected, 1 not scanned or unreadable");
+        assert_eq!(rec.topic, None, "on record, not sent");
+        assert_eq!(rec.evidence, ["/tmp/x: ClamAV: Unix.Trojan.Mirai-1", "/opt/y: clean", "/opt/z: not scanned: no longer there"]);
+        assert!(e.on_file_scan(&report).iter().all(|a| a.severity == Severity::Info), "the same hit and error: once a day");
+    }
+
+    /// A local user's own changed files: at most `USER_SCANS_PER_HOUR` scanned an hour (each
+    /// scan may load a gigabyte of signatures), and what the scans find in them shares the
+    /// user's alert budget, so a pile of test signatures can't flood the admins.
+    #[test]
+    fn a_users_own_files_have_a_scan_and_alert_budget() {
+        use crate::filescan::{FileResult, ScanReport};
+        let cfg = Config::from_toml("[antivirus]\nscan_changed = \"clamav\"").unwrap();
+        let mut e = Engine::new(Arc::new(cfg), 0);
+        let h = 3600 * SEC;
+        let finding = |i: usize, owner: Option<u32>| crate::cronwatch::Finding {
+            key: format!("cron:{i}"),
+            every: 0,
+            severity: Severity::High,
+            message: "cron: changed".into(),
+            evidence: vec![],
+            notify: false,
+            owner,
+            files: vec![format!("/home/eve/s{i}"), format!("/home/eve/t{i}")],
+        };
+        e.findings((0..20).map(|i| finding(i, Some(1000))).collect(), 10 * h);
+        e.findings((100..120).map(|i| finding(i, None)).collect(), 10 * h);
+        let jobs = e.take_scans(1000);
+        assert_eq!(jobs.iter().filter(|j| j.owner == Some(1000)).count(), USER_SCANS_PER_HOUR);
+        assert_eq!(jobs.iter().filter(|j| j.owner.is_none()).count(), 40, "root's: no budget");
+        e.findings(vec![finding(50, Some(1000))], 11 * h + MIN);
+        assert_eq!(e.take_scans(10).len(), 2, "an hour on");
+
+        let report = ScanReport {
+            finished: 12 * h,
+            files: (0..10)
+                .map(|i| FileResult {
+                    path: format!("/home/eve/s{i}"),
+                    why: "cron".into(),
+                    hits: vec!["ClamAV: Eicar-Signature".into()],
+                    owner: Some(1000),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let a = e.on_file_scan(&report);
+        let sent = a.iter().filter(|a| a.topic == Some(Topic::Integrity)).count();
+        assert_eq!(sent, USER_ALERTS_PER_HOUR + 1, "five alerts and the note that the rest are only logged: {a:?}");
+        assert_eq!(a.iter().filter(|a| a.message.starts_with("malware in")).count(), 10, "all on record");
     }
 
     #[test]
@@ -3033,12 +3571,12 @@ mod tests {
         // ssh: lines keep coming (own logins, reloads...) but none names an address
         for i in 0..300 {
             e.count_record(Source::Ssh, 103 * h + i * SEC);
-            e.on_event(&Event::new(103 * h + i * 60 * SEC, "11.10.1.2".parse().unwrap(), Signal::FwBlock));
+            e.on_event(&Event::new(103 * h + i * 60 * SEC, "11.13.1.2".parse().unwrap(), Signal::FwBlock));
             e.count_record(Source::Ufw, 103 * h + i * 60 * SEC);
         }
         let m = msgs(e.check_silence(106 * h + SEC));
         assert!(m.iter().any(|m| m.starts_with("301 ssh log lines in the last 6h")), "{m:?}");
-        e.on_event(&ev(106 * 3600 + 2, "11.10.1.1", Signal::SshPreauth));
+        e.on_event(&ev(106 * 3600 + 2, "11.13.1.1", Signal::SshPreauth));
         e.count_record(Source::Ssh, 106 * h + 2 * SEC);
         assert_eq!(msgs(e.check_silence(106 * h + 3 * SEC)), vec!["ssh log lines name client addresses again"]);
     }
@@ -3049,8 +3587,8 @@ mod tests {
         assert!(!e.snapshot(0, 10).world.geo);
         e.geo = Some(Arc::new(crate::geo::tests::sample()));
         e.on_event(&ev(1, "5.9.1.1", Signal::FwTripwire).port(Some(23))); // DE, banned
-        e.on_event(&ev(2, "11.35.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
-        e.on_event(&ev(3, "11.35.1.1", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(2, "11.41.1.1", Signal::FwBlock).port(Some(3389))); // FI, tracked
+        e.on_event(&ev(3, "11.41.1.1", Signal::FwBlock).port(Some(3389)));
         e.on_event(&ev(4, "8.8.8.8", Signal::FwBlock).port(Some(22))); // no geo data
         e.on_event(&ev(5, "1.0.0.5", Signal::XmppAuthOk)); // AU user
         let w = e.snapshot(0, 10).world;
@@ -3085,7 +3623,7 @@ mod tests {
         assert_eq!(w2.ports, vec![(3389, 1)], "halved; counters reaching 0 are dropped");
         assert!(w2.by_country.get("DE").is_none_or(|d| d.ports.is_empty()));
         // most offenders first, whatever the bans
-        e.on_event(&ev(6, "11.35.1.2", Signal::FwBlock).port(Some(3389)));
+        e.on_event(&ev(6, "11.41.1.2", Signal::FwBlock).port(Some(3389)));
         let w = e.snapshot(0, 10).world;
         assert_eq!(w.countries.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), ["FI", "DE"]);
     }
@@ -3137,17 +3675,17 @@ mod tests {
     #[test]
     fn canary_bans_at_first_attempt_and_login_is_critical() {
         let mut e = engine();
-        let a = e.on_event(&ev(1, "11.15.9.9", Signal::SshCanary).account(Some("ubuntu")));
-        assert_eq!(bans(&a), vec!["11.15.9.9"]);
+        let a = e.on_event(&ev(1, "11.18.9.9", Signal::SshCanary).account(Some("ubuntu")));
+        assert_eq!(bans(&a), vec!["11.18.9.9"]);
         assert_eq!(a[0].category.as_deref(), Some("canary"));
         assert!(a.iter().all(|a| a.accounts.is_empty()), "nobody to notify about a canary account");
-        let login = Event::new(2 * SEC, "11.15.9.8".parse().unwrap(), Signal::XmppCanary)
+        let login = Event::new(2 * SEC, "11.18.9.8".parse().unwrap(), Signal::XmppCanary)
             .detail(format!("{} test@x.org", crate::event::CANARY_LOGIN));
         let a = e.on_event(&login);
         assert!(a.iter().any(|a| a.severity == Severity::Critical && a.topic == Some(Topic::Compromise)), "{a:?}");
-        assert!(e.protection("11.15.9.8".parse().unwrap()).is_none(), "a canary login earns no trust");
+        assert!(e.protection("11.18.9.8".parse().unwrap()).is_none(), "a canary login earns no trust");
         // your own (allowlisted) address mistyping a name: alert, no ban
-        let a = e.on_event(&ev(3, "11.42.43.31", Signal::SshCanary).account(Some("root")));
+        let a = e.on_event(&ev(3, "11.48.43.31", Signal::SshCanary).account(Some("root")));
         assert!(bans(&a).is_empty());
         assert!(a.iter().any(|a| a.topic == Some(Topic::Protected)));
     }
@@ -3330,7 +3868,10 @@ mod tests {
         let mut seq = 0;
         let mut apply = |e: &mut Engine, body: &FactBody| {
             seq += 1;
-            e.apply_peer_fact(&Fact { origin: "vpn".into(), seq, created: 10 * SEC, hops: 1, body: body.clone() }, &ccfg)
+            e.apply_peer_fact(
+                &Fact { origin: "vpn".into(), seq, created: 10 * SEC, hops: 1, body: body.clone(), sig: String::new() },
+                &ccfg,
+            )
         };
         let mut all = vec![];
         for f in &facts {
@@ -3353,28 +3894,28 @@ mod tests {
         let mut ban = |e: &mut Engine, net: &str| {
             seq += 1;
             let body = FactBody::Ban { net: net.parse().unwrap(), until: 3600 * SEC, reason: "x".into(), forgeable: false };
-            bans(&e.apply_peer_fact(&Fact { origin: "vpn".into(), seq, created: SEC, hops: 1, body }, &ccfg))
+            bans(&e.apply_peer_fact(&Fact { origin: "vpn".into(), seq, created: SEC, hops: 1, body, sig: String::new() }, &ccfg))
         };
         let mut cfg = Config::default();
         cfg.subnets.v4_wide_prefix = 20;
         let mut e = Engine::new(Arc::new(cfg), 0);
-        assert!(ban(&mut e, "11.10.0.0/16").is_empty() && ban(&mut e, "11.11.0.0/19").is_empty());
-        assert_eq!(ban(&mut e, "11.12.0.0/20"), ["11.12.0.0/20"]);
+        assert!(ban(&mut e, "11.13.0.0/16").is_empty() && ban(&mut e, "11.14.0.0/19").is_empty());
+        assert_eq!(ban(&mut e, "11.15.0.0/20"), ["11.15.0.0/20"]);
         // without growth: /24 at most; IPv6 /64
         let mut cfg = Config::default();
         cfg.subnets.wide_enabled = false;
         let mut e = Engine::new(Arc::new(cfg), 0);
-        assert!(ban(&mut e, "11.13.0.0/23").is_empty() && ban(&mut e, "3fff:100::/48").is_empty());
-        assert_eq!(ban(&mut e, "11.13.0.0/24"), ["11.13.0.0/24"]);
+        assert!(ban(&mut e, "11.16.0.0/23").is_empty() && ban(&mut e, "3fff:130::/48").is_empty());
+        assert_eq!(ban(&mut e, "11.16.0.0/24"), ["11.16.0.0/24"]);
     }
 
     #[test]
     fn cluster_facts() {
         use crate::cluster::{ClusterCfg, Fact, FactBody};
         let ccfg = ClusterCfg::default();
-        let fact = |body| Fact { origin: "vpn".into(), seq: 1, created: 1000 * SEC, hops: 1, body };
+        let fact = |body| Fact { origin: "vpn".into(), seq: 1, created: 1000 * SEC, hops: 1, body, sig: String::new() };
         let mut e = engine();
-        e.enable_sharing(vec!["11.32.48.86".parse().unwrap()]);
+        e.enable_sharing(vec!["11.38.48.86".parse().unwrap()]);
         e.now = 1000 * SEC;
 
         // remote ban: applied, capped to max_remote_ban, tagged with its origin, not re-shared as ours
@@ -3389,7 +3930,7 @@ mod tests {
         assert!(e.take_outbox(10.0).is_empty());
 
         // protected addresses: home (allowlist) and cluster peers are never banned by peers
-        for ip in ["11.42.43.31", "11.32.48.86"] {
+        for ip in ["11.48.43.31", "11.38.48.86"] {
             assert!(e
                 .apply_peer_fact(
                     &fact(FactBody::Ban { net: ip.parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
@@ -3452,7 +3993,7 @@ mod tests {
         assert_eq!(e.ips[&"5.5.5.7".parse().unwrap()].fast, 100.0, "capped at one threshold");
         assert!(
             e.apply_peer_fact(
-                &fact(FactBody::Ban { net: "11.10.0.0/16".parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
+                &fact(FactBody::Ban { net: "11.13.0.0/16".parse().unwrap(), until: 2000 * SEC, reason: "x".into(), forgeable: false }),
                 &ccfg
             )
             .len()
@@ -3484,24 +4025,25 @@ mod tests {
                 seq: 1,
                 created: 20 * SEC,
                 hops: 1,
-                body: FactBody::Ban { net: "11.15.0.0/24".parse().unwrap(), until: 9000 * SEC, reason: "r".into(), forgeable: false },
+                body: FactBody::Ban { net: "11.18.0.0/24".parse().unwrap(), until: 9000 * SEC, reason: "r".into(), forgeable: false },
+                sig: String::new(),
             },
             &ClusterCfg::default(),
         );
-        let err = e.operator_unban("11.15.0.7".parse().unwrap()).unwrap_err();
-        assert!(err.contains("covered by the ban on 11.15.0.0/24"), "{err}");
+        let err = e.operator_unban("11.18.0.7".parse().unwrap()).unwrap_err();
+        assert!(err.contains("covered by the ban on 11.18.0.0/24"), "{err}");
         assert!(e.operator_unban("8.8.4.4".parse().unwrap()).unwrap_err().contains("no active ban"));
 
         // allowlisting lifts bans inside it, protects, and expires
-        let a = e.operator_allow("11.15.0.0/24".parse().unwrap(), 100 * SEC, "office".into());
+        let a = e.operator_allow("11.18.0.0/24".parse().unwrap(), 100 * SEC, "office".into());
         assert_eq!(a.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::Unban, ActionKind::Allow]);
-        assert_eq!(e.protection("11.15.0.7".parse().unwrap()), Some("operator allowlist"));
-        let tripped: Vec<Action> = (0..5).flat_map(|i| e.on_event(&ev(30 + i, "11.15.0.7", Signal::XmppTlsFail))).collect();
+        assert_eq!(e.protection("11.18.0.7".parse().unwrap()), Some("operator allowlist"));
+        let tripped: Vec<Action> = (0..5).flat_map(|i| e.on_event(&ev(30 + i, "11.18.0.7", Signal::XmppTlsFail))).collect();
         assert!(bans(&tripped).is_empty());
         let expired = e.tick(200 * SEC);
         assert!(expired.iter().any(|a| a.kind == ActionKind::Disallow));
-        assert!(e.protection("11.15.0.7".parse().unwrap()).is_none());
-        assert!(e.operator_disallow("11.15.0.0/24".parse().unwrap()).is_err());
+        assert!(e.protection("11.18.0.7".parse().unwrap()).is_none());
+        assert!(e.operator_disallow("11.18.0.0/24".parse().unwrap()).is_err());
     }
 
     #[test]
@@ -3562,7 +4104,7 @@ mod tests {
     fn snapshot_top_n_and_persistence_is_lean() {
         let mut e = engine();
         for host in 1..=50u8 {
-            e.on_event(&ev(i64::from(host), &format!("11.10.1.{host}"), Signal::XmppConn).port(Some(5269)));
+            e.on_event(&ev(i64::from(host), &format!("11.13.1.{host}"), Signal::XmppConn).port(Some(5269)));
         }
         for i in 0..3 {
             e.on_event(&ev(100 + i, "9.9.9.9", Signal::XmppTlsFail));
@@ -3593,13 +4135,13 @@ mod tests {
     #[test]
     fn three_tls_failures_ban() {
         let mut e = engine();
-        assert!(e.on_event(&ev(0, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
-        assert!(e.on_event(&ev(5, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
-        let a = e.on_event(&ev(9, "11.49.40.218", Signal::XmppTlsFail));
-        assert_eq!(bans(&a), vec!["11.49.40.218"]);
+        assert!(e.on_event(&ev(0, "11.57.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(5, "11.57.40.218", Signal::XmppTlsFail)).is_empty());
+        let a = e.on_event(&ev(9, "11.57.40.218", Signal::XmppTlsFail));
+        assert_eq!(bans(&a), vec!["11.57.40.218"]);
         assert_eq!(a[0].until, Some(9 * SEC + 3600 * SEC));
         // no duplicate ban while active
-        assert!(e.on_event(&ev(10, "11.49.40.218", Signal::XmppTlsFail)).is_empty());
+        assert!(e.on_event(&ev(10, "11.57.40.218", Signal::XmppTlsFail)).is_empty());
     }
 
     #[test]
@@ -3622,7 +4164,7 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for i in 0..10 {
-            all.extend(e.on_event(&ev(i, "11.42.43.31", Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(i, "11.48.43.31", Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty());
         assert!(all.iter().any(|a| a.kind == ActionKind::Alert));
@@ -3706,7 +4248,7 @@ mod tests {
     #[test]
     fn port_spread_scanner() {
         let mut e = engine();
-        let ip = "11.41.253.221";
+        let ip = "11.47.253.221";
         let mut all = vec![];
         for (i, port) in [5222u16, 5269, 5280, 5443].iter().enumerate() {
             all.extend(e.on_event(&ev(i as i64, ip, Signal::XmppConn).port(Some(*port))));
@@ -3743,23 +4285,23 @@ mod tests {
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i, &format!("11.17.59.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i, &format!("11.20.59.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
         let b = bans(&all);
-        assert!(b.contains(&"11.17.59.0/24".to_string()));
+        assert!(b.contains(&"11.20.59.0/24".to_string()));
         let sub = all.iter().find(|a| a.target.map(|t| t.prefix) == Some(24)).unwrap();
         assert_eq!(sub.superseded.len(), 3, "host bans inside the subnet are replaced");
-        assert!(e.banned_by("11.17.59.200".parse().unwrap()).is_some());
+        assert!(e.banned_by("11.20.59.200".parse().unwrap()).is_some());
 
         // A subnet that contains a trusted address is never banned wholesale.
         let mut e = engine();
-        e.on_event(&Event::new(0, "11.23.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        e.on_event(&Event::new(0, "11.26.44.5".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
         let mut all = vec![];
         for host in [10, 11, 12] {
             for i in 0..3 {
-                all.extend(e.on_event(&ev(i + 1, &format!("11.23.44.{host}"), Signal::XmppTlsFail)));
+                all.extend(e.on_event(&ev(i + 1, &format!("11.26.44.{host}"), Signal::XmppTlsFail)));
             }
         }
         all.extend(e.tick(120 * SEC));
@@ -3771,11 +4313,11 @@ mod tests {
         let mut e = engine();
         let mut all = vec![];
         for host in 1..=6 {
-            all.extend(e.on_event(&ev(host, &format!("11.31.48.{host}"), Signal::XmppTlsFail)));
+            all.extend(e.on_event(&ev(host, &format!("11.37.48.{host}"), Signal::XmppTlsFail)));
         }
         assert!(bans(&all).is_empty(), "one probe per address is not a ban on its own");
         all.extend(e.tick(120 * SEC));
-        assert_eq!(bans(&all), vec!["11.31.48.0/24"]);
+        assert_eq!(bans(&all), vec!["11.37.48.0/24"]);
     }
 
     /// Three failed TLS handshakes within 3 s: a host ban.
@@ -3832,74 +4374,74 @@ mod tests {
     fn subnet_growth_limits() {
         let seed = |e: &mut Engine| {
             for host in [10, 11, 12] {
-                attack(e, 0, &format!("11.17.59.{host}"));
+                attack(e, 0, &format!("11.20.59.{host}"));
             }
-            assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.17.59.0/24"]);
+            assert_eq!(bans(&e.tick(120 * SEC)), vec!["11.20.59.0/24"]);
         };
         // a user who logged in from the next /24 keeps it out of the ban
         let mut e = engine();
-        e.on_event(&Event::new(0, "11.17.58.50".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
+        e.on_event(&Event::new(0, "11.20.58.50".parse().unwrap(), Signal::XmppAuthOk).account(Some("a@b")));
         seed(&mut e);
-        attack(&mut e, 200, "11.17.57.7");
+        attack(&mut e, 200, "11.20.57.7");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
 
         // two banned /24s side by side make exactly their /23
         let mut e = engine();
         seed(&mut e);
         for host in [20, 21, 22] {
-            attack(&mut e, 200, &format!("11.17.58.{host}"));
+            attack(&mut e, 200, &format!("11.20.58.{host}"));
         }
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.58.0/24", "11.17.58.0/23"]);
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.20.58.0/24", "11.20.58.0/23"]);
 
         // with a network database: never into another provider's addresses
         let mut e = engine();
         let mut db = crate::geo::GeoDb::default();
-        db.read("11.17.56.0,11.17.57.255,64501,\"Other\"\n11.17.58.0,11.17.63.255,64500,\"Provider\"\n".as_bytes(), false).unwrap();
+        db.read("11.20.56.0,11.20.57.255,64501,\"Other\"\n11.20.58.0,11.20.63.255,64500,\"Provider\"\n".as_bytes(), false).unwrap();
         e.geo = Some(Arc::new(db));
         seed(&mut e);
-        attack(&mut e, 200, "11.17.57.7");
-        attack(&mut e, 200, "11.17.58.9");
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.58.0/23"], "the /22 would hold AS64501's 11.17.56.0/23");
+        attack(&mut e, 200, "11.20.57.7");
+        attack(&mut e, 200, "11.20.58.9");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.20.58.0/23"], "the /22 would hold AS64501's 11.20.56.0/23");
 
         // a larger step: one ban anywhere within it is enough (here 5 bits, /24 -> /19)
         let mut cfg = Config::default();
         cfg.subnets.wide_max_step = 8;
         let mut e = Engine::new(Arc::new(cfg), 0);
         seed(&mut e);
-        attack(&mut e, 200, "11.17.36.5");
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.17.32.0/19"]);
+        attack(&mut e, 200, "11.20.36.5");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["11.20.32.0/19"]);
 
         // growth off: /24 bans stay /24
         let mut cfg = Config::default();
         cfg.subnets.wide_enabled = false;
         let mut e = Engine::new(Arc::new(cfg), 0);
         seed(&mut e);
-        attack(&mut e, 200, "11.17.57.7");
+        attack(&mut e, 200, "11.20.57.7");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
 
         // IPv6 /64 bans grow too, 4 bits at a time, up to /48
         let mut e = engine();
         for host in 1..=3 {
-            attack(&mut e, 0, &format!("3fff:100:1:2::{host}"));
+            attack(&mut e, 0, &format!("3fff:130:1:2::{host}"));
         }
-        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:100:1:2::/64"]);
-        attack(&mut e, 200, "3fff:100:1:3::1");
-        assert_eq!(bans(&e.tick(300 * SEC)), vec!["3fff:100:1:2::/63"], "the narrowest network with the nearest ban");
-        attack(&mut e, 400, "3fff:100:1:ff::1");
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:130:1:2::/64"]);
+        attack(&mut e, 200, "3fff:130:1:3::1");
+        assert_eq!(bans(&e.tick(300 * SEC)), vec!["3fff:130:1:2::/63"], "the narrowest network with the nearest ban");
+        attack(&mut e, 400, "3fff:130:1:ff::1");
         assert!(bans(&e.tick(500 * SEC)).is_empty(), "8 bits away: more than 4 at a time");
-        attack(&mut e, 600, "3fff:100:1:8::1");
-        assert_eq!(bans(&e.tick(700 * SEC)), vec!["3fff:100:1::/56"], "through the /60 on to the far one, in one go");
-        attack(&mut e, 800, "3fff:100:2::1");
+        attack(&mut e, 600, "3fff:130:1:8::1");
+        assert_eq!(bans(&e.tick(700 * SEC)), vec!["3fff:130:1::/56"], "through the /60 on to the far one, in one go");
+        attack(&mut e, 800, "3fff:130:2::1");
         assert!(bans(&e.tick(900 * SEC)).is_empty(), "another /48: never past v6_wide_prefix");
         // ...and not at all with v6_wide_prefix = v6_prefix
         let mut cfg = Config::default();
         cfg.subnets.v6_wide_prefix = 64;
         let mut e = Engine::new(Arc::new(cfg), 0);
         for host in 1..=3 {
-            attack(&mut e, 0, &format!("3fff:100:1:2::{host}"));
+            attack(&mut e, 0, &format!("3fff:130:1:2::{host}"));
         }
-        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:100:1:2::/64"]);
-        attack(&mut e, 200, "3fff:100:1:3::1");
+        assert_eq!(bans(&e.tick(120 * SEC)), vec!["3fff:130:1:2::/64"]);
+        attack(&mut e, 200, "3fff:130:1:3::1");
         assert!(bans(&e.tick(300 * SEC)).is_empty());
     }
 
@@ -3922,12 +4464,12 @@ mod tests {
     #[test]
     fn own_address_is_never_scored_and_wall_alerts_have_real_time() {
         let mut e = engine();
-        e.set_own_addresses(vec!["11.24.39.236".parse().unwrap()]);
+        e.set_own_addresses(vec!["11.29.39.236".parse().unwrap()]);
         for i in 0..20 {
-            assert!(bans(&e.on_event(&ev(i, "11.24.39.236", Signal::XmppNoAuth))).is_empty());
+            assert!(bans(&e.on_event(&ev(i, "11.29.39.236", Signal::XmppNoAuth))).is_empty());
         }
-        assert_eq!(e.protection("11.24.39.236".parse().unwrap()), Some("this host"));
-        assert!(e.ips.get(&"11.24.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
+        assert_eq!(e.protection("11.29.39.236".parse().unwrap()), Some("this host"));
+        assert!(e.ips.get(&"11.29.39.236".parse().unwrap()).is_none_or(|s| s.slow == 0.0), "its own checks score nothing");
         // engine clock still at the start (no log line yet): the alert gets the wall-clock time
         let mut e = engine();
         let a = e.system_alert_wall("cert:x", 86_400 * SEC, Severity::High, "expires".into(), 1_791_806_149 * SEC);
@@ -3939,15 +4481,15 @@ mod tests {
     fn longer_bans_outlive_a_shorter_subnet_ban() {
         let mut e = engine();
         let mut out = vec![];
-        let long: Net = "11.15.9.9".parse().unwrap();
+        let long: Net = "11.18.9.9".parse().unwrap();
         e.insert_ban(long, 30 * 86_400 * SEC, 5, "repeat".into(), None, "m".into(), vec![], "x", &mut out);
-        let short: Net = "11.15.9.0/24".parse().unwrap();
+        let short: Net = "11.18.9.0/24".parse().unwrap();
         e.insert_ban(short, 3600 * SEC, 1, "subnet".into(), None, "m".into(), vec![], "x", &mut out);
         assert_eq!(out[1].superseded, vec![long], "nftables needs the host element gone first");
-        assert!(e.banned_by("11.15.9.9".parse().unwrap()).is_some_and(|b| b.net == short));
+        assert!(e.banned_by("11.18.9.9".parse().unwrap()).is_some_and(|b| b.net == short));
         let a = e.tick(3601 * SEC);
         let kinds: Vec<(ActionKind, String)> = a.iter().map(|a| (a.kind, a.target.unwrap().to_string())).collect();
-        assert_eq!(kinds, vec![(ActionKind::Unban, "11.15.9.0/24".into()), (ActionKind::Ban, "11.15.9.9".into())]);
+        assert_eq!(kinds, vec![(ActionKind::Unban, "11.18.9.0/24".into()), (ActionKind::Ban, "11.18.9.9".into())]);
         assert_eq!(a[1].until, Some(30 * 86_400 * SEC), "same end as before");
         assert!(e.export(None).bans.iter().all(|b| b.inner.is_empty()));
     }
@@ -3994,7 +4536,7 @@ mod tests {
         let ok = |t: i64, ip: &str| Event::new(t * SEC, ip.parse().unwrap(), Signal::XmppAuthOk).account(Some("user5@x"));
         assert!(e.on_event(&ok(0, "5.9.1.1")).is_empty(), "learning");
         // a different /16 (and country) of the same provider: no news
-        assert!(e.on_event(&ok(8 * 86_400, "11.35.1.1")).is_empty());
+        assert!(e.on_event(&ok(8 * 86_400, "11.41.1.1")).is_empty());
         let a = e.on_event(&ok(8 * 86_400 + 60, "1.0.0.7"));
         assert_eq!(
             a[0].message,
@@ -4127,13 +4669,48 @@ mod tests {
     }
 
     #[test]
+    fn ssh_audit_alerts_once_and_survives_restarts() {
+        use crate::sshaudit::{Issue, SshAuditReport};
+        let h = 3600 * SEC;
+        let report = |t: Micros, pw: &str| SshAuditReport {
+            read: t,
+            installed: true,
+            layout: "standard".into(),
+            issues: if pw == "yes" {
+                vec![Issue {
+                    id: "password-auth".into(),
+                    severity: Severity::Warning,
+                    message: "sshd accepts passwords".into(),
+                    fix: "x".into(),
+                }]
+            } else {
+                vec![]
+            },
+            settings: BTreeMap::from([("passwordauthentication".into(), pw.into())]),
+            ..Default::default()
+        };
+        let mut e = engine();
+        let a = e.on_ssh_audit(report(h, "no"));
+        assert!(a.len() == 1 && a[0].topic.is_none(), "nothing wrong: only logged: {a:?}");
+        assert!(e.snapshot(0, 0).ssh_audit.is_some());
+
+        let mut e2 = engine();
+        e2.restore(e.export(None));
+        let a = e2.on_ssh_audit(report(2 * h, "yes"));
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!((a[0].severity, a[0].topic), (Severity::Warning, Some(Topic::Integrity)));
+        assert!(a[0].evidence.iter().any(|e| e == "changed: passwordauthentication: no -> yes"), "{:?}", a[0].evidence);
+        assert!(e2.on_ssh_audit(report(3 * h, "yes")).is_empty(), "told once");
+    }
+
+    #[test]
     fn operator_bans() {
         let mut e = engine();
         e.enable_sharing(vec!["203.0.113.9".parse().unwrap()]);
         e.now = 100 * SEC;
-        let net: Net = "11.15.9.9".parse().unwrap();
+        let net: Net = "11.18.9.9".parse().unwrap();
         let a = e.operator_ban(net, 100 * SEC + 7 * 86_400 * SEC, "scanner".into()).unwrap();
-        assert_eq!(bans(&a), vec!["11.15.9.9"]);
+        assert_eq!(bans(&a), vec!["11.18.9.9"]);
         assert!(a[0].message.contains("for 7d00h (operator): scanner"), "{}", a[0].message);
         assert_eq!(a[0].category.as_deref(), Some("operator"));
         let shared = e.take_outbox(1000.0);
@@ -4142,17 +4719,83 @@ mod tests {
         let a = e.operator_ban(net, 200 * SEC, "shorter".into()).unwrap();
         assert_eq!(a.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::Unban, ActionKind::Ban]);
         // refused: protected addresses, ones inside a wider ban, networks wider than own bans
-        for (target, why) in [("11.42.43.31", "allowlisted"), ("203.0.113.9", "cluster peer"), ("10.0.0.1", "private")] {
+        for (target, why) in [("11.48.43.31", "allowlisted"), ("203.0.113.9", "cluster peer"), ("10.0.0.1", "private")] {
             let err = e.operator_ban(target.parse().unwrap(), 300 * SEC, "x".into()).unwrap_err();
             assert!(err.contains(why), "{target}: {err}");
         }
-        assert!(e.operator_ban("11.42.43.0/24".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("protected"));
-        assert!(e.operator_ban("11.9.0.0/12".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("wider"));
-        e.operator_ban("11.15.9.0/24".parse().unwrap(), 300 * SEC, "range".into()).unwrap();
+        assert!(e.operator_ban("11.48.43.0/24".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("protected"));
+        assert!(e.operator_ban("11.12.0.0/12".parse().unwrap(), 300 * SEC, "x".into()).unwrap_err().contains("wider"));
+        e.operator_ban("11.18.9.0/24".parse().unwrap(), 300 * SEC, "range".into()).unwrap();
         assert!(e
-            .operator_ban("11.15.9.7".parse().unwrap(), 300 * SEC, "x".into())
+            .operator_ban("11.18.9.7".parse().unwrap(), 300 * SEC, "x".into())
             .unwrap_err()
-            .contains("inside the ban on 11.15.9.0/24"));
+            .contains("inside the ban on 11.18.9.0/24"));
+    }
+
+    #[test]
+    fn waf_bans_follow_their_source() {
+        use crate::waf::{Decision, WafSource};
+        let mut e = engine();
+        e.enable_sharing(vec![]);
+        e.now = 100 * SEC;
+        let d = |net: &str, until: Option<Micros>, reason: &str| Decision {
+            net: net.parse().unwrap(),
+            until,
+            kind: "ban".into(),
+            origin: "crowdsec".into(),
+            reason: reason.into(),
+        };
+        let src = WafSource { name: "crowdsec".into(), ..Default::default() };
+        let ten_hours = Some(100 * SEC + 10 * 3600 * SEC);
+        let mut decisions = vec![
+            d("11.18.9.9", ten_hours, "crowdsecurity/http-probing"),
+            d("198.51.100.0/24", None, ""),
+            d("11.48.43.31", ten_hours, "allowlisted"),
+            d("11.12.0.0/12", ten_hours, "too wide"),
+            d("11.18.9.9", Some(200 * SEC), "a shorter one for the same address"),
+        ];
+        let (a, skipped) = e.waf_sync(&src, &decisions);
+        assert_eq!((bans(&a), skipped), (vec!["11.18.9.9".to_string(), "198.51.100.0/24".into()], 2));
+        assert!(a[0].message.contains("for 10h00m (waf crowdsec): crowdsecurity/http-probing"), "{}", a[0].message);
+        assert_eq!((a[0].category.as_deref(), a[0].evidence.len()), (Some("waf"), 1));
+        assert_eq!(a[1].until, Some(100 * SEC + 4 * 3600 * SEC), "[waf] default_ban without a duration");
+        assert_eq!(e.banned_by("11.18.9.9".parse().unwrap()).unwrap().reason, "waf crowdsec: crowdsecurity/http-probing");
+        assert_eq!(e.waf_bans("crowdsec").len(), 2);
+        assert!(e.waf_bans("other").is_empty());
+        assert_eq!(e.take_outbox(1000.0).iter().filter(|f| matches!(f, FactBody::Ban { forgeable: false, .. })).count(), 2);
+
+        // read again a minute later: nothing to do
+        e.now += 60 * SEC;
+        assert!(e.waf_sync(&src, &decisions).0.is_empty());
+        // two hours on, the plain list's 4 h ban has less than half left: renewed
+        e.now += 2 * 3600 * SEC;
+        let a = e.waf_sync(&src, &decisions).0;
+        assert_eq!(
+            a.iter().map(|a| (a.kind, a.target.unwrap().to_string())).collect::<Vec<_>>(),
+            [(ActionKind::Unban, "198.51.100.0/24".to_string()), (ActionKind::Ban, "198.51.100.0/24".into())]
+        );
+
+        // the WAF drops a decision: its ban is lifted, here and at the peers
+        decisions.remove(0);
+        let _ = e.take_outbox(1000.0);
+        let a = e.waf_sync(&src, &decisions).0;
+        assert_eq!(a.len(), 1);
+        assert!(a[0].kind == ActionKind::Unban && a[0].message.contains("lifted by waf crowdsec"), "{a:?}");
+        assert!(matches!(&e.take_outbox(1000.0)[..], [FactBody::Unban { .. }]));
+        // a ban logguard decided itself is never the WAF's to lift
+        e.on_event(&ev(e.now / SEC, "11.18.9.10", Signal::SshCanary).account(Some("root")));
+        assert!(e.banned_by("11.18.9.10".parse().unwrap()).is_some());
+        assert!(e.waf_sync(&src, &decisions).0.is_empty());
+        assert!(e.banned_by("11.18.9.10".parse().unwrap()).is_some());
+
+        // not shared: nothing for the peers; a recent login protects the address
+        let quiet = WafSource { name: "local".into(), share: false, ..Default::default() };
+        let _ = e.take_outbox(1000.0);
+        let now = e.now;
+        e.on_event(&Event::new(now, "5.5.5.9".parse().unwrap(), Signal::SshAuthOk).account(Some("user6")));
+        let (a, skipped) = e.waf_sync(&quiet, &[d("11.18.9.20", None, "x"), d("5.5.5.9", None, "a user's address")]);
+        assert_eq!((bans(&a), skipped), (vec!["11.18.9.20".to_string()], 1));
+        assert!(e.take_outbox(1000.0).is_empty());
     }
 
     #[test]
@@ -4224,6 +4867,7 @@ mod tests {
             evidence: vec![],
             notify: true,
             owner,
+            files: vec![],
         };
         let sent = |a: &[Action]| a.iter().filter(|a| a.topic == Some(Topic::Integrity)).count();
         let mut a = Vec::new();
@@ -4266,8 +4910,8 @@ mod tests {
     fn honeypot_hits_are_not_forgeable() {
         let mut e = engine();
         e.enable_sharing(vec![]);
-        let a = e.on_event(&ev(1, "11.14.8.8", Signal::TripwireConnect).port(Some(2323)));
-        assert_eq!(bans(&a), vec!["11.14.8.8"]);
+        let a = e.on_event(&ev(1, "11.17.8.8", Signal::TripwireConnect).port(Some(2323)));
+        assert_eq!(bans(&a), vec!["11.17.8.8"]);
         assert_eq!(a[0].category.as_deref(), Some("tripwire"));
         let facts = e.take_outbox(10.0);
         assert!(
@@ -4275,7 +4919,7 @@ mod tests {
             "a completed handshake names its sender: {facts:?}"
         );
         // a logged-in address (a carrier NAT neighbour) is still excused, as for blocked SYNs
-        let user = "11.14.8.9";
+        let user = "11.17.8.9";
         e.on_event(&ev(2, user, Signal::SshAuthOk).account(Some("gw")));
         assert!(bans(&e.on_event(&ev(3, user, Signal::TripwireConnect).port(Some(2323)))).is_empty());
     }

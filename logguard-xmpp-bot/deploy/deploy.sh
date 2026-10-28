@@ -6,13 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 HOST=${1:-xmpp}
-TARGET=x86_64-unknown-linux-musl
+# An ARM server: TARGET=aarch64-unknown-linux-musl (or armv7-unknown-linux-musleabihf) ./deploy/deploy.sh ...
+export TARGET=${TARGET:-x86_64-unknown-linux-musl}   # ci.sh builds it
 
 ./scripts/ci.sh
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-cp "target/$TARGET/release/logguard-xmpp-bot" deploy/logguard-xmpp-bot.service deploy/logguard-xmpp-bot.logrotate deploy/ejabberd-logs.logrotate deploy/install.sh "$STAGE/"
+cp "target/$TARGET/release/logguard-xmpp-bot" deploy/logguard-xmpp-bot.service deploy/logguard-xmpp-bot-client.service \
+    deploy/logguard-xmpp-bot.logrotate deploy/ejabberd-logs.logrotate deploy/install.sh "$STAGE/"
 
 # The staging directory belongs to the SSH user, who could swap files between the copy and
 # the root shell: root copies it into a private directory first and checks every file

@@ -96,7 +96,7 @@ pub fn replay(cfg: Arc<Config>, opts: &ReplayOpts, mut on_action: impl FnMut(&Ac
     let mut pipe = Pipeline::new(Arc::clone(&cfg), 0);
     if cfg.geo.enabled {
         // Labels from an already downloaded database; replay never downloads.
-        match crate::geo::GeoDb::load(&cfg.geo.dir) {
+        match crate::geo::GeoDb::open(&cfg.geo) {
             Ok(db) => pipe.engine.geo = Some(Arc::new(db)),
             Err(e) => eprintln!("logguard: no place labels: {e:#}"),
         }

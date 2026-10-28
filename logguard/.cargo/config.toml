@@ -1,5 +1,15 @@
-# Static Linux build from macOS without a C cross toolchain:
-#   cargo build --release --target x86_64-unknown-linux-musl
+# Static Linux builds from macOS without a C cross toolchain:
+#   cargo build --release --target x86_64-unknown-linux-musl          (amd64)
+#   cargo build --release --target aarch64-unknown-linux-musl         (arm64)
+#   cargo build --release --target armv7-unknown-linux-musleabihf     (32-bit ARM, ARMv7 hard-float)
 [target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static"]

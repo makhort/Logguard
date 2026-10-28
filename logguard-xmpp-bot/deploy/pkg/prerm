@@ -1,0 +1,11 @@
+#!/bin/bash
+# logguard-xmpp-bot's package, before its files are removed. dpkg runs it as  prerm remove|
+# upgrade..., rpm as %preun with 0 (removal) or 1 (upgrade): the same script for both. On
+# removal the bot stops, whichever mode's unit runs it; an upgrade keeps it running (postinst
+# restarts it).
+set -eu
+case ${1:-} in remove | 0) ;; *) exit 0 ;; esac
+if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+    systemctl disable --now -q logguard-xmpp-bot.service logguard-xmpp-bot-client.service 2> /dev/null || true
+fi
+exit 0

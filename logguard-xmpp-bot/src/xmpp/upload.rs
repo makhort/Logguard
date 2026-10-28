@@ -1,8 +1,8 @@
 //! Sending the outbox to the admin: HTTP File Upload (XEP-0363) of files encrypted as
 //! OMEMO media (XEP-0454), announced in OMEMO messages. Nothing is ever sent unencrypted.
+//! (Client mode's outbox goes through [`super::client`], which falls back to OpenPGP files.)
 
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use tokio_xmpp::parsers::http_upload::{SlotRequest, SlotResult};
 use tokio_xmpp::parsers::ns;
 use tokio_xmpp::IqRequest;
 
-use super::{Session, MAX_BACKLOG};
+use super::{Role, Session, MAX_BACKLOG};
 use crate::commands::{Attachment, Reply};
 use crate::outbox;
 
@@ -145,7 +145,7 @@ impl Session {
         let candidates: Vec<Jid> = match &self.upload.configured {
             Some(j) => vec![j.clone()],
             None => {
-                let domain: Jid = self.bot.domain.parse().map_err(|e| format!("domain: {e}"))?;
+                let domain: Jid = self.domain.parse().map_err(|e| format!("domain: {e}"))?;
                 let query = Element::builder("query", ns::DISCO_ITEMS).build();
                 let items = self.iq(Some(domain.clone()), IqRequest::Get(query)).await.map_err(|e| format!("disco#items: {}", e.text))?;
                 let mut list = vec![domain];
@@ -170,13 +170,19 @@ impl Session {
 
     /// Encrypts and uploads `plain` as `filename`; returns the aesgcm:// URL.
     async fn upload_encrypted(&mut self, filename: &str, plain: &[u8]) -> Result<String, String> {
-        let service = self.upload_service().await?;
         let sealed = outbox::seal(plain);
-        let size = sealed.data.len() as u64;
+        let get = self.upload(filename, &sealed.data, "application/octet-stream").await?;
+        outbox::aesgcm_url(&get, &sealed.iv, &sealed.key)
+    }
+
+    /// Uploads `data` (already encrypted) as `filename`; returns the download URL.
+    pub(super) async fn upload(&mut self, filename: &str, data: &[u8], content_type: &str) -> Result<String, String> {
+        let service = self.upload_service().await?;
+        let size = data.len() as u64;
         if service.max_size.is_some_and(|m| size > m) {
             return Err(format!("{size} bytes is more than the upload service takes ({:?})", service.max_size));
         }
-        let request = SlotRequest { filename: filename.into(), size, content_type: Some("application/octet-stream".into()) };
+        let request = SlotRequest { filename: filename.into(), size, content_type: Some(content_type.into()) };
         let slot = self.iq(Some(service.jid.clone()), IqRequest::Get(request.into())).await.map_err(|e| {
             // a stale service (the server's configuration changed): find it again next time
             self.upload.service = None;
@@ -185,15 +191,22 @@ impl Session {
         let slot = SlotResult::try_from(slot.ok_or("empty upload slot")?).map_err(|e| format!("upload slot: {e}"))?;
         let headers: Vec<(String, String)> = slot.put.headers.iter().map(|h| (h.name.as_str().to_string(), h.value.clone())).collect();
         let put = slot.put.url.clone();
-        let result = self.alongside(tokio::time::timeout(PUT_TIMEOUT, http_put(&put, &headers, &sealed.data))).await;
+        let result = self.alongside(tokio::time::timeout(PUT_TIMEOUT, http_put(&put, &headers, data))).await;
         result.map_err(|_| "upload timed out".to_string())??;
-        outbox::aesgcm_url(&slot.get.url, &sealed.iv, &sealed.key)
+        Ok(slot.get.url)
     }
 
     /// Uploads `plain` encrypted and sends `bare` a line saying what it is (`intro`), then
     /// the file's aesgcm:// URL. Both OMEMO-encrypted, for `bare`'s trusted devices (and
     /// `also`, the device that asked); without one, nothing is sent.
-    async fn send_file(&mut self, bare: &str, also: Option<u32>, filename: &str, plain: &[u8], intro: String) -> Result<(), String> {
+    pub(super) async fn send_file(
+        &mut self,
+        bare: &str,
+        also: Option<u32>,
+        filename: &str,
+        plain: &[u8],
+        intro: String,
+    ) -> Result<(), String> {
         let to: Jid = bare.parse().map_err(|e| format!("JID {bare}: {e}"))?;
         let url = self.upload_encrypted(filename, plain).await?;
         self.send_encrypted(to.clone(), bare, also, &Reply::from(intro)).await?;
@@ -202,12 +215,13 @@ impl Session {
 
     /// A command's file for the user who sent it (`/export`), from the device that asked.
     pub(super) async fn send_attachment(&mut self, sender: &str, device: u32, attachment: &Attachment) {
-        let t = self.bot.language_of(sender).texts();
+        let Role::Admin(bot) = &self.role else { return };
+        let t = self.texts(sender);
         let intro = t
             .export_file
             .replace("{file}", &attachment.filename)
             .replace("{kb}", &attachment.data.len().div_ceil(1024).to_string())
-            .replace("{days}", &self.bot.retention.files.to_string());
+            .replace("{days}", &bot.retention.files.to_string());
         match self.send_file(sender, Some(device), &attachment.filename, &attachment.data, intro).await {
             Ok(()) => log::info!("{sender}: {} sent (OMEMO media)", attachment.filename),
             Err(e) => {
@@ -222,22 +236,24 @@ impl Session {
 
     /// Sends one outbox file to the admin: a line saying what it is, then the file.
     /// Both OMEMO-encrypted; without a trusted admin device nothing is sent.
-    async fn send_outbox_file(&mut self, path: &Path) -> Result<(), String> {
-        let admin = self.bot.admin_jid.clone();
-        let filename = path.file_name().and_then(|n| n.to_str()).ok_or("file name is not UTF-8")?.to_string();
-        let plain = std::fs::read(path).map_err(|e| format!("reading: {e}"))?;
-        let summary = outbox::summary(&String::from_utf8_lossy(&plain));
-        let intro = format!(
-            "📎 {filename} ({} KB), encrypted. The server deletes its (encrypted) copy after {} days.\n{summary}",
-            plain.len().div_ceil(1024),
-            self.bot.retention.files
-        );
-        self.send_file(&admin, None, &filename, &plain, intro).await
+    pub(super) async fn send_outbox_file(&mut self, filename: &str, plain: &[u8]) -> Result<(), String> {
+        let admin = self.admin_jid.clone();
+        let summary = outbox::summary(&String::from_utf8_lossy(plain));
+        // how long the server keeps uploads, as far as the bot knows (its own server's)
+        let kept = match &self.role {
+            Role::Admin(bot) => format!(" The server deletes its (encrypted) copy after {} days.", bot.retention.files),
+            Role::Client(_) => String::new(),
+        };
+        let intro = format!("📎 {filename} ({} KB), encrypted.{kept}\n{summary}", plain.len().div_ceil(1024));
+        self.send_file(&admin, None, filename, plain, intro).await
     }
 
     /// Sends what the outbox holds (while online) and deletes it; deletes unsent files
     /// older than the retention time.
     pub(super) async fn deliver_outbox(&mut self) {
+        if matches!(self.role, Role::Client(_)) {
+            return self.client_deliver_files().await;
+        }
         let dir = self.upload.outbox.clone();
         let pending = match outbox::scan(&dir, self.upload.max_age, std::time::SystemTime::now()) {
             Ok(p) => p,
@@ -254,14 +270,26 @@ impl Session {
                 Err(e) => log::error!("outbox: deleting {}: {e}", path.display()),
             }
         }
-        if pending.ready.is_empty() || !self.online {
+        if pending.ready.is_empty() {
             return;
         }
         if self.omemo.is_none() {
             return log::warn!("outbox: {} file(s) waiting, but OMEMO is off and files go out encrypted only", pending.ready.len());
         }
+        if !self.server_answers().await {
+            return;
+        }
         for path in pending.ready {
-            match self.send_outbox_file(&path).await {
+            let file = path.file_name().and_then(|n| n.to_str()).map(String::from).ok_or_else(|| "file name is not UTF-8".to_string());
+            let sent = match file.and_then(|f| std::fs::read(&path).map(|d| (f, d)).map_err(|e| format!("reading: {e}"))) {
+                Ok((name, plain)) => self.send_outbox_file(&name, &plain).await,
+                Err(e) => Err(e),
+            };
+            match sent {
+                Ok(()) if !self.delivered().await => {
+                    log::warn!("outbox: {} not confirmed by the server; sending it again later", path.display());
+                    break;
+                }
                 Ok(()) => {
                     log::info!("outbox: {} sent to the admin (OMEMO media)", path.display());
                     if let Err(e) = std::fs::remove_file(&path) {
@@ -280,9 +308,13 @@ impl Session {
 impl Session {
     /// Sends logguard's alert messages in the outbox to the admin, OMEMO-encrypted (see
     /// [`outbox`]). Without OMEMO, a connection or a trusted admin device, they stay, and
-    /// logguard sends them itself after its grace time.
+    /// logguard sends them itself after its grace time. Each is deleted only once the server
+    /// confirmed it ([`Session::delivered`]).
     pub(super) async fn deliver_messages(&mut self) {
-        if !self.online || self.omemo.is_none() {
+        if matches!(self.role, Role::Client(_)) {
+            return self.client_deliver_alerts().await;
+        }
+        if self.omemo.is_none() {
             return;
         }
         let dir = self.upload.outbox.clone();
@@ -291,6 +323,9 @@ impl Session {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => return log::warn!("outbox {}: {e}", dir.display()),
         };
+        if waiting.is_empty() || !self.server_answers().await {
+            return;
+        }
         for path in waiting {
             let sending = outbox::claimed(&path, "sending");
             match std::fs::rename(&path, &sending) {
@@ -303,7 +338,7 @@ impl Session {
                 }
             }
             let message = std::fs::read_to_string(&sending).ok().as_deref().and_then(outbox::parse_message);
-            let admin_bare = self.bot.admin_jid.clone();
+            let admin_bare = self.admin_jid.clone();
             let Some((to, text)) = message.filter(|(to, _)| *to == admin_bare) else {
                 log::warn!("outbox: {} is not a message for the admin; left to logguard", path.display());
                 let _ = std::fs::rename(&sending, outbox::claimed(&path, "rejected"));
@@ -314,6 +349,11 @@ impl Session {
                 Err(e) => Err(format!("admin JID: {e}")),
             };
             match sent {
+                Ok(()) if !self.delivered().await => {
+                    log::warn!("outbox: alert {} not confirmed by the server; sending it again", path.display());
+                    let _ = std::fs::rename(&sending, &path);
+                    break;
+                }
                 Ok(()) => {
                     log::info!("outbox: alert {} sent to the admin (OMEMO)", path.display());
                     if let Err(e) = std::fs::remove_file(&sending) {

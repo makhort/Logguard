@@ -33,8 +33,15 @@ pub struct ProcCfg {
     pub suspicious_ports: Vec<u16>,
     /// Programs (as `/proc/<pid>/comm` names them) left out of both checks.
     pub ignore_processes: Vec<String>,
-    /// Remote ports whose connections aren't watched.
+    /// Remote ports whose connections aren't watched (but shells and network tools are,
+    /// whatever the port).
     pub ignore_ports: Vec<u16>,
+    /// Report each new (program, remote port) pair after `learn`. False: only shells and
+    /// network tools talking out, and `suspicious_ports` (a desktop, where every new app talks).
+    pub new_outbound: bool,
+    /// AppImages run from a FUSE mount in `/tmp/.mount_*`: not reported as programs running
+    /// from a temporary directory. A program merely in a directory of that name still is.
+    pub allow_appimages: bool,
 }
 
 impl Default for ProcCfg {
@@ -46,6 +53,8 @@ impl Default for ProcCfg {
             suspicious_ports: vec![1337, 3333, 4444, 5555, 6666, 7777, 8333, 9999, 14433, 14444, 31337, 45560, 45700],
             ignore_processes: vec![],
             ignore_ports: vec![],
+            new_outbound: true,
+            allow_appimages: false,
         }
     }
 }
@@ -186,7 +195,9 @@ fn uid_of(dir: &Path) -> u32 {
 }
 
 /// Where packages put programs: a deleted file there was replaced by an upgrade.
-const SYSTEM_DIRS: [&str; 7] = ["/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/libx32/"];
+/// Where an update replaces a running program's file: the system's, and Snap's and Flatpak's
+/// (as an app sees itself, `/app`).
+const SYSTEM_DIRS: [&str; 9] = ["/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/libx32/", "/snap/", "/app/"];
 const TEMP_DIRS: [&str; 5] = ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/dev/mqueue/"];
 
 /// Why a program at `exe` (as `/proc/<pid>/exe` names it) shouldn't run, if it shouldn't.
@@ -206,7 +217,7 @@ pub fn odd_exe(exe: &str) -> Option<&'static str> {
     None
 }
 
-fn programs(proc: &Path, ignore: &[String]) -> Vec<Odd> {
+fn programs(proc: &Path, ignore: &[String], allow_appimages: bool) -> Vec<Odd> {
     let mut out = Vec::new();
     let own_ns = std::fs::read_link(proc.join("self/ns/mnt")).ok();
     let Ok(rd) = std::fs::read_dir(proc) else { return out };
@@ -217,6 +228,9 @@ fn programs(proc: &Path, ignore: &[String]) -> Vec<Odd> {
         let Ok(exe) = std::fs::read_link(dir.join("exe")) else { continue };
         let exe = crate::event::clean(&exe.display().to_string(), 300);
         let Some(why) = odd_exe(&exe) else { continue };
+        if allow_appimages && appimage(&dir, &exe) {
+            continue;
+        }
         let process = comm(&dir);
         if ignore.contains(&process) {
             continue;
@@ -243,7 +257,7 @@ pub fn scan(cfg: &ProcCfg) -> ProcReport {
     listening.extend(l6);
     let outward: Vec<(IpAddr, u16, u64)> = conns
         .into_iter()
-        .filter(|(lp, ip, rp, _)| !listening.contains(lp) && !is_non_global(*ip) && !cfg.ignore_ports.contains(rp))
+        .filter(|(lp, ip, _, _)| !listening.contains(lp) && !is_non_global(*ip))
         .map(|(_, ip, rp, inode)| (ip, rp, inode))
         .collect();
     if !outward.is_empty() {
@@ -251,7 +265,7 @@ pub fn scan(cfg: &ProcCfg) -> ProcReport {
         let mut seen = std::collections::HashSet::new();
         for (remote, port, inode) in outward {
             let Some((pid, process, uid)) = owners.get(&inode).cloned() else { continue };
-            if cfg.ignore_processes.contains(&process) || !seen.insert((process.clone(), remote, port)) {
+            if ignored(cfg, &process, port) || !seen.insert((process.clone(), remote, port)) {
                 continue;
             }
             r.outbound.push(Conn { process, pid, uid, remote, port });
@@ -260,8 +274,38 @@ pub fn scan(cfg: &ProcCfg) -> ProcReport {
             }
         }
     }
-    r.odd = programs(proc, &cfg.ignore_processes);
+    r.odd = programs(proc, &cfg.ignore_processes, cfg.allow_appimages);
     r
+}
+
+/// Connections not watched: of `ignore_processes`, and to `ignore_ports` unless a shell or
+/// network tool makes them (a reverse shell on port 443 is still one).
+fn ignored(cfg: &ProcCfg, process: &str, port: u16) -> bool {
+    cfg.ignore_processes.iter().any(|p| p == process) || (cfg.ignore_ports.contains(&port) && !SHELLS.contains(&process))
+}
+
+/// Whether `path` is on a FUSE file system, as `mountinfo` (a process's
+/// `/proc/<pid>/mountinfo`) shows its mounts: the longest mount point above it decides.
+fn on_fuse(mountinfo: &str, path: &str) -> bool {
+    let mut best: Option<(usize, bool)> = None;
+    for line in mountinfo.lines() {
+        // id parent major:minor root mountpoint options [optional...] - fstype source options
+        let Some((left, right)) = line.split_once(" - ") else { continue };
+        let Some(point) = left.split(' ').nth(4) else { continue };
+        let point = point.replace("\\040", " ");
+        let inside = path == point || path.starts_with(&format!("{}/", point.trim_end_matches('/')));
+        if inside && best.is_none_or(|(len, _)| point.len() >= len) {
+            best = Some((point.len(), right.split(' ').next().is_some_and(|t| t.starts_with("fuse"))));
+        }
+    }
+    best.is_some_and(|(_, fuse)| fuse)
+}
+
+/// An AppImage: its program under `/tmp/.mount_*`, on the FUSE mount the AppImage made.
+fn appimage(dir: &Path, exe: &str) -> bool {
+    exe.starts_with("/tmp/.mount_")
+        && !exe.ends_with(" (deleted)")
+        && std::fs::read_to_string(dir.join("mountinfo")).is_ok_and(|m| on_fuse(&m, exe))
 }
 
 /// The local user (not root) a process runs as, if known: the owner of its findings.
@@ -292,6 +336,8 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
             evidence: vec![],
             notify: true,
             owner: local_user(o.uid),
+            // the program as it runs: readable there even when its file was deleted
+            files: vec![format!("/proc/{}/exe", o.pid)],
         });
     }
     let (mut more, mut more_uids): (Vec<String>, BTreeSet<u32>) = (Vec::new(), BTreeSet::new());
@@ -300,7 +346,7 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
         let odd_port = cfg.suspicious_ports.contains(&c.port);
         let pair = (c.process.clone(), c.port);
         let known = b.pairs.contains(&pair);
-        if !shell && !odd_port && (known || learning) {
+        if !shell && !odd_port && (known || learning || !cfg.new_outbound) {
             if !known && b.pairs.len() < MAX_PAIRS {
                 b.pairs.insert(pair);
             }
@@ -331,6 +377,7 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
             evidence: vec![],
             notify: true,
             owner: local_user(c.uid),
+            files: vec![],
         });
         if !shell && !odd_port && b.pairs.len() < MAX_PAIRS {
             b.pairs.insert(pair);
@@ -346,6 +393,7 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
             notify: true,
             // one user's own, if they all are
             owner: (more_uids.len() == 1).then(|| more_uids.first().copied().and_then(local_user)).flatten(),
+            files: vec![],
         });
     }
     if !learning && !b.armed {
@@ -358,6 +406,7 @@ pub fn judge(baseline: &mut Option<ProcBaseline>, r: &ProcReport, cfg: &ProcCfg,
             evidence: vec![],
             notify: false,
             owner: None,
+            files: vec![],
         });
     }
     out
@@ -376,6 +425,49 @@ mod tests {
 ";
 
     #[test]
+    fn appimages_snaps_and_flatpaks() {
+        let mountinfo = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+            30 22 0:27 / /tmp rw,nosuid,nodev shared:5 - tmpfs tmpfs rw\n\
+            612 30 0:55 / /tmp/.mount_FooBar1 ro,nosuid,nodev,relatime shared:350 - fuse.Foo.AppImage Foo.AppImage ro,user_id=1000\n\
+            613 30 0:56 / /tmp/my\\040dir rw shared:351 - fuse.sshfs host: rw\n";
+        assert!(on_fuse(mountinfo, "/tmp/.mount_FooBar1/usr/bin/foo"), "the AppImage's own mount");
+        assert!(!on_fuse(mountinfo, "/tmp/.mount_Fake/x"), "a directory merely named so, on /tmp's tmpfs");
+        assert!(!on_fuse(mountinfo, "/tmp/.mount_FooBar10/x"), "a sibling with a longer name isn't inside");
+        assert!(on_fuse(mountinfo, "/tmp/my dir/x"), "escaped spaces");
+        assert!(!on_fuse(mountinfo, "/usr/bin/x"));
+        // updated while running: Snap's and Flatpak's places are like the system's
+        assert_eq!(odd_exe("/snap/firefox/5000/usr/lib/firefox/firefox (deleted)"), None);
+        assert_eq!(odd_exe("/app/bin/telegram (deleted)"), None);
+        assert!(odd_exe("/opt/x/y (deleted)").is_some());
+        assert!(odd_exe("/tmp/.mount_FooBar1/AppRun").is_some(), "without allow_appimages, as before");
+    }
+
+    #[test]
+    fn ignored_ports_never_hide_shells() {
+        let cfg = ProcCfg { ignore_ports: vec![443], ignore_processes: vec!["backup".into()], ..Default::default() };
+        assert!(ignored(&cfg, "firefox", 443));
+        assert!(!ignored(&cfg, "bash", 443) && !ignored(&cfg, "nc", 443), "a reverse shell on 443");
+        assert!(ignored(&cfg, "backup", 22) && !ignored(&cfg, "firefox", 22));
+    }
+
+    /// On a desktop (`new_outbound = false`): every new app talks; only shells, network tools
+    /// and the miners' and reverse shells' ports are reported.
+    #[test]
+    fn desktop_reports_only_dangerous_connections() {
+        let cfg = ProcCfg { new_outbound: false, learn: Dur(0), ..Default::default() };
+        let conn = |process: &str, port| Conn { process: process.into(), pid: 9, uid: 1000, remote: "8.8.8.8".parse().unwrap(), port };
+        let report = |outbound| ProcReport { scanned: time::SEC, available: true, outbound, odd: vec![] };
+        let mut b = None;
+        let f =
+            judge(&mut b, &report(vec![conn("steam", 27015), conn("slack", 443), conn("bash", 443), conn("xmrig", 3333)]), &cfg, &|_| None);
+        let keys: Vec<&str> = f.iter().map(|f| f.key.as_str()).filter(|k| k.starts_with("proc-out:")).collect();
+        assert_eq!(keys, ["proc-out:bash:443", "proc-out:xmrig:3333"]);
+        assert!(f.iter().filter(|f| f.key.starts_with("proc-out:")).all(|f| f.severity == Severity::High));
+    }
+
+    #[test]
+    // /proc/net fixtures as a little-endian kernel prints them (x86_64, ARM)
+    #[cfg(target_endian = "little")]
     fn outbound_connections_from_proc() {
         let (conns, listening) = parse_tcp(TCP);
         assert_eq!(listening.into_iter().collect::<Vec<_>>(), vec![22]);
@@ -439,5 +531,6 @@ mod tests {
         let f = judge(&mut None, &r, &cfg, &|_| None);
         let owners: Vec<Option<u32>> = f.iter().map(|f| f.owner).collect();
         assert_eq!(owners, [Some(1000), None, None, Some(1000), None], "{f:?}");
+        assert_eq!(f[0].files, ["/proc/9/exe"], "the program as it runs, even deleted");
     }
 }

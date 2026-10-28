@@ -16,6 +16,15 @@ const RETIRED: [(&str, &str); 2] = [
     ("subnets.wide_min_subnets", "subnet bans now grow step by step, see subnets.wide_max_step"),
 ];
 
+/// Options with a new name; the old one is still read (an alias).
+const RENAMED: [(&str, &str); 5] = [
+    ("sources.nextcloud", "sources.nextcloud_aio"),
+    ("silence.nextcloud", "silence.nextcloud_aio"),
+    ("nextcloud.docker", "nextcloud_aio.docker"),
+    ("nextcloud.apache_container", "nextcloud_aio.apache_container"),
+    ("nextcloud.log_file", "nextcloud_aio.log_file"),
+];
+
 /// Dotted key (`scoring.weights.fw_block`) -> value. Arrays (including arrays of tables
 /// such as `[[ratelimit]]`) are single values; empty tables are kept as values.
 fn flatten(prefix: &str, v: &Value, out: &mut BTreeMap<String, Value>) {
@@ -132,11 +141,16 @@ pub fn diff(installed: &str, old_defaults: Option<&str>, opts: &DiffOpts) -> Res
     section("UNKNOWN options in your file - logguard refuses to start until they are fixed or removed:", unknown);
     let retired: Vec<String> = RETIRED.iter().filter_map(|(k, why)| mine.get(*k).map(|v| format!("{k} = {}  ({why})", show(v)))).collect();
     section("Options no longer used (ignored; you can remove them):", retired);
+    let renamed: Vec<String> =
+        RENAMED.iter().filter_map(|(was, now)| mine.get(*was).map(|v| format!("{was} = {}  ->  {now} = {}", show(v), show(v)))).collect();
+    section("Renamed options (the old name still works; rename it in your file):", renamed);
 
     if let Some(old) = &old {
+        // a renamed option's new name isn't new for a file with the old one
+        let renamed_here = |k: &str| RENAMED.iter().any(|(was, now)| *now == k && mine.contains_key(*was));
         let new: Vec<String> = cur
             .iter()
-            .filter(|(k, _)| !old.contains_key(*k))
+            .filter(|(k, _)| !old.contains_key(*k) && !renamed_here(k))
             .map(|(k, v)| if mine.contains_key(k) { format!("{k} (already set in your file)") } else { format!("{k} = {}", show(v)) })
             .collect();
         section("New options in this version (defaults shown; add them to your file to change them):", new);
@@ -154,7 +168,11 @@ pub fn diff(installed: &str, old_defaults: Option<&str>, opts: &DiffOpts) -> Res
             })
             .collect();
         section("Changed defaults:", changed);
-        let removed: Vec<String> = old.keys().filter(|k| !cur.contains_key(*k) && !mine.contains_key(*k)).cloned().collect();
+        let removed: Vec<String> = old
+            .keys()
+            .filter(|k| !cur.contains_key(*k) && !mine.contains_key(*k) && !RENAMED.iter().any(|(was, _)| was == k))
+            .cloned()
+            .collect();
         section("Options removed in this version (not in your file, nothing to do):", removed);
     } else {
         let top = |k: &str| k.split('.').next().unwrap_or(k).to_string();
@@ -248,6 +266,35 @@ min_bad_ip = 3
             "{r}"
         );
         assert!(r.contains("subnets.wide_max_step = 2") && r.contains("Your file is valid"), "{r}");
+
+        // a renamed option: the old name in the file, the new one in this version's defaults
+        let before_rename = {
+            let mut t: toml::Table = old_defaults.parse().unwrap();
+            let sources = t["sources"].as_table_mut().unwrap();
+            let v = sources.remove("nextcloud_aio").unwrap();
+            sources.insert("nextcloud".into(), v);
+            let silence = t["silence"].as_table_mut().unwrap();
+            let v = silence.remove("nextcloud_aio").unwrap();
+            silence.insert("nextcloud".into(), v);
+            let aio = t.remove("nextcloud_aio").unwrap();
+            t.insert("nextcloud".into(), aio);
+            toml::to_string(&t).unwrap()
+        };
+        let r = diff("[sources]\nnextcloud = true\n", Some(&before_rename), &DiffOpts { all: false }).unwrap();
+        assert!(
+            r.contains("Renamed options (the old name still works; rename it in your file):\n  sources.nextcloud = true  ->  sources.nextcloud_aio = true\n"),
+            "{r}"
+        );
+        assert!(!r.contains("UNKNOWN") && !r.contains("  sources.nextcloud_aio = false"), "not new, nor unknown: {r}");
+        let r =
+            diff("[nextcloud]\napache_container = \"\"\n[silence]\nnextcloud = \"0s\"\n", Some(&before_rename), &DiffOpts { all: false })
+                .unwrap();
+        assert!(r.contains("  nextcloud.apache_container = \"\"  ->  nextcloud_aio.apache_container = \"\"\n"), "{r}");
+        assert!(r.contains("  silence.nextcloud = \"0s\"  ->  silence.nextcloud_aio = \"0s\"\n"), "{r}");
+        assert!(!r.contains("UNKNOWN") && !r.contains("  nextcloud_aio.apache_container = \"nextcloud-aio-apache\""), "{r}");
+        let r = diff("[sources]\nssh = true\n", Some(&before_rename), &DiffOpts { all: false }).unwrap();
+        assert!(r.contains("  sources.nextcloud_aio = false\n") && !r.contains("Renamed"), "{r}");
+        assert!(!r.contains("removed in this version (not in your file, nothing to do):\n  sources.nextcloud"), "{r}");
 
         let r = diff("mode = \"enforce\"\n[canary]\nssh = [\"root\"]\n", None, &DiffOpts { all: true }).unwrap();
         assert!(r.contains("[scoring] ("), "{r}");

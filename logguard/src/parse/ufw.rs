@@ -1,6 +1,7 @@
 //! UFW kernel log parsing (`[UFW BLOCK]`, `[UFW LIMIT BLOCK]`), IPv4 and IPv6,
 //! TCP and UDP alike. Hosts with plain iptables log the same way with a LOG rule of their
-//! own, prefix `[LOGGUARD BLOCK] ` (see the README, "Requirements").
+//! own, prefix `[LOGGUARD BLOCK] ` (see the README, "Requirements"); firewalld with
+//! `LogDenied` on as `filter_IN_<zone>_REJECT: ` / `_DROP: `, read as blocks too.
 
 use crate::event::{Event, Proto, Signal};
 use crate::net::parse_ip;
@@ -17,11 +18,28 @@ const PREFIXES: [&str; 2] = ["[UFW ", "[LOGGUARD "];
 /// banned. A process name holds 15 bytes at most, so it can't reach the `OUT=` that follows.
 fn firewall_line(msg: &str) -> Option<(&str, &str)> {
     let m = super::kernel::text(msg);
-    let rest = PREFIXES.iter().find_map(|p| m.strip_prefix(p))?;
-    let (action, fields) = rest.split_once(']')?;
-    let fields = fields.strip_prefix(' ')?;
+    let (action, fields) = match PREFIXES.iter().find_map(|p| m.strip_prefix(p)) {
+        Some(rest) => {
+            let (action, fields) = rest.split_once(']')?;
+            (action, fields.strip_prefix(' ')?)
+        }
+        None => firewalld_line(m)?,
+    };
     let mut f = fields.split(' ');
     (f.next()?.starts_with("IN=") && f.next()?.starts_with("OUT=")).then_some((action, fields))
+}
+
+/// firewalld's denied-packet prefix (`firewall-cmd --set-log-denied=unicast`):
+/// `filter_IN_<zone>_REJECT: ` or `_DROP: `, as `BLOCK`. Not logguard's own zone: those are
+/// banned sources already (as with nft, whose drops come before ufw logs anything).
+fn firewalld_line(m: &str) -> Option<(&'static str, &str)> {
+    let rest = m.strip_prefix("filter_IN_")?;
+    let (head, fields) = rest.split_once(": ")?;
+    let zone = head.strip_suffix("_REJECT").or_else(|| head.strip_suffix("_DROP"))?;
+    if zone.is_empty() || zone == crate::enforce::FIREWALLD_ZONE || !zone.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) {
+        return None;
+    }
+    Some(("BLOCK", fields))
 }
 
 /// Whether a kernel message is a firewall log line this parser reads.
@@ -72,13 +90,13 @@ mod tests {
 
     #[test]
     fn tcp_udp_v6_and_limit() {
-        let tcp = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.4 DST=11.24.39.236 LEN=44 TOS=0x00 PREC=0x00 TTL=242 ID=54321 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0");
+        let tcp = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.4 DST=11.29.39.236 LEN=44 TOS=0x00 PREC=0x00 TTL=242 ID=54321 PROTO=TCP SPT=1 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0");
         assert_eq!((tcp[0].signal, tcp[0].port), (Signal::FwBlock, Some(23)));
-        let udp = parse("[12.3] [UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.5 DST=11.24.39.236 LEN=50 TOS=0x00 PREC=0x00 TTL=50 ID=1 PROTO=UDP SPT=5 DPT=161 LEN=30");
+        let udp = parse("[12.3] [UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.5 DST=11.29.39.236 LEN=50 TOS=0x00 PREC=0x00 TTL=50 ID=1 PROTO=UDP SPT=5 DPT=161 LEN=30");
         assert_eq!((udp[0].port, udp[0].proto), (Some(161), Proto::Udp));
         let v6 = parse("[UFW BLOCK] IN=eth0 OUT= MAC=aa SRC=2001:db8::1 DST=2001:db8::2 LEN=80 TC=0 HOPLIMIT=50 FLOWLBL=0 PROTO=TCP SPT=1 DPT=22 WINDOW=1 RES=0x00 SYN URGP=0");
         assert_eq!(v6[0].ip.to_string(), "2001:db8::1");
-        let lim = parse("[UFW LIMIT BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.6 DST=11.24.39.236 LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=1 DF PROTO=TCP SPT=5 DPT=9843 WINDOW=1 RES=0x00 SYN URGP=0");
+        let lim = parse("[UFW LIMIT BLOCK] IN=eth0 OUT= MAC=aa SRC=1.2.3.6 DST=11.29.39.236 LEN=60 TOS=0x00 PREC=0x00 TTL=50 ID=1 DF PROTO=TCP SPT=5 DPT=9843 WINDOW=1 RES=0x00 SYN URGP=0");
         assert_eq!(lim[0].signal, Signal::FwLimit);
         assert!(parse("[UFW AUDIT] IN=eth0 SRC=1.1.1.1 DPT=1").is_empty());
     }
@@ -97,6 +115,19 @@ mod tests {
 
     /// A program any local user names and crashes makes the kernel log its name (15 bytes
     /// at most) at the start and its file name further on: neither makes a firewall line.
+    #[test]
+    fn firewalld_denied_packets() {
+        let e = parse("filter_IN_public_REJECT: IN=eth0 OUT= MAC=aa SRC=198.51.100.9 DST=192.0.2.1 LEN=44 PROTO=TCP SPT=1 DPT=3389 WINDOW=1024 SYN URGP=0");
+        assert_eq!(e.len(), 1);
+        assert_eq!((e[0].signal, e[0].port, e[0].ip.to_string()), (Signal::FwBlock, Some(3389), "198.51.100.9".to_string()));
+        assert_eq!(parse("[5.1] filter_IN_drop_DROP: IN=eth0 OUT= SRC=2001:db8::9 DST=2001:db8::1 PROTO=UDP SPT=5 DPT=161").len(), 1);
+        // logguard's own zone holds the banned sources: not counted again
+        assert!(parse("filter_IN_logguard_DROP: IN=eth0 OUT= SRC=198.51.100.9 DST=192.0.2.1 PROTO=TCP SPT=1 DPT=22").is_empty());
+        assert!(parse("filter_IN_public_ACCEPT: IN=eth0 OUT= SRC=198.51.100.9 PROTO=TCP DPT=22").is_empty());
+        assert!(parse("filter_IN__DROP: IN=eth0 OUT= SRC=198.51.100.9 PROTO=TCP DPT=22").is_empty());
+        assert!(parse("filter_IN_public_DROP: segfault IN= OUT= SRC=198.51.100.9 DPT=23").is_empty(), "IN= must follow");
+    }
+
     #[test]
     fn crashing_programs_cannot_forge_blocks() {
         let forged = [

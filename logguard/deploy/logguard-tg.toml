@@ -6,6 +6,8 @@
 # templates have the lines, commented out) and its address to ufw there (install.sh does).
 # `logguard -c /etc/logguard/logguard.toml print-config` shows every effective setting.
 mode = "shadow"
+# "apt": dpkg and apt (Debian, Ubuntu); "dnf": rpm and dnf (Fedora, RHEL; the -dnf templates)
+package_manager = "apt"
 state_file = "/var/lib/logguard/state.json"
 socket = "/run/logguard/logguard.sock"
 actions_log = "/var/log/logguard/actions.jsonl"
@@ -16,7 +18,15 @@ ssh = true
 ufw = true
 oom = true                # alert when the kernel kills a process for lack of memory ("system" topic)
 privilege = true          # su and sudo: failures (someone has an account and tries for root) as alerts
+pam = true                # PAM and account tools: console/polkit login failures, lockouts, passwords, new accounts and admins
+audit = true              # the audit log: the same as the kernel records them, auditd stopped or switched off
+audit_keys = []           # audit rule keys (auditctl -k) to alert on when their rules fire, e.g. ["identity"]; "*" for any
+# audit_log = "/var/log/audit/audit.log"   # auditd's file instead of the journal (journald with Audit=no)
 services = ["logguard-tg-bot.service"]   # a failed logguard-tg-bot becomes a system alert, relayed to the XMPP admin
+# Built-in sources for common services (README, "Built-in sources for common services"):
+# apache, nginx, haproxy, prosody, nextcloud (without AIO), owncloud (10), mysql (MariaDB too),
+# postgresql, mongodb, redis (Valkey too), postfix, dovecot, logguard-web (the web console). Their logs are looked for in the usual places; [sources.app_logs] names others.
+apps = []
 
 [ports]
 # Nothing is served here: logguard-tg-bot only connects out (HTTPS to api.telegram.org).
@@ -56,6 +66,7 @@ except = []
 [silence]                 # warn when UFW or sshd logging goes quiet ("0s" = never)
 ufw = "2h"
 ssh = "2d"
+# [silence.apps]           # logs of [sources] apps to warn about when quiet, e.g. nginx_access = "2h"
 
 # Kernel rate limits on new connections per source address (enforce mode, nftables only).
 [[ratelimit]]
@@ -67,7 +78,7 @@ burst = 6
 nets = [
   "127.0.0.0/8",
   "::1",
-  "11.42.43.31",
+  "11.48.43.31",
   # Upstream DNS (UDP sources can be spoofed: a forged flood "from" a resolver must never ban it).
   "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
 ]
@@ -82,7 +93,7 @@ ladder = ["1h", "6h", "1d", "7d", "30d"]
 forgive_after = "30d"
 
 [enforce]
-backend = "auto"          # nftables (prerouting, so Docker-published ports are covered), falling back to ufw, then iptables
+backend = "auto"          # nftables (prerouting, so Docker-published ports are covered), falling back to firewalld, ufw, then iptables
 
 [notify]
 # No ejabberd here: admin messages (this node's, and the ones the other nodes relay) go only
@@ -94,6 +105,14 @@ tg_user = "logguard-tg-bot"
 # The mail bot can relay here too (or instead: drop tg_outbox): logguard-mail-bot's README.
 #mail_outbox = "/opt/logguard-mail-bot/outbox"
 #mail_user = "logguard-mail-bot"
+# So can the Signal and Matrix bots: logguard-signal-bot's and logguard-matrix-bot's READMEs.
+#signal_outbox = "/opt/logguard-signal-bot/outbox"
+#signal_user = "logguard-signal-bot"
+#matrix_outbox = "/opt/logguard-matrix-bot/outbox"
+#matrix_user = "logguard-matrix-bot"
+# So can logguard-xmpp-bot in client mode (BOT_MODE=client, an account on any XMPP server; its README).
+#xmpp_outbox = "/opt/logguard-xmpp-bot/outbox"
+#xmpp_user = "logguard-xmpp-bot"
 bot_stuck_after = "1h"            # then a system alert, relayed to the XMPP admin
 
 [cluster]
@@ -103,7 +122,7 @@ bot_stuck_after = "1h"            # then a system alert, relayed to the XMPP adm
 enabled = true
 node_id = "tg"
 listen = "0.0.0.0:7946"            # install.sh opens it in ufw for the peers below only
-peers = ["11.24.39.236:7946", "11.32.48.86:7946"]   # xmpp, vpn; peers are never banned here
+peers = ["11.29.39.236:7946", "11.38.48.86:7946"]   # xmpp, vpn; peers are never banned here
 key_file = "/etc/logguard/cluster.key"
 rotate_after = "180d"             # then a weekly reminder to run deploy/rotate-cluster-key.sh
 sync_interval = "10s"
@@ -114,6 +133,14 @@ full_sync_every = "10m"
 share = ["notices"]
 accept = ["bans", "unbans", "reports", "trust", "notices"]
 relay_notices = true
+# Optional: node identities. Each node signs what it shares with a key of its own, so a node
+# broken into (or a stolen cluster key) can speak only for itself, and deleting a node's line
+# in `nodes` drops it without a new cluster key. `logguard cluster-identity --out
+# /etc/logguard/node.key` on each node prints its line for `nodes`. Same `nodes` on every node;
+# require_signatures once every node signs (README, "Node identities").
+#identity_file = "/etc/logguard/node.key"
+#nodes = { xmpp = "<public key>", vpn = "<public key>", tg = "<public key>" }
+#require_signatures = true
 # Bans learned from peers last at most this long here. The built-in default (1d) limits what a
 # compromised or mistaken node can do to the others; both nodes here are equally trusted, so
 # mirror the origin's full ban ladder (a peer's 7d ban is 7d here too).
@@ -155,6 +182,13 @@ max_growth = 2.0          # refuse a refresh covering >2x the last accepted list
 # database (needs [geo] with asn_url): Spamhaus ASN-DROP lists hijacked and criminal networks.
 asn_urls = ["https://www.spamhaus.org/drop/asndrop.json"]
 
+[console]
+# The read-only socket for logguard-web, the web console (logguard-web/README.md): its group
+# reads this node's snapshot, digest preview and abuse reports there, never bans or unbans.
+# Empty: off.
+socket = ""                # "/run/logguard-console/console.sock" with logguard-web installed
+group = "logguard-web"
+
 [digest]
 # One summary message per day at `at` (UTC): bans by cause, top offenders, alerts,
 # exposure, cluster, feeds and certificate expiry.
@@ -178,7 +212,19 @@ asn_url = "https://download.db-ip.com/free/dbip-asn-lite-{month}.csv.gz"
 # asn_url = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
 dir = "/var/lib/logguard/geo"
 refresh = "7d"
+# Networks the lite database places in the wrong country, pinned to the right one (an ISO
+# code or a name). Labels, accounts' countries and counters use it; [geoblock] doesn't.
+#places = { "198.51.100.0/24" = "GE" }
 
+
+[geoblock]
+# Drop whole countries or networks (ASNs), by the [geo] databases above: no other database and
+# no download, only the firewall's sets. DB-IP's lite data misplaces some addresses: coarse.
+# Never dropped: the allowlist, this host, the cluster peers. Backends nft, ipset, firewalld.
+enabled = false
+countries = []            # e.g. ["CN", "Russia"]: ISO codes or names
+only_countries = []       # e.g. ["UA", "DE"]: every other country dropped (federation, CDNs, ...)
+asns = []                 # e.g. [64500]
 [cron]
 # New or changed scheduled tasks are a classic sign of a break-in. Watched: /etc/crontab,
 # /etc/cron.d/*, every user's crontab (what `crontab -l` shows), /etc/cron.{hourly,daily,
@@ -194,7 +240,7 @@ learn = "1d"
 # dirs = ["/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/etc/cron.yearly", "/etc/systemd/system/timers.target.wants"]
 scripts = true
 # Other files whose changes are reported (`*` within one path component, in any component):
-# SSH keys, sudoers, users, sshd settings, PAM, apt hooks, programs installed by hand,
+# SSH keys, sudoers, users, sshd settings, PAM, apt and dnf hooks, programs installed by hand,
 # systemd units, preloaded libraries. Files of a pattern added later are learned
 # silently; files of a removed pattern are forgotten.
 # files = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/sudoers.d/*",
@@ -202,7 +248,8 @@ scripts = true
 #          "/root/.ssh/authorized_keys2", "/home/*/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys2",
 #          "/etc/ssh/authorized_keys/*", "/etc/ld.so.preload", "/etc/ld.so.conf.d/*", "/etc/rc.local",
 #          "/etc/profile.d/*", "/etc/environment", "/etc/bash.bashrc", "/root/.bashrc", "/root/.profile",
-#          "/etc/pam.d/*", "/etc/apt/apt.conf.d/*", "/etc/update-motd.d/*", "/etc/modules-load.d/*",
+#          "/etc/pam.d/*", "/etc/apt/apt.conf.d/*", "/etc/dnf/plugins/post-transaction-actions.d/*",
+#          "/etc/dnf/libdnf5-plugins/actions.d/*", "/etc/update-motd.d/*", "/etc/modules-load.d/*",
 #          "/etc/modprobe.d/*", "/etc/udev/rules.d/*", "/etc/init.d/*", "/usr/local/bin/*", "/usr/local/sbin/*",
 #          "/etc/systemd/system/*", "/etc/systemd/system/*.wants/*", "/etc/systemd/system/*.d/*.conf"]
 dpkg_db = "/var/lib/dpkg"       # read directly (no dpkg process); "" on hosts without dpkg
@@ -216,6 +263,16 @@ dpkg_db = "/var/lib/dpkg"       # read directly (no dpkg process); "" on hosts w
 enabled = false            # ClamAV is not installed here; apt install clamav clamav-freshclam, then true
 log = "/var/log/logguard/avscan.log"
 stale_after = "36h"
+# Scans of the files the integrity watches report new or changed (cron jobs and their
+# scripts, watched files, changed package files, set-uid programs, programs running from
+# /tmp or deleted): "none", "clamav", "yara" or "both". Infected files are high alerts.
+# clamscan and yara run outside logguard's memory limit (systemd-run, scan_memory).
+scan_changed = "none"
+# yara_rules = ["/etc/logguard/yara"]      # .yar/.yara files, directories of them, or one .yarc
+# clamd_socket = "/run/clamav/clamd.ctl"   # while it exists, files go to clamd (Fedora: /run/clamd.scan/clamd.sock)
+# scan_memory = "2G"
+# scan_timeout = "30m"
+# scan_max_mb = 100
 
 [journal]
 journalctl = "/usr/bin/journalctl"
@@ -271,6 +328,20 @@ interval = "60s"
 learn = "3d"
 ignore_processes = []
 ignore_ports = []
+
+[ssh_audit]
+# Hourly: sshd's effective settings (sshd -T, with -C for root and the gateway users, so Match
+# blocks count) checked against good practice and this host's layout: a plain VPS, a hosting
+# panel (cPanel/WHM, Plesk, ...), or a gateway like harden-vps.sh's (one key-only user forced
+# into the su/sftp wrapper, su limited by pam_wheel, root-owned key files, no root login).
+# New problems and changed settings are alerts; `logguard ssh-audit` shows all, with fixes.
+enabled = true
+interval = "1h"
+profile = "auto"             # auto | standard | gateway
+gateway_users = []           # empty: AllowUsers' users with a ForceCommand
+su_group = "gw-su"
+ignore = []                  # problem ids, e.g. ["x11-forwarding", "gateway-port"]
+remind = "7d"                # high problems still open, again
 
 # Log lines of your own (a service logguard has no parser for): a regex with the client
 # address in group `ip` (and the account in `user`), over a systemd unit's journal lines or a

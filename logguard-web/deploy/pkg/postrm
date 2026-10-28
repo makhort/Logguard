@@ -1,0 +1,19 @@
+#!/bin/bash
+# logguard-web's package, after its files are removed. dpkg runs it as  postrm remove|purge|
+# upgrade..., rpm as %postun with 0 (removal) or 1 (upgrade): the same script for both.
+# config.env, the web key, the password and TOTP files and the certificate stay on removal;
+# dpkg's purge takes them too (rpm has no purge: remove them by hand). The system user stays
+# either way (userdel logguard-web removes it).
+set -eu
+case ${1:-} in
+    remove | 0)
+        if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+            systemctl daemon-reload 2> /dev/null || true
+        fi
+        echo "logguard-web: /opt/logguard-web stays (dpkg: apt purge logguard-web removes it)"
+        ;;
+    purge)
+        rm -rf /opt/logguard-web
+        ;;
+esac
+exit 0

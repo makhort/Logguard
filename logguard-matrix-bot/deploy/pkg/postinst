@@ -1,0 +1,185 @@
+#!/bin/bash
+# logguard-matrix-bot's package, after its files are unpacked. dpkg runs it as  postinst configure
+# [old-version]  (also for dpkg-reconfigure), rpm as %post with 1 (first install) or 2
+# (upgrade): the same script for both.
+#
+# What the bundle's install.sh does, less the files the package puts in place itself: the
+# system user, /opt/logguard-matrix-bot and config.env from the template (the first time), the
+# owners and modes, the outbox and the log directory. It also takes over an install from a
+# bundle or deploy.sh: its unit in /etc/systemd/system (it would shadow the package's) and its
+# rollback files go; config.env, the state and the keys stay. The bot is restarted only when
+# it was running and its config is filled in; a first install prints what to fill in and
+# starts nothing.
+#
+# Asked, when a terminal is there: whether to replace config.env with this version's template
+# (the old one kept as config.env.old). Enter, a timeout, no terminal, or
+# DEBIAN_FRONTEND=noninteractive keep it. LOGGUARD_PACKAGE_CONFIG=keep|replace answers without
+# asking (sudo LOGGUARD_PACKAGE_CONFIG=replace apt install ./logguard-matrix-bot_*.deb).
+set -eu
+
+BOT=logguard-matrix-bot
+DIR=/opt/$BOT
+UNIT=$BOT.service
+OLD_UNIT=/etc/systemd/system/$UNIT
+WANTS=/etc/systemd/system/multi-user.target.wants/$UNIT
+
+case ${1:-} in
+    configure | 1 | 2 | [3-9]*) ;;
+    *) exit 0 ;;   # abort-upgrade and the like: nothing to do
+esac
+systemd() { [ -d /run/systemd/system ] && command -v systemctl > /dev/null; }
+sc() { systemctl "$@" 2> /dev/null || true; }
+note() { echo "$BOT: $*"; }
+setting() { # the value of $1 in config.env, quotes removed
+    grep -E "^$1=" "$DIR/config.env" 2> /dev/null | tail -n 1 | cut -d= -f2- | tr -d "\"'" || true
+}
+# logguard's integrity watch covers the account files and the enabled units: announce what
+# changes, so it is logged instead of raised as a high alert. logguard is the package's
+# (/usr/bin) or a bundle's (/usr/local/bin).
+LG=""
+for b in /usr/bin/logguard /usr/local/bin/logguard; do
+    if [ -x "$b" ] && [ -f /etc/logguard/logguard.toml ]; then LG=$b; break; fi
+done
+announce() { [ -n "$LG" ] && "$LG" --config /etc/logguard/logguard.toml expect-change "$@" 2> /dev/null || true; }
+announce_accounts() {
+    local f files=()
+    for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do [ -f "$f" ] && files+=("$f"); done
+    announce "${files[@]}"
+}
+
+# A system user of its own, without a home or a shell.
+if ! id "$BOT" > /dev/null 2>&1; then
+    useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$BOT"
+    note "created the system user $BOT"
+    announce_accounts
+fi
+
+mkdir -p "$DIR"
+first=no
+if [ ! -f "$DIR/config.env" ]; then
+    install -m 0640 -o root -g "$BOT" "$DIR/config.env.example" "$DIR/config.env"
+    first=yes
+    note "new $DIR/config.env from the template"
+else
+    # The config stays (the default), or this version's template replaces it.
+    replace=${LOGGUARD_PACKAGE_CONFIG:-}
+    if [ -z "$replace" ] && [ "${DEBIAN_FRONTEND:-}" != noninteractive ] && [ -c /dev/tty ] && { : < /dev/tty; } 2> /dev/null; then
+        echo
+        echo "$BOT: $DIR/config.env exists. Keep it (compare it with this version's template:"
+        echo "diff $DIR/config.env.example $DIR/config.env), or replace it with the template"
+        echo "(the old file kept as config.env.old)?"
+        ans=""
+        read -r -t 60 -p "$BOT: replace the config? [y/N] " ans < /dev/tty > /dev/tty || ans=""
+        case $ans in y | Y | yes | YES) replace=replace ;; *) replace=keep ;; esac
+    fi
+    if [ "$replace" = replace ]; then
+        cp -p "$DIR/config.env" "$DIR/config.env.old"
+        install -m 0640 -o root -g "$BOT" "$DIR/config.env.example" "$DIR/config.env"
+        note "replaced $DIR/config.env with the template; the old file is $DIR/config.env.old (compare: diff $DIR/config.env.old $DIR/config.env)"
+    else
+        note "kept $DIR/config.env (this version's template: $DIR/config.env.example)"
+    fi
+fi
+
+# Owners and modes, as install.sh sets them. The directory is sticky: the bot may replace its
+# own files (the state is written to a temporary file and renamed), but not root's ones.
+#   config.env, OPENPGP_KEY      root:$BOT 640  (the bot reads them)
+#   state.json, pseudonym.key    $BOT 600       (the bot writes them)
+#   the binary, config.env.example   root (the package's)
+chown root:"$BOT" "$DIR"
+chmod 1770 "$DIR"
+chown root:"$BOT" "$DIR/config.env"
+chmod 640 "$DIR/config.env"
+SP=$(setting BOT_STATE_PATH); SP=${SP:-$DIR/state.json}
+KEY=$(setting PSEUDONYM_KEY); KEY=${KEY:-$(dirname "$SP")/pseudonym.key}
+# the admin's OpenPGP public key: root's, the bot only reads it
+PGPKEY=$(setting OPENPGP_KEY)
+if [ -n "$PGPKEY" ] && [ -f "$PGPKEY" ]; then
+    chown root:"$BOT" "$PGPKEY"
+    chmod 640 "$PGPKEY"
+elif [ -n "$PGPKEY" ]; then
+    note "OPENPGP_KEY=$PGPKEY does not exist yet: export your public key and copy it there (root:$BOT 640), or comment OPENPGP_KEY out"
+fi
+for f in "$SP" "$KEY"; do
+    if [ -f "$f" ]; then
+        chown "$BOT:$BOT" "$f"
+        chmod 600 "$f"
+    fi
+done
+# leftovers of an interrupted write, possibly root's: the bot could not replace them
+rm -f "${DIR:?}"/*.tmp
+LOGDIR=$(setting LOG_DIR); LOGDIR=${LOGDIR:-/var/log/$BOT}
+mkdir -p "$LOGDIR"
+chown "$BOT:$BOT" "$LOGDIR"
+chmod 700 "$LOGDIR"
+if [ -f "$LOGDIR/bot.log" ]; then
+    chown "$BOT:$BOT" "$LOGDIR/bot.log"
+    chmod 600 "$LOGDIR/bot.log"
+fi
+# Outbox: logguard (root) writes alerts and the weekly report here and hands each file to
+# the bot, which sends and deletes it. Sticky like $DIR.
+OUTBOX=$(setting OUTBOX_DIR); OUTBOX=${OUTBOX:-$(dirname "$SP")/outbox}
+mkdir -p "$OUTBOX"
+chown root:"$BOT" "$OUTBOX"
+chmod 1770 "$OUTBOX"
+
+# An install from a bundle or deploy.sh: its unit in /etc/systemd/system would shadow the
+# package's. It goes, with the rollback files its install.sh kept; the bot is enabled again
+# on the package's unit if it was. (logguard's watch reports the removed unit as a warning once.)
+was_active=no
+if systemd && systemctl is-active -q "$UNIT"; then was_active=yes; fi
+if [ -f "$OLD_UNIT" ] && [ ! -L "$OLD_UNIT" ]; then
+    note "taking over the install from the bundle (or deploy.sh): its unit and rollback files go; config.env, state and keys stay"
+    was_enabled=no
+    if systemd && systemctl is-enabled -q "$UNIT" 2> /dev/null; then was_enabled=yes; fi
+    rm -f "${OLD_UNIT:?}" "${WANTS:?}"
+    echo "  removed $OLD_UNIT"
+    for f in "$DIR/$BOT.prev" "$DIR/$BOT.service.prev" "$DIR/install.sh"; do
+        [ -e "$f" ] || continue
+        rm -f "${f:?}"
+        echo "  removed $f"
+    done
+    systemd && sc daemon-reload
+    if [ "$was_enabled" = yes ] && systemd; then
+        announce "$WANTS=/usr/lib/systemd/system/$UNIT"
+        sc enable -q "$UNIT"
+    fi
+fi
+systemd && sc daemon-reload
+
+# Filled in? Empty values, or still config.env.example's placeholders
+configured=yes
+placeholder() { local v; v=$(setting "$1"); [ -z "$v" ] || [[ "$v" == *REPLACE* ]] || [ "$v" = https://matrix.example.org ]; }
+if placeholder MATRIX_HOMESERVER || placeholder MATRIX_USER || placeholder ADMIN; then configured=no; fi
+if [ "$configured" = yes ] && { [ ! -f "$SP" ] || ! grep -q '"access_token"' "$SP"; }; then configured=no; fi
+
+if [ "$configured" = yes ] && [ "$was_active" = yes ] && systemd; then
+    sc restart "$UNIT"
+    sleep 3
+    if systemctl is-active -q "$UNIT"; then
+        note "restarted: $("$DIR/$BOT" --version). Accept its invitation in your Matrix client."
+    else
+        note "WARNING: $BOT is not running after the restart:  journalctl -u $BOT -n 20"
+    fi
+elif [ "$configured" = yes ]; then
+    note "not started (it wasn't running):  systemctl enable --now $BOT"
+else
+    if placeholder MATRIX_HOMESERVER || placeholder MATRIX_USER || placeholder ADMIN; then
+        note "not started: $DIR/config.env needs MATRIX_HOMESERVER, MATRIX_USER and ADMIN (and your OpenPGP public key as OPENPGP_KEY, root:$BOT 640)."
+    else
+        note "not started: the bot isn't logged in yet. With the service stopped, as root:"
+        echo "  runuser -u $BOT -- sh -c 'set -a; . $DIR/config.env; exec $DIR/$BOT login'"
+        echo "  It asks for the bot account's password."
+    fi
+    echo "  Then:  systemctl enable --now $BOT"
+fi
+# logguard feeds the bot only when its config says so (off by default)
+LGCONF=/etc/logguard/logguard.toml
+if [ -f "$LGCONF" ] && ! grep -qE "^[[:space:]]*matrix_outbox[[:space:]]*=[[:space:]]*\"$OUTBOX\"" "$LGCONF"; then
+    note "logguard doesn't write to this outbox yet. In [notify] of $LGCONF set"
+    echo "  matrix_outbox = \"$OUTBOX\""
+    echo "  matrix_user = \"$BOT\""
+    echo "  (the weekly abuse report job reads it from there too)"
+    echo "  then: systemctl restart logguard, and test: logguard -c $LGCONF notify-test --matrix"
+fi
+exit 0

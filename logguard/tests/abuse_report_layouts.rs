@@ -17,7 +17,7 @@ impl Case {
     fn new(name: &str, toml: &str) -> Case {
         let dir = std::env::temp_dir().join(format!("lgar-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        for d in ["outbox-xmpp", "outbox-tg", "outbox-mail", "inbox", "work"] {
+        for d in ["outbox-xmpp", "outbox-tg", "outbox-mail", "outbox-signal", "outbox-matrix", "outbox-xmppc", "inbox", "work"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
         let me = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap().trim().to_string();
@@ -73,7 +73,8 @@ esac
         (out.status.success(), text)
     }
 
-    /// The reports in a bot's outbox (`xmpp`, `tg` or `mail`).
+    /// The reports in a bot's outbox (`xmpp`, `tg`, `mail`, `signal`, `matrix` or `xmppc`, the
+    /// XMPP client bot).
     fn reports(&self, which: &str) -> Vec<String> {
         std::fs::read_dir(self.dir.join(format!("outbox-{which}")))
             .unwrap()
@@ -108,6 +109,9 @@ impl Drop for Case {
 const XMPP_BOT: &str = "bot_outbox = \"{dir}/outbox-xmpp\"\nbot_user = \"{me}\"\n";
 const TG_BOT: &str = "tg_outbox = \"{dir}/outbox-tg\"\ntg_user = \"{me}\"\n";
 const MAIL_BOT: &str = "mail_outbox = \"{dir}/outbox-mail\"\nmail_user = \"{me}\"\n";
+const SIGNAL_BOT: &str = "signal_outbox = \"{dir}/outbox-signal\"\nsignal_user = \"{me}\"\n";
+const MATRIX_BOT: &str = "matrix_outbox = \"{dir}/outbox-matrix\"\nmatrix_user = \"{me}\"\n";
+const XMPP_CLIENT_BOT: &str = "xmpp_outbox = \"{dir}/outbox-xmppc\"\nxmpp_user = \"{me}\"\n";
 const CLUSTER: &str = "[cluster]\nenabled = true\nkey = \"Zm9yIHRlc3RzIG9ubHk6IGEgMzItYnl0ZSBrZXkhISE=\"\npeers = [\"192.0.2.1:7946\"]\ninbox = \"{dir}/inbox\"\n";
 const NO_PEERS: &str = "[cluster]\ninbox = \"{dir}/inbox\"\n";
 
@@ -250,6 +254,62 @@ fn layout10_all_three_bots_get_the_report() {
     let (ok, out) = c.run();
     assert!(ok, "{out}");
     assert_eq!((c.reports("xmpp").len(), c.reports("tg").len(), c.reports("mail").len()), (1, 1, 1));
+}
+
+/// A node without ejabberd whose admin messages go to `bots` only.
+fn copy_bot_node(bots: &str, cluster: &str) -> String {
+    format!("[sources]\nejabberd = false\n[notify]\nenabled = true\nxmpp = false\n{bots}{cluster}")
+}
+
+#[test]
+fn layout11_signal_bot_no_peers_merges_for_signal() {
+    let c = Case::new("11", &copy_bot_node(SIGNAL_BOT, NO_PEERS));
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
+    assert_eq!(c.reports("signal").len(), 1);
+    assert!(["xmpp", "tg", "mail", "matrix"].iter().all(|w| c.reports(w).is_empty()));
+}
+
+#[test]
+fn layout12_matrix_bot_with_peers_relays() {
+    let c = Case::new("12-relay", &copy_bot_node(MATRIX_BOT, CLUSTER));
+    c.peer_file("abuse-report-xmpp.txt.gz", "merged on the XMPP server\n");
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    assert!(c.sent().starts_with("--name abuse "), "own report to the peers: {}", c.sent());
+    assert_eq!(c.reports("matrix"), ["merged on the XMPP server\n"]);
+}
+
+#[test]
+fn layout13_all_five_bots_get_the_report() {
+    let c = Case::new("13", &xmpp_server(&format!("{XMPP_BOT}{TG_BOT}{MAIL_BOT}{SIGNAL_BOT}{MATRIX_BOT}"), NO_PEERS));
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    for which in ["xmpp", "tg", "mail", "signal", "matrix"] {
+        assert_eq!(c.reports(which).len(), 1, "{which}: {out}");
+    }
+}
+
+#[test]
+fn layout14_xmpp_client_bot_no_peers_merges_for_it() {
+    // a desktop or a lone server: no ejabberd, the client bot on someone else's XMPP server
+    let c = Case::new("14", &copy_bot_node(XMPP_CLIENT_BOT, NO_PEERS));
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
+    assert_eq!(c.reports("xmppc").len(), 1);
+    assert!(["xmpp", "tg", "mail", "signal", "matrix"].iter().all(|w| c.reports(w).is_empty()));
+}
+
+#[test]
+fn layout15_xmpp_client_bot_with_peers_relays() {
+    let c = Case::new("15-relay", &copy_bot_node(XMPP_CLIENT_BOT, CLUSTER));
+    c.peer_file("abuse-report-xmpp.txt.gz", "merged on the XMPP server\n");
+    let (ok, out) = c.run();
+    assert!(ok, "{out}");
+    assert!(c.sent().starts_with("--name abuse "), "own report to the peers: {}", c.sent());
+    assert_eq!(c.reports("xmppc"), ["merged on the XMPP server\n"]);
 }
 
 #[test]

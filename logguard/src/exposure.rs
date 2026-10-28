@@ -3,7 +3,7 @@
 //!
 //! Every interval the daemon reads the listening sockets from `/proc/net/{tcp,udp}{,6}`
 //! (no `ss` subprocess), maps them to processes via `/proc/<pid>/fd`, and compares
-//! them with `ufw status`. Ports published by Docker show up as `docker-proxy`
+//! them with `ufw status` (or firewalld's zones, or iptables' INPUT chain). Ports published by Docker show up as `docker-proxy`
 //! listeners and are flagged: that traffic bypasses UFW. The engine keeps a baseline
 //! and alerts on drift (see `Engine::on_exposure`).
 
@@ -96,6 +96,9 @@ impl Exposure {
 pub enum Firewall {
     /// ufw, active: `ufw status` is read.
     Ufw,
+    /// firewalld, running: its zones are read (`firewall-cmd --list-all-zones`, and the ports
+    /// of the services they name from firewalld's service files).
+    Firewalld,
     /// No active ufw; the filter table's INPUT chain is read (`iptables -S`, `ip6tables -S`).
     Iptables,
     /// No active ufw and no iptables filtering, but nftables chains of their own on the input
@@ -109,6 +112,7 @@ impl Firewall {
     pub fn name(self) -> &'static str {
         match self {
             Firewall::Ufw => "ufw",
+            Firewall::Firewalld => "firewalld",
             Firewall::Iptables => "iptables",
             Firewall::Nftables => "nftables",
             Firewall::Absent => "no firewall",
@@ -145,7 +149,7 @@ impl Listener {
         let by = fw.name();
         if self.honeypot {
             return match self.exposure {
-                Exposure::Firewalled => format!("honeypot, but blocked by {by}: open it (ufw allow {}/tcp)", self.key.port),
+                Exposure::Firewalled => format!("honeypot, but blocked by {by}: open it ({})", open_command(fw, self.key.port)),
                 Exposure::Local => "honeypot, local only".into(),
                 _ => "honeypot: logguard bans whoever connects".into(),
             };
@@ -162,6 +166,15 @@ impl Listener {
             (Exposure::Unfiltered, Firewall::Iptables) => "no ip6tables rules: open over IPv6".into(),
             (Exposure::Unfiltered, _) => "no firewall".into(),
         }
+    }
+}
+
+/// How to open a TCP port to everyone under `fw`.
+fn open_command(fw: Firewall, port: u16) -> String {
+    match fw {
+        Firewall::Firewalld => format!("firewall-cmd --permanent --add-port={port}/tcp; firewall-cmd --reload"),
+        Firewall::Iptables => format!("iptables -I INPUT -p tcp --dport {port} -j ACCEPT"),
+        _ => format!("ufw allow {port}/tcp"),
     }
 }
 
@@ -222,6 +235,7 @@ impl ExposureReport {
         }
         match self.firewall() {
             Firewall::Ufw => "ufw active".into(),
+            Firewall::Firewalld => format!("firewalld running{ufw}"),
             Firewall::Iptables => format!("iptables{ufw}"),
             Firewall::Nftables => format!("nftables, rules not read{ufw}"),
             Firewall::Absent => format!("NO FIREWALL{ufw}"),
@@ -239,6 +253,9 @@ pub struct UfwRule {
     pub limit: bool,
     /// The address or network it lets in from; None: from anywhere.
     pub from: Option<String>,
+    /// Every port (of `proto`): a firewalld zone whose target is ACCEPT, or that allows a
+    /// whole protocol. Not a port range, whose sockets come and go.
+    pub every: bool,
 }
 
 impl UfwRule {
@@ -249,15 +266,17 @@ impl UfwRule {
 
 // ------------------------------------------------------------------ /proc parsing
 
+/// The kernel prints an address as 32-bit words read in the host's byte order: their bytes in
+/// that order are the address (little-endian on x86_64 and ARM, so `0100007F` is 127.0.0.1).
 pub(crate) fn parse_hex_addr(hex: &str) -> Option<IpAddr> {
     match hex.len() {
-        8 => Some(IpAddr::V4(Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?.swap_bytes()))),
+        8 => Some(IpAddr::V4(Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes()))),
         32 => {
-            // four 32-bit words, each in host (little-endian) byte order
+            // four 32-bit words, each in host byte order
             let mut bytes = [0u8; 16];
             for i in 0..4 {
                 let w = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
-                bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
             }
             Some(crate::net::normalize(IpAddr::V6(Ipv6Addr::from(bytes))))
         }
@@ -355,12 +374,218 @@ pub fn parse_ufw_status(text: &str) -> (bool, Vec<UfwRule>) {
         };
         // App profiles ("OpenSSH") and "Anywhere" targets can't be mapped to ports.
         let (Some(lo), Some(hi)) = (lo, hi) else { continue };
-        let rule = UfwRule { lo, hi, proto, label: to.to_string(), limit: action.starts_with("LIMIT"), from };
+        let rule = UfwRule { lo, hi, proto, label: to.to_string(), limit: action.starts_with("LIMIT"), from, every: false };
         if !rules.contains(&rule) {
             rules.push(rule);
         }
     }
     (active, rules)
+}
+
+// ------------------------------------------------------------------ firewalld parsing
+
+/// One zone of `firewall-cmd --list-all-zones`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FirewalldZone {
+    pub name: String,
+    /// The default zone: it takes the interfaces no zone names.
+    pub default: bool,
+    pub target: String,
+    pub interfaces: Vec<String>,
+    pub sources: Vec<String>,
+    pub services: Vec<String>,
+    pub ports: Vec<String>,
+    pub protocols: Vec<String>,
+    pub rich_rules: Vec<String>,
+}
+
+/// Parses `firewall-cmd --list-all-zones`: a header line per zone (`public (default, active)`),
+/// then indented `key: values` lines; rich rules follow `rich rules:`, one per line.
+pub fn parse_firewalld_zones(text: &str) -> Vec<FirewalldZone> {
+    let mut zones: Vec<FirewalldZone> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            let (name, flags) = line.split_once(' ').unwrap_or((line, ""));
+            zones.push(FirewalldZone { name: name.to_string(), default: flags.contains("default"), ..Default::default() });
+            continue;
+        }
+        let Some(z) = zones.last_mut() else { continue };
+        let t = line.trim();
+        if t.starts_with("rule ") {
+            z.rich_rules.push(t.to_string());
+            continue;
+        }
+        let Some((key, values)) = t.split_once(':') else { continue };
+        let values: Vec<String> = values.split_whitespace().map(str::to_string).collect();
+        match key {
+            "target" => z.target = values.first().cloned().unwrap_or_default(),
+            "interfaces" => z.interfaces = values,
+            "sources" => z.sources = values,
+            "services" => z.services = values,
+            "ports" => z.ports = values,
+            "protocols" => z.protocols = values,
+            _ => {}
+        }
+    }
+    zones
+}
+
+/// A port range of firewalld's: `443/tcp`, `60000-61000/udp`.
+fn firewalld_port(spec: &str) -> Option<(u16, u16, Option<Proto>)> {
+    let (ports, proto) = spec.split_once('/')?;
+    let proto = match proto {
+        "tcp" => Some(Proto::Tcp),
+        "udp" => Some(Proto::Udp),
+        _ => return None, // sctp, dccp: no listeners read
+    };
+    let (lo, hi) = match ports.split_once('-') {
+        Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
+        None => (ports.parse().ok()?, ports.parse().ok()?),
+    };
+    Some((lo, hi, proto))
+}
+
+/// A firewalld service file's ports (`<port protocol="tcp" port="22"/>`) and the services it
+/// includes (`<include service="..."/>`).
+pub fn parse_firewalld_service(xml: &str) -> (Vec<String>, Vec<String>) {
+    let attr = |tag: &str, name: &str| -> Option<String> {
+        let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
+        Some(tag[start..].split('"').next()?.to_string())
+    };
+    let (mut ports, mut includes) = (Vec::new(), Vec::new());
+    for tag in xml.split('<').skip(1) {
+        if let Some(t) = tag.strip_prefix("port ") {
+            if let (Some(port), Some(proto)) = (attr(t, "port"), attr(t, "protocol")) {
+                ports.push(format!("{port}/{proto}"));
+            }
+        } else if let Some(t) = tag.strip_prefix("include ") {
+            includes.extend(attr(t, "service"));
+        }
+    }
+    (ports, includes)
+}
+
+/// The ports of the services the zones name, from firewalld's service files (`/etc` overrides
+/// `/usr/lib`), includes followed a few levels deep. A service without a file has none.
+fn firewalld_service_ports(zones: &[FirewalldZone], dirs: &[&Path]) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let named: Vec<String> = zones
+        .iter()
+        .flat_map(|z| z.services.iter().cloned())
+        .chain(zones.iter().flat_map(|z| z.rich_rules.iter().filter_map(|r| rich_value(r, "service name"))))
+        .collect();
+    for name in named {
+        if out.contains_key(&name) || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) || name.starts_with('.') {
+            continue;
+        }
+        let mut ports = Vec::new();
+        let mut todo = vec![(name.clone(), 0)];
+        while let Some((service, depth)) = todo.pop() {
+            let Some(xml) = dirs.iter().find_map(|d| std::fs::read_to_string(d.join(format!("{service}.xml"))).ok()) else { continue };
+            let (p, includes) = parse_firewalld_service(&xml);
+            ports.extend(p);
+            if depth < 3 {
+                todo.extend(
+                    includes
+                        .into_iter()
+                        .filter(|i| i.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) && !i.starts_with('.'))
+                        .map(|i| (i, depth + 1)),
+                );
+            }
+        }
+        out.insert(name, ports);
+    }
+    out
+}
+
+/// A rich rule's `key="value"` (e.g. `source address`, `port port`, `service name`).
+fn rich_value(rule: &str, key: &str) -> Option<String> {
+    let start = rule.find(&format!("{key}=\""))? + key.len() + 2;
+    Some(rule[start..].split('"').next()?.to_string())
+}
+
+/// The rules letting traffic in under firewalld, as ufw's would be: those of the zones that
+/// take traffic from the internet (the default zone, and zones with an interface other than
+/// loopback, containers' bridges and tunnels) from anywhere; those of zones bound to sources,
+/// and rich rules naming a source, from those sources only. logguard's own zone (banned
+/// sources) lets nobody in. Also the single ports opened from anywhere (`ports:`, not
+/// services), for dead-rule checks.
+pub fn firewalld_rules(zones: &[FirewalldZone], services: &HashMap<String, Vec<String>>) -> (Vec<UfwRule>, Vec<UfwRule>) {
+    let (mut rules, mut explicit) = (Vec::new(), Vec::new());
+    for z in zones.iter().filter(|z| z.name != crate::enforce::FIREWALLD_ZONE) {
+        let public = z.default || z.interfaces.iter().any(|i| !internal_interface(i));
+        let from = match (public, z.sources.is_empty()) {
+            (true, _) => None,
+            (false, false) => Some(z.sources.join(", ")),
+            (false, true) => continue, // inactive, or internal interfaces only
+        };
+        let mut add = |lo, hi, proto, label: String, limit, from: Option<String>, every| {
+            let r = UfwRule { lo, hi, proto, label, limit, from, every };
+            if !rules.contains(&r) {
+                rules.push(r);
+            }
+        };
+        let zone = &z.name;
+        if z.target == "ACCEPT" {
+            add(1, u16::MAX, None, format!("target ACCEPT ({zone})"), false, from.clone(), true);
+        }
+        for p in &z.ports {
+            if let Some((lo, hi, proto)) = firewalld_port(p) {
+                add(lo, hi, proto, format!("{p} ({zone})"), false, from.clone(), false);
+                if from.is_none() && lo == hi {
+                    explicit.push(UfwRule { lo, hi, proto, label: format!("{p} ({zone})"), limit: false, from: None, every: false });
+                }
+            }
+        }
+        for s in &z.services {
+            for (lo, hi, proto) in services.get(s).into_iter().flatten().filter_map(|p| firewalld_port(p)) {
+                add(lo, hi, proto, format!("{s} ({zone})"), false, from.clone(), false);
+            }
+        }
+        for p in &z.protocols {
+            let proto = match p.as_str() {
+                "tcp" => Proto::Tcp,
+                "udp" => Proto::Udp,
+                _ => continue,
+            };
+            add(1, u16::MAX, Some(proto), format!("protocol {p} ({zone})"), false, from.clone(), true);
+        }
+        for r in &z.rich_rules {
+            // only rules that let traffic in; `source not` = from anywhere but some
+            if !r.split_whitespace().any(|w| w == "accept") {
+                continue;
+            }
+            let source = (!r.contains("source not"))
+                .then(|| rich_value(r, "source address").or_else(|| rich_value(r, "source ipset").map(|s| format!("ipset {s}"))))
+                .flatten();
+            let from = source.or_else(|| from.clone());
+            let limit = r.contains(" limit value=");
+            if let Some(port) = rich_value(r, "port port") {
+                let proto = rich_value(r, "protocol").unwrap_or_default();
+                if let Some((lo, hi, proto)) = firewalld_port(&format!("{port}/{proto}")) {
+                    add(
+                        lo,
+                        hi,
+                        proto,
+                        format!("rich rule {port}/{} ({zone})", rich_value(r, "protocol").unwrap_or_default()),
+                        limit,
+                        from,
+                        false,
+                    );
+                }
+            } else if let Some(s) = rich_value(r, "service name") {
+                for (lo, hi, proto) in services.get(&s).into_iter().flatten().filter_map(|p| firewalld_port(p)) {
+                    add(lo, hi, proto, format!("rich rule {s} ({zone})"), limit, from.clone(), false);
+                }
+            } else if !r.contains("forward-port") && !r.contains("icmp") {
+                add(1, u16::MAX, None, format!("rich rule ({zone})"), limit, from, true);
+            }
+        }
+    }
+    (rules, explicit)
 }
 
 // ------------------------------------------------------------------ iptables parsing
@@ -706,6 +931,10 @@ pub struct FirewallView<'a> {
     pub ip6tables: Option<&'a str>,
     /// nftables has filter chains of its own on the input hook that drop or hold rules.
     pub nft_input: bool,
+    /// `firewall-cmd --list-all-zones`, when firewalld runs (and ufw isn't active).
+    pub firewalld: Option<&'a str>,
+    /// The ports of the services firewalld's zones name.
+    pub firewalld_services: Option<&'a HashMap<String, Vec<String>>>,
 }
 
 /// How reachable a listener is, the rule letting it in, whether a rate limit applies, and
@@ -729,9 +958,9 @@ fn classify(
         return (Exposure::Docker, rule, false, false);
     }
     match fw {
-        Firewall::Ufw => match ufw.iter().find(open) {
+        Firewall::Ufw | Firewall::Firewalld => match ufw.iter().find(open) {
             Some(r) => {
-                let hit = |single: bool| ufw.iter().filter(open).any(|r| (r.lo == r.hi) == single);
+                let hit = |single: bool| ufw.iter().filter(open).any(|r| (r.lo == r.hi || r.every) == single);
                 (Exposure::Allowed, Some(action(r)), r.limit, !hit(true) && hit(false))
             }
             None => {
@@ -770,7 +999,7 @@ fn classify(
     }
 }
 
-/// "11.32.48.86", "3 sources": who some rules let in.
+/// "11.38.48.86", "3 sources": who some rules let in.
 fn sources<'a>(from: impl Iterator<Item = &'a str>) -> String {
     let distinct: std::collections::BTreeSet<&str> = from.collect();
     match distinct.iter().next() {
@@ -816,15 +1045,19 @@ pub fn build_report(
 ) -> ExposureReport {
     let ufw = fw.ufw.map(parse_ufw_status);
     let ipt = [fw.iptables.map(parse_iptables), fw.ip6tables.map(parse_iptables)];
-    let firewall = match &ufw {
-        Some((true, _)) => Firewall::Ufw,
+    let no_services = HashMap::new();
+    let firewalld = fw.firewalld.map(|t| firewalld_rules(&parse_firewalld_zones(t), fw.firewalld_services.unwrap_or(&no_services)));
+    let firewall = match (&ufw, &firewalld) {
+        (Some((true, _)), _) => Firewall::Ufw,
+        (_, Some(_)) => Firewall::Firewalld,
         _ if ipt.iter().flatten().any(IptRules::filters) => Firewall::Iptables,
         _ if fw.nft_input => Firewall::Nftables,
         _ => Firewall::Absent,
     };
-    let rules: &[UfwRule] = match &ufw {
-        Some((true, rules)) => rules,
-        _ => &[],
+    let (rules, explicit): (&[UfwRule], &[UfwRule]) = match (&ufw, &firewalld) {
+        (Some((true, rules)), _) => (rules, rules),
+        (_, Some((rules, explicit))) if firewall == Firewall::Firewalld => (rules, explicit),
+        _ => (&[], &[]),
     };
     let mut listeners: Vec<Listener> = sockets
         .into_iter()
@@ -839,7 +1072,7 @@ pub fn build_report(
     listeners.dedup_by_key(|l| l.key);
 
     let mut dead_rules = Vec::new();
-    for r in rules.iter().filter(|r| r.from.is_none() && r.lo == r.hi && !ignore.iter().any(|i| i.port == r.lo)) {
+    for r in explicit.iter().filter(|r| r.from.is_none() && r.lo == r.hi && !ignore.iter().any(|i| i.port == r.lo)) {
         let served = listeners.iter().any(|l| l.exposure != Exposure::Local && r.matches(l.key.port, l.key.proto));
         if !served && !dead_rules.contains(&r.label) {
             dead_rules.push(r.label.clone());
@@ -874,6 +1107,37 @@ fn ufw_status(ufw: &Path) -> Option<String> {
     let text = out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned());
     *cache = Some((stamps, Instant::now(), text.clone()));
     text
+}
+
+/// firewalld's zones and their services' ports, when it runs. firewall-cmd is a Python
+/// program talking to firewalld over D-Bus, too heavy to start every scan: re-read every 5
+/// minutes, or when a file in /etc/firewalld changes.
+fn firewalld_state(firewall_cmd: &Path) -> Option<(String, HashMap<String, Vec<String>>)> {
+    use std::sync::Mutex;
+    use std::time::{Instant, SystemTime};
+    type Cache = (Option<SystemTime>, Instant, Option<(String, HashMap<String, Vec<String>>)>);
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    if firewall_cmd.as_os_str().is_empty() || !firewall_cmd.exists() {
+        return None;
+    }
+    let stamp = ["/etc/firewalld", "/etc/firewalld/zones", "/etc/firewalld/services"]
+        .iter()
+        .filter_map(|d| std::fs::metadata(d).and_then(|m| m.modified()).ok())
+        .max();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((s, at, state)) = cache.as_ref() {
+        if *s == stamp && at.elapsed() < std::time::Duration::from_secs(300) {
+            return state.clone();
+        }
+    }
+    // fails (exit 252) while firewalld isn't running
+    let state = output_of(firewall_cmd, &["--list-all-zones"]).map(|text| {
+        let zones = parse_firewalld_zones(&text);
+        let services = firewalld_service_ports(&zones, &[Path::new("/etc/firewalld/services"), Path::new("/usr/lib/firewalld/services")]);
+        (text, services)
+    });
+    *cache = Some((stamp, Instant::now(), state.clone()));
+    state
 }
 
 /// A command's output, None where the program is missing or fails.
@@ -922,9 +1186,11 @@ pub fn scan(cfg: &ExposureCfg, tools: &crate::config::EnforceCfg, honeypots: &[u
     }
     let owners = socket_owners();
     let ufw = ufw_status(&cfg.ufw);
-    // without an active ufw: iptables' filter table, else nftables chains of their own
+    // without an active ufw: firewalld's zones, else iptables' filter table, else nftables
+    // chains of their own
     let ufw_active = ufw.as_deref().is_some_and(|t| parse_ufw_status(t).0);
-    let (v4, v6) = if ufw_active {
+    let firewalld = if ufw_active { None } else { firewalld_state(&tools.firewall_cmd) };
+    let (v4, v6) = if ufw_active || firewalld.is_some() {
         (None, None)
     } else {
         (output_of(&tools.iptables, &["-w", "10", "-S"]), output_of(&tools.ip6tables, &["-w", "10", "-S"]))
@@ -934,7 +1200,9 @@ pub fn scan(cfg: &ExposureCfg, tools: &crate::config::EnforceCfg, honeypots: &[u
         ufw: ufw.as_deref(),
         iptables: v4.as_deref(),
         ip6tables: v6.as_deref(),
-        nft_input: !ufw_active && !filtering && nft_filters_input(&tools.nft),
+        nft_input: !ufw_active && firewalld.is_none() && !filtering && nft_filters_input(&tools.nft),
+        firewalld: firewalld.as_ref().map(|(t, _)| t.as_str()),
+        firewalld_services: firewalld.as_ref().map(|(_, s)| s),
     };
     let mut r = build_report(time::now(), sockets, &owners, &fw, &cfg.ignore);
     mark_honeypots(&mut r, honeypots);
@@ -944,6 +1212,8 @@ pub fn scan(cfg: &ExposureCfg, tools: &crate::config::EnforceCfg, honeypots: &[u
 #[cfg(test)]
 mod tests {
     #[test]
+    // /proc/net fixtures as a little-endian kernel prints them (x86_64, ARM)
+    #[cfg(target_endian = "little")]
     fn v4_and_v6_twins_shown_once() {
         let l = |addr: &str, port, proto, process: &str, exposure| Listener {
             key: ListenerKey { proto, addr: addr.parse().unwrap(), port },
@@ -992,8 +1262,8 @@ To                         Action      From
 49152:65535/udp            ALLOW       Anywhere                   # relay
 5349/tcp                   ALLOW       Anywhere                   # TURNS
 OpenSSH                    ALLOW       Anywhere
-Anywhere                   DENY        11.29.0.0/16              # blocked
-Anywhere                   ALLOW       11.42.43.31
+Anywhere                   DENY        11.35.0.0/16              # blocked
+Anywhere                   ALLOW       11.48.43.31
 2222/tcp (v6)             LIMIT       Anywhere (v6)              # SSH
 ";
 
@@ -1066,13 +1336,13 @@ Anywhere                   ALLOW       11.42.43.31
 
     #[test]
     fn rules_for_some_sources_and_docker_ports() {
-        // the dzen node: the cluster port open to the peers only, Nextcloud published by docker
+        // a node with the cluster port open to the peers only, Nextcloud published by docker
         let ufw = "Status: active\n\nTo                         Action      From\n--                         ------      ----\n\
             9847/tcp                   LIMIT IN    Anywhere                   # SSH\n\
             443/tcp                    ALLOW IN    Anywhere                   # Nextcloud\n\
-            7946/tcp                   ALLOW IN    11.32.48.86               # logguard cluster\n\
-            7946/tcp                   ALLOW IN    11.5.39.73                # logguard cluster\n\
-            7946/tcp                   ALLOW IN    11.24.39.236              # logguard cluster\n\
+            7946/tcp                   ALLOW IN    11.38.48.86               # logguard cluster\n\
+            7946/tcp                   ALLOW IN    11.8.39.73                # logguard cluster\n\
+            7946/tcp                   ALLOW IN    11.29.39.236              # logguard cluster\n\
             9847/tcp (v6)              LIMIT IN    Anywhere (v6)              # SSH\n";
         let key = |port, proto| ListenerKey { addr: "0.0.0.0".parse().unwrap(), port, proto };
         let sockets = vec![(key(7946, Proto::Tcp), 1), (key(443, Proto::Tcp), 2), (key(8443, Proto::Tcp), 2), (key(5355, Proto::Tcp), 3)];
@@ -1094,10 +1364,10 @@ Anywhere                   ALLOW       11.42.43.31
         assert_eq!((docker(443).as_deref(), docker(8443).as_deref()), (Some("ALLOW 443/tcp"), Some("none: containers blocked")));
         assert_eq!(get(5355), (Exposure::Firewalled, None, "blocked by ufw".into()));
         assert_eq!(r.dead_rules, ["9847/tcp"], "no sshd in this test; rules for some sources are never dead");
-        let one = parse_ufw_status(&ufw.replace("11.5.39.73", "11.32.48.86").replace("11.24.39.236", "11.32.48.86")).1;
+        let one = parse_ufw_status(&ufw.replace("11.8.39.73", "11.38.48.86").replace("11.29.39.236", "11.38.48.86")).1;
         let r = build_report(0, vec![(key(7946, Proto::Tcp), 1)], &owners, &FirewallView { ufw: Some(ufw), ..Default::default() }, &[]);
         assert!(r.listeners[0].rule.as_deref().is_some_and(|x| x.ends_with("3 sources")));
-        assert_eq!(sources(one.iter().filter_map(|r| r.from.as_deref())), "11.32.48.86");
+        assert_eq!(sources(one.iter().filter_map(|r| r.from.as_deref())), "11.38.48.86");
 
         // the same with iptables: an ACCEPT for the peers' set, closed by the policy otherwise
         let ipt = "-P INPUT DROP\n-A INPUT -p tcp -m tcp --dport 7946 -m set --match-set peers src -j ACCEPT\n-A INPUT -p tcp --dport 22 -j ACCEPT\n";
@@ -1182,7 +1452,7 @@ Anywhere                   ALLOW       11.42.43.31
             (key("0.0.0.0", 22, Proto::Tcp), 1),
             (key("0.0.0.0", 8080, Proto::Tcp), 2),
             (key("::", 8080, Proto::Tcp), 2),
-            (key("3fff:100::1", 9000, Proto::Tcp), 3),
+            (key("3fff:130::1", 9000, Proto::Tcp), 3),
             (key("0.0.0.0", 443, Proto::Tcp), 4),
             (key("127.0.0.1", 3306, Proto::Tcp), 5),
             (key("0.0.0.0", 50050, Proto::Udp), 6),
@@ -1191,7 +1461,7 @@ Anywhere                   ALLOW       11.42.43.31
             .map(|(i, n)| (i, n.to_string()))
             .into();
         let v6_open = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
-        let fw = FirewallView { ufw: Some("Status: inactive\n"), iptables: Some(IPTABLES), ip6tables: Some(v6_open), nft_input: false };
+        let fw = FirewallView { ufw: Some("Status: inactive\n"), iptables: Some(IPTABLES), ip6tables: Some(v6_open), ..Default::default() };
         let r = build_report(0, sockets.clone(), &owners, &fw, &[]);
         assert_eq!((r.firewall(), r.firewall_summary().as_str()), (Firewall::Iptables, "iptables (ufw inactive)"));
         let get = |addr: &str, port| {
@@ -1208,7 +1478,7 @@ Anywhere                   ALLOW       11.42.43.31
         assert_eq!(get("0.0.0.0", 8080), from_one);
         // IPv4 is closed, IPv6 isn't filtered at all
         assert_eq!(get("::", 8080), (Exposure::Allowed, Some("policy ACCEPT (IPv6)".into()), "allowed by iptables".into()));
-        assert_eq!(get("3fff:100::1", 9000).1.as_deref(), Some("policy ACCEPT"));
+        assert_eq!(get("3fff:130::1", 9000).1.as_deref(), Some("policy ACCEPT"));
         assert_eq!(get("0.0.0.0", 443).2, "published by docker, bypasses iptables");
         let relay = r.listeners.iter().find(|l| l.key.port == 50050).unwrap();
         assert!(relay.dynamic && relay.exposure == Exposure::Allowed, "a relay let in through a port range: no new/gone alerts");
@@ -1263,5 +1533,154 @@ Anywhere                   ALLOW       11.42.43.31
         // names nft would read as more commands or options are never handed back to it
         assert!(plain_name("filter") && plain_name("filter_IN_public") && plain_name("inet"));
         assert!(!plain_name("x; flush ruleset") && !plain_name("-f") && !plain_name("a b") && !plain_name("") && !plain_name("\"q\""));
+    }
+
+    /// `firewall-cmd --list-all-zones` of a Fedora server: the default zone with services,
+    /// ports and rich rules, a zone for an internal network, Docker's zone, and logguard's.
+    const ZONES: &str = "docker (active)
+  target: ACCEPT
+  icmp-block-inversion: no
+  interfaces: br-1a2b docker0
+  sources: 
+  services: 
+  ports: 
+  protocols: 
+  forward: yes
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 
+
+logguard (active)
+  target: DROP
+  interfaces: 
+  sources: ipset:logguard-ban4 ipset:logguard-ban6
+  services: 
+  ports: 443/tcp
+  rich rules: 
+
+public (default, active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: eth0
+  sources: 
+  services: cockpit dhcpv6-client ssh
+  ports: 8443/tcp 60000-61000/udp
+  protocols: 
+  forward: yes
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 
+\trule family=\"ipv4\" source address=\"198.51.100.7\" port port=\"7946\" protocol=\"tcp\" accept
+\trule family=\"ipv4\" port port=\"5222\" protocol=\"tcp\" log prefix=\"xmpp\" accept limit value=\"30/m\"
+\trule family=\"ipv4\" source address=\"203.0.113.0/24\" port port=\"25\" protocol=\"tcp\" reject
+
+trusted
+  target: ACCEPT
+  interfaces: 
+  sources: 
+  services: 
+
+work (active)
+  target: default
+  interfaces: 
+  sources: 10.0.0.0/8
+  services: 
+  ports: 6379/tcp
+  rich rules: 
+";
+
+    #[test]
+    fn firewalld_zones_and_services() {
+        let zones = parse_firewalld_zones(ZONES);
+        assert_eq!(zones.iter().map(|z| z.name.as_str()).collect::<Vec<_>>(), ["docker", "logguard", "public", "trusted", "work"]);
+        let public = &zones[2];
+        assert!(public.default && !zones[0].default);
+        assert_eq!((public.target.as_str(), public.interfaces.as_slice()), ("default", &["eth0".to_string()][..]));
+        assert_eq!(public.services, ["cockpit", "dhcpv6-client", "ssh"]);
+        assert_eq!(public.ports, ["8443/tcp", "60000-61000/udp"]);
+        assert_eq!(public.rich_rules.len(), 3);
+        assert_eq!(zones[4].sources, ["10.0.0.0/8"]);
+
+        let (ports, includes) = parse_firewalld_service(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<service>\n  <short>SSH</short>\n  <port protocol=\"tcp\" port=\"22\"/>\n  <include service=\"ssh-extra\"/>\n</service>\n",
+        );
+        assert_eq!((ports, includes), (vec!["22/tcp".to_string()], vec!["ssh-extra".to_string()]));
+
+        // service files: /etc first, includes followed; unsafe or unknown names have none
+        let dir = std::env::temp_dir().join(format!("logguard-fwd-services-{}", std::process::id()));
+        let (etc, lib) = (dir.join("etc"), dir.join("lib"));
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("ssh.xml"), "<service><port protocol=\"tcp\" port=\"22\"/></service>").unwrap();
+        std::fs::write(etc.join("ssh.xml"), "<service><port protocol=\"tcp\" port=\"2222\"/><include service=\"cockpit\"/></service>")
+            .unwrap();
+        std::fs::write(lib.join("cockpit.xml"), "<service><port protocol=\"tcp\" port=\"9090\"/></service>").unwrap();
+        let mut odd = zones.clone();
+        odd[2].services.push("../../etc/passwd".into());
+        let services = firewalld_service_ports(&odd, &[&etc, &lib]);
+        assert_eq!(services["ssh"], ["2222/tcp", "9090/tcp"]);
+        assert_eq!(services["cockpit"], ["9090/tcp"]);
+        assert!(services["dhcpv6-client"].is_empty());
+        assert!(!services.contains_key("../../etc/passwd"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn firewalld_exposure() {
+        let services: HashMap<String, Vec<String>> =
+            [("ssh", vec!["22/tcp"]), ("cockpit", vec!["9090/tcp"]), ("dhcpv6-client", vec!["546/udp"])]
+                .map(|(n, p)| (n.to_string(), p.into_iter().map(String::from).collect()))
+                .into();
+        let key = |port, proto| ListenerKey { addr: "0.0.0.0".parse().unwrap(), port, proto };
+        let ports = [22, 9090, 5432, 6379, 7946, 5222, 443, 3000];
+        let mut sockets: Vec<(ListenerKey, u64)> = ports.iter().map(|&p| (key(p, Proto::Tcp), u64::from(p))).collect();
+        sockets.push((key(60123, Proto::Udp), 60123));
+        let owners: HashMap<u64, String> =
+            sockets.iter().map(|(_, i)| (*i, if *i == 3000 { "docker-proxy".to_string() } else { "x".to_string() })).collect();
+        let fw = FirewallView { firewalld: Some(ZONES), firewalld_services: Some(&services), ..Default::default() };
+        let r = build_report(0, sockets, &owners, &fw, &[]);
+        assert_eq!(r.firewall(), Firewall::Firewalld);
+        assert_eq!(r.firewall_summary(), "firewalld running");
+        let get = |port: u16| {
+            let l = r.listeners.iter().find(|l| l.key.port == port).unwrap();
+            (l.exposure, l.rule.clone(), l.limited, l.dynamic)
+        };
+        assert_eq!(get(22), (Exposure::Allowed, Some("ALLOW ssh (public)".into()), false, false));
+        assert_eq!(get(9090), (Exposure::Allowed, Some("ALLOW cockpit (public)".into()), false, false));
+        assert_eq!(get(5432), (Exposure::Firewalled, None, false, false), "nothing opens it");
+        assert_eq!(get(6379), (Exposure::Firewalled, Some("ALLOW 6379/tcp (work) from 10.0.0.0/8".into()), false, false));
+        assert_eq!(get(7946), (Exposure::Firewalled, Some("ALLOW rich rule 7946/tcp (public) from 198.51.100.7".into()), false, false));
+        assert_eq!(get(5222), (Exposure::Allowed, Some("LIMIT rich rule 5222/tcp (public)".into()), true, false));
+        assert_eq!(get(443).0, Exposure::Firewalled, "logguard's zone lets in only banned sources' whitelisted ports");
+        assert_eq!(get(60123), (Exposure::Allowed, Some("ALLOW 60000-61000/udp (public)".into()), false, true), "a range: short-lived");
+        assert_eq!(get(3000).0, Exposure::Docker);
+        let l = r.listeners.iter().find(|l| l.key.port == 5432).unwrap();
+        assert_eq!(r.describe(l), "blocked by firewalld");
+        assert_eq!(r.dead_rules, ["8443/tcp (public)"], "a port opened by hand that nothing serves; services never count");
+        // Docker's zone (bridges only) doesn't open everything; a public zone with target ACCEPT does
+        let open = ZONES.replace("interfaces: br-1a2b docker0", "interfaces: br-1a2b docker0 eth1");
+        let r = build_report(0, vec![(key(5432, Proto::Tcp), 1)], &owners, &FirewallView { firewalld: Some(&open), ..fw }, &[]);
+        assert_eq!(
+            (r.listeners[0].exposure, r.listeners[0].rule.as_deref(), r.listeners[0].dynamic),
+            (Exposure::Allowed, Some("ALLOW target ACCEPT (docker)"), false)
+        );
+        // an active ufw is what filters, even with firewalld's zones read
+        let r = build_report(0, vec![(key(22, Proto::Tcp), 1)], &owners, &FirewallView { ufw: Some(UFW), ..fw }, &[]);
+        assert_eq!(r.firewall(), Firewall::Ufw);
+        // logguard's honeypot behind firewalld: firewalld's command to open it
+        let hp = Listener {
+            key: key(2222, Proto::Tcp),
+            process: "logguard".into(),
+            exposure: Exposure::Firewalled,
+            dynamic: false,
+            rule: None,
+            limited: false,
+            honeypot: true,
+        };
+        assert!(hp.describe(Firewall::Firewalld).contains("firewall-cmd --permanent --add-port=2222/tcp"));
     }
 }

@@ -11,7 +11,9 @@
 //! one the bot doesn't take within its grace time itself, unencrypted, so the bot claims
 //! each by renaming it to `.<name>.sending` first, puts it back if sending fails, and renames
 //! one for anyone but the admin to `.<name>.rejected` (logguard's module `botbox` has the
-//! other side).
+//! other side). In client mode (`BOT_MODE=client`) the outbox is logguard's `[notify]
+//! xmpp_outbox`, a copy bot's like logguard-tg-bot's: no fallback on logguard's side, and every
+//! message goes to the bot's admin, whatever its `To:` says.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -84,6 +86,21 @@ pub fn parse_message(text: &str) -> Option<(String, String)> {
         }
     }
     Some((to.filter(|t| !t.is_empty())?, body.to_string()))
+}
+
+/// An alert larger than this is not one of logguard's (they are a few KB): it is not read.
+pub const MAX_MESSAGE: u64 = 1 << 20;
+
+/// An alert file as [`parse_message`] reads it, if it is one: at most [`MAX_MESSAGE`] bytes
+/// of UTF-8.
+pub fn read_message(path: &Path) -> Option<(String, String)> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(MAX_MESSAGE + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > MAX_MESSAGE {
+        return None;
+    }
+    parse_message(&text)
 }
 
 /// Files to upload: regular files only (no links, no directories), not dot files (still
@@ -235,6 +252,24 @@ mod tests {
         assert_eq!(names(&scan_messages(&dir).unwrap()), ["alert-0.msg", "alert-1.msg", "alert-2.msg"]);
         assert!(dir.join(".alert-9.msg.fallback").exists(), "logguard's claim stays logguard's");
         assert_eq!(claimed(&dir.join("alert-1.msg"), "sending"), dir.join(".alert-1.msg.sending"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_or_binary_messages_are_not_read() {
+        let dir = std::env::temp_dir().join(format!("logguard-xmpp-bot-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("alert-1.msg");
+        std::fs::write(&ok, "To: admin\nSubject: s\n\nbody").unwrap();
+        assert_eq!(read_message(&ok), Some(("admin".into(), "body".into())));
+        let big = dir.join("alert-2.msg");
+        std::fs::write(&big, format!("To: a\nSubject: s\n\n{}", "x".repeat(MAX_MESSAGE as usize))).unwrap();
+        assert_eq!(read_message(&big), None);
+        let binary = dir.join("alert-3.msg");
+        std::fs::write(&binary, b"To: a\nSubject: s\n\n\xff\xfe").unwrap();
+        assert_eq!(read_message(&binary), None);
+        assert_eq!(read_message(&dir.join("missing.msg")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

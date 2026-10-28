@@ -22,13 +22,19 @@ pub enum Source {
     Systemd,
     /// Local privilege changes: `su` and `sudo` (successes and failures).
     Privilege,
+    /// PAM's lines of the programs no other parser reads (the console, desktops, polkit,
+    /// Cockpit, FTP, ...) and the account tools' (`useradd`, `usermod`, ...).
+    Auth,
+    /// The audit log: the journal's audit records, the kernel's without auditd, or
+    /// auditd's file.
+    Audit,
     /// Lines for the patterns of your own (`[[patterns]]`): journal entries no built-in parser
     /// reads, and lines of the log files they name.
     Custom,
 }
 
 impl Source {
-    pub const ALL: [Source; 9] = [
+    pub const ALL: [Source; 11] = [
         Source::Ejabberd,
         Source::Ssh,
         Source::Ufw,
@@ -37,6 +43,8 @@ impl Source {
         Source::Kernel,
         Source::Systemd,
         Source::Privilege,
+        Source::Auth,
+        Source::Audit,
         Source::Peer,
     ];
 
@@ -50,6 +58,8 @@ impl Source {
             Source::Kernel => "kernel",
             Source::Systemd => "systemd",
             Source::Privilege => "privilege",
+            Source::Auth => "auth",
+            Source::Audit => "audit",
             Source::Custom => "custom",
         }
     }
@@ -80,7 +90,7 @@ pub struct Record {
     pub msg: String,
     /// journald cursor, when the record came from the journal.
     pub cursor: Option<String>,
-    /// Who logged it, for `Source::Custom` and `Source::Privilege` records only.
+    /// Who logged it, for `Source::Custom`, `Source::Privilege` and `Source::Auth` records only.
     pub sender: Option<Box<Sender>>,
 }
 
@@ -97,6 +107,10 @@ fn classify(ident: &str, unit: &str, msg: &str) -> Option<Source> {
         Some(Source::Systemd)
     } else if ident == "su" || ident == "sudo" {
         Some(Source::Privilege)
+    } else if ident == "audit" || (ident == "kernel" && msg.starts_with("audit: type=")) {
+        Some(Source::Audit)
+    } else if crate::parse::auth::is_auth_line(ident, msg) {
+        Some(Source::Auth)
     } else {
         None
     }
@@ -105,6 +119,21 @@ fn classify(ident: &str, unit: &str, msg: &str) -> Option<Source> {
 /// Programs whose lines count as `Source::Privilege`, where the system installs them: any
 /// user can run a copy named `su` of their own, and log lines tagged `su` with `logger`.
 const PRIVILEGE_PROGRAMS: [&str; 4] = ["/usr/bin/su", "/bin/su", "/usr/bin/sudo", "/bin/sudo"];
+
+/// Set-uid programs whose PAM lines count as `Source::Auth` though they run as the user who
+/// started them; everything else must run as root.
+const SETUID_AUTH_PROGRAMS: [&str; 10] = [
+    "/usr/bin/passwd",
+    "/usr/bin/chsh",
+    "/usr/bin/chfn",
+    "/usr/bin/newgrp",
+    "/usr/bin/gpasswd",
+    "/usr/bin/pkexec",
+    "/usr/lib/polkit-1/polkit-agent-helper-1",
+    "/usr/libexec/polkit-agent-helper-1",
+    "/usr/lib/policykit-1/polkit-agent-helper-1",
+    "/usr/bin/run0",
+];
 
 /// ejabberd prefixes every message with its own millisecond ISO timestamp; prefer it.
 fn refine_ts(source: Source, ts: Micros, msg: &str) -> Micros {
@@ -170,7 +199,7 @@ pub fn parse_syslog_line(line: &str, years: &mut YearGuess) -> Option<Record> {
     if source == Source::Ejabberd {
         years.sync(ts);
     }
-    let sender = matches!(source, Source::Custom | Source::Privilege)
+    let sender = matches!(source, Source::Custom | Source::Privilege | Source::Auth)
         .then(|| Box::new(Sender { ident: Some(ident.to_string()), ..Default::default() }));
     Some(Record { ts, source, pid, msg: msg.to_string(), cursor: None, sender })
 }
@@ -240,6 +269,15 @@ fn genuine(source: Source, e: &JournalEntry) -> bool {
             Some(x) => PRIVILEGE_PROGRAMS.contains(&x),
             None => e.uid.as_deref().is_none_or(|u| u == "0"),
         },
+        // a root process's, or one of the set-uid programs the system installs (any user can
+        // log a line with `pam_unix(login:auth)` in it, or tagged `useradd`)
+        Source::Auth => match e.uid.as_deref() {
+            None | Some("0") => true,
+            Some(_) => e.exe.as_deref().is_some_and(|x| SETUID_AUTH_PROGRAMS.contains(&x)),
+        },
+        // only programs allowed to write audit records (CAP_AUDIT_WRITE) can make them; a
+        // line tagged `audit` that came another way is someone's `logger`
+        Source::Audit => e.transport.as_deref().is_none_or(|t| t == "audit" || t == "kernel"),
         // the patterns check the sender themselves (`parse::custom`)
         Source::Nextcloud | Source::Peer | Source::Custom => true,
     }
@@ -325,14 +363,16 @@ pub fn parse_journal_json(line: &str) -> (Option<Record>, Option<String>) {
     let unit = e.unit.as_deref().unwrap_or("");
     // An entry no built-in parser reads (or one whose sender isn't who it claims) may still
     // be for a pattern of your own, which judges the sender by journald's fields.
-    let source = match classify(ident, unit, &msg) {
+    // journald's own audit records, whatever identifier they carry
+    let classified = if e.transport.as_deref() == Some("audit") { Some(Source::Audit) } else { classify(ident, unit, &msg) };
+    let source = match classified {
         Some(s) if genuine(s, &e) => s,
         Some(_) => return (None, cursor),
         None => Source::Custom,
     };
     let ts = e.realtime.as_deref().and_then(|t| t.parse().ok()).unwrap_or_else(time::now);
     let pid = e.pid.as_deref().or(e.syslog_pid.as_deref()).and_then(|p| p.parse().ok()).unwrap_or(0);
-    let sender = matches!(source, Source::Custom | Source::Privilege).then(|| {
+    let sender = matches!(source, Source::Custom | Source::Privilege | Source::Auth).then(|| {
         Box::new(Sender {
             ident: e.ident.clone(),
             unit: e.unit.clone(),
@@ -354,7 +394,7 @@ mod tests {
     fn syslog_ejabberd_line_uses_inner_iso_timestamp() {
         let mut y = YearGuess::new(2020);
         let r = parse_syslog_line(
-            "Aug 16 21:20:19 example.org ejabberdctl[26427]: 2026-08-16 21:20:19.107 [info] (#PID<0.28856.0>) Accepted connection [::ffff:11.39.25.27]:59195 -> [::ffff:11.24.39.236]:5223",
+            "Aug 16 21:20:19 example.org ejabberdctl[26427]: 2026-08-16 21:20:19.107 [info] (#PID<0.28856.0>) Accepted connection [::ffff:11.45.25.27]:59195 -> [::ffff:11.29.39.236]:5223",
             &mut y,
         )
         .unwrap();
@@ -423,6 +463,25 @@ mod tests {
         assert_eq!(su(r#""SYSLOG_IDENTIFIER":"su","_EXE":"/tmp/su","_UID":"1000""#), None);
         assert_eq!(su(r#""SYSLOG_IDENTIFIER":"su","_UID":"1000""#), None, "logger -t su");
         assert_eq!(su(r#""SYSLOG_IDENTIFIER":"su","_UID":"0""#), Some(Source::Privilege));
+        // PAM and account tool lines: from root, or from the set-uid programs installed
+        let auth = |fields: &str, msg: &str| parse_journal_json(&format!("{{{fields},\"MESSAGE\":\"{msg}\"}}")).0.map(|r| r.source);
+        let login = "pam_unix(login:auth): authentication failure; logname=LOGIN uid=0 euid=0 tty=/dev/tty1 ruser= rhost=  user=root";
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"login","_EXE":"/usr/bin/login","_UID":"0""#, login), Some(Source::Auth));
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"login","_EXE":"/usr/bin/logger","_UID":"1000""#, login), None, "logger -t login");
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"useradd","_UID":"1000""#, "new user: name=x, UID=0"), None);
+        let polkit = "pam_unix(polkit-1:auth): authentication failure; logname= uid=1000 euid=0 tty= ruser=eve rhost= user=root";
+        let helper = r#""SYSLOG_IDENTIFIER":"polkit-agent-helper-1","_EXE":"/usr/lib/polkit-1/polkit-agent-helper-1","_UID":"1000""#;
+        assert_eq!(auth(helper, polkit), Some(Source::Auth), "set-uid, run by the user");
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"cron","_UID":"0""#, "(root) CMD (x)"), Some(Source::Custom));
+        // audit records: journald's own, or the kernel's; a line tagged audit by anyone else isn't one
+        let rec = "USER_AUTH pid=1 uid=0 msg='op=PAM:authentication acct=\\\"root\\\" exe=\\\"/usr/bin/login\\\" terminal=tty1 res=failed'";
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"audit","_TRANSPORT":"audit""#, rec), Some(Source::Audit));
+        assert_eq!(auth(r#""_TRANSPORT":"audit""#, rec), Some(Source::Audit), "whatever its identifier");
+        assert_eq!(auth(r#""SYSLOG_IDENTIFIER":"audit","_TRANSPORT":"syslog","_UID":"0""#, rec), None);
+        assert_eq!(
+            auth(r#""SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel""#, &format!("audit: type=1100 audit(1.2:3): {}", &rec[10..])),
+            Some(Source::Audit)
+        );
         let forged = r#"{"SYSLOG_IDENTIFIER":"sshd","_EXE":"/usr/bin/logger","_TRANSPORT":"syslog","MESSAGE":"Invalid user admin from 1.2.3.4 port 5555"}"#;
         assert!(parse_journal_json(forged).0.is_none());
         let real = r#"{"SYSLOG_IDENTIFIER":"sshd-session","_EXE":"/usr/lib/openssh/sshd-session","MESSAGE":"Invalid user admin from 1.2.3.4 port 5555"}"#;

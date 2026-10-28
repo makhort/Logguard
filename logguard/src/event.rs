@@ -63,13 +63,16 @@ pub enum Signal {
     CustomProbe,
     /// The same, `kind = "success"`: a login, which earns its address trust.
     CustomSuccess,
+    /// A failed login PAM logged for a service without a parser of its own (FTP, Cockpit,
+    /// ...), from an address on the internet.
+    PamAuthFail,
 }
 
 /// Event detail of a *successful* login to a canary account (worse than a failed one).
 pub const CANARY_LOGIN: &str = "LOGGED IN to canary account";
 
 impl Signal {
-    pub const ALL: [Signal; 27] = [
+    pub const ALL: [Signal; 28] = [
         Signal::XmppTlsFail,
         Signal::XmppAuthFail,
         Signal::XmppAuthOk,
@@ -97,6 +100,7 @@ impl Signal {
         Signal::CustomFailure,
         Signal::CustomProbe,
         Signal::CustomSuccess,
+        Signal::PamAuthFail,
     ];
 
     pub fn name(self) -> &'static str {
@@ -128,6 +132,7 @@ impl Signal {
             Signal::CustomFailure => "custom_failure",
             Signal::CustomProbe => "custom_probe",
             Signal::CustomSuccess => "custom_success",
+            Signal::PamAuthFail => "pam_auth_fail",
         }
     }
 
@@ -140,7 +145,15 @@ impl Signal {
     }
 
     pub fn is_auth_failure(self) -> bool {
-        matches!(self, Signal::XmppAuthFail | Signal::SshAuthFail | Signal::SshInvalidUser | Signal::NcAuthFail | Signal::CustomFailure)
+        matches!(
+            self,
+            Signal::XmppAuthFail
+                | Signal::SshAuthFail
+                | Signal::SshInvalidUser
+                | Signal::NcAuthFail
+                | Signal::CustomFailure
+                | Signal::PamAuthFail
+        )
     }
 
     pub fn source(self) -> Source {
@@ -165,6 +178,7 @@ impl Signal {
             Signal::PeerReport => Source::Peer,
             Signal::WebProbe | Signal::NcAuthFail | Signal::NcCanary => Source::Nextcloud,
             Signal::CustomFailure | Signal::CustomProbe | Signal::CustomSuccess => Source::Custom,
+            Signal::PamAuthFail => Source::Auth,
         }
     }
 }

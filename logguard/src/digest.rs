@@ -378,17 +378,28 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
             ));
         }
     }
+    if let Some(w) = &s.waf {
+        attention.extend(w.problems().into_iter().map(|p| format!("waf {p}")));
+    }
     if let Some(r) = &s.exposure {
         if r.firewall() == crate::exposure::Firewall::Absent && r.firewall_checked() && r.listeners.iter().any(|l| l.exposure.is_exposed())
         {
             attention.push("no firewall filters incoming traffic: every listener on a public address is reachable".into());
         }
         for dead in &r.dead_rules {
-            attention.push(format!("dead ufw rule {dead} (nothing listens)"));
+            attention.push(format!("dead {} rule {dead} (nothing listens)", r.firewall().name()));
         }
     }
     if let Some(p) = &s.patches {
         attention.extend(p.concerns());
+    }
+    if let Some(a) = &s.ssh_audit {
+        let c = a.concerns();
+        let more = c.len().saturating_sub(6);
+        attention.extend(c.into_iter().take(6));
+        if more > 0 {
+            attention.push(format!("ssh: {more} more problems (logguard ssh-audit)"));
+        }
     }
     attention.extend(d.attention.iter().rev().take(15).cloned());
 
@@ -473,15 +484,23 @@ fn render_raw(d: &DigestData, s: &Snapshot, warn_days: i64) -> (String, String) 
     if let Some(f) = &s.feeds {
         b += &format!("Blocklists: {} networks{}\n", f.v4 + f.v6, if f.applied { "" } else { " (not applied)" });
     }
+    if let Some(w) = &s.waf {
+        let bans: usize = w.sources.iter().map(|x| x.banned).sum();
+        let list = w.list_v4 + w.list_v6;
+        b += &format!("WAF decisions: {bans} bans, {list} listed networks{}\n", if w.applied || list == 0 { "" } else { " (not applied)" });
+    }
     if !s.allowed.is_empty() {
         b += &format!("Operator allowlist: {} entries\n", s.allowed.len());
     }
     if let Some(p) = &s.patches {
         b += &format!("Patches: {}\n", p.summary());
     }
+    if let Some(a) = &s.ssh_audit {
+        b += &format!("SSH: {}\n", a.summary());
+    }
     if let Some(v) = &s.verify {
         b += &format!(
-            "Packages: checked {} ({} files, {} differ from dpkg), {} set-uid/set-gid programs\n",
+            "Packages: checked {} ({} files, {} differ from their packages), {} set-uid/set-gid programs\n",
             &fmt_ts(v.last_run)[..10],
             v.checked,
             v.mismatched,

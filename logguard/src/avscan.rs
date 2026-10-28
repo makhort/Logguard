@@ -34,11 +34,44 @@ pub struct AvCfg {
     pub log: PathBuf,
     /// Warn when no scan has finished for this long ("0s" = never).
     pub stale_after: Dur,
+    /// Scans of the files the integrity watches report new or changed (`filescan`): "none",
+    /// "clamav", "yara" or "both". Independent of `enabled` (the scheduled scans' log).
+    pub scan_changed: crate::filescan::Scanners,
+    pub clamscan: PathBuf,
+    pub clamdscan: PathBuf,
+    /// clamd's socket: while it exists, files go to clamd (`clamdscan --fdpass`), else to clamscan.
+    pub clamd_socket: PathBuf,
+    pub yara: PathBuf,
+    /// YARA rule files (`.yar`, `.yara`), directories of them, or one file compiled with `yarac` (`.yarc`).
+    pub yara_rules: Vec<PathBuf>,
+    /// Runs clamscan and yara as a transient service, outside logguard's memory limit; empty
+    /// runs them directly (within it: small YARA rule sets only).
+    pub systemd_run: PathBuf,
+    /// That service's `MemoryMax`.
+    pub scan_memory: String,
+    /// Longest a scan may take.
+    pub scan_timeout: Dur,
+    /// Larger files are not scanned (MB).
+    pub scan_max_mb: u64,
 }
 
 impl Default for AvCfg {
     fn default() -> Self {
-        AvCfg { enabled: false, log: "/var/log/logguard/avscan.log".into(), stale_after: Dur(36 * 3600) }
+        AvCfg {
+            enabled: false,
+            log: "/var/log/logguard/avscan.log".into(),
+            stale_after: Dur(36 * 3600),
+            scan_changed: crate::filescan::Scanners::None,
+            clamscan: "/usr/bin/clamscan".into(),
+            clamdscan: "/usr/bin/clamdscan".into(),
+            clamd_socket: "/run/clamav/clamd.ctl".into(),
+            yara: "/usr/bin/yara".into(),
+            yara_rules: vec![],
+            systemd_run: "/usr/bin/systemd-run".into(),
+            scan_memory: "2G".into(),
+            scan_timeout: Dur(1800),
+            scan_max_mb: 100,
+        }
     }
 }
 
@@ -238,6 +271,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                 evidence: vec![],
                 notify: true,
                 owner: None,
+                files: vec![],
             });
         }
         if st.reported == 0 {
@@ -265,6 +299,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     evidence: s.infected.clone(),
                     notify: true,
                     owner: None,
+                    files: vec![],
                 });
             }
             if !s.ok() {
@@ -280,6 +315,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     evidence: vec![],
                     notify: true,
                     owner: None,
+                    files: vec![],
                 });
             } else if s.infections() == 0 {
                 let files = s.scanned_files.map(|n| format!("{n} files, ")).unwrap_or_default();
@@ -293,6 +329,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     evidence: vec![],
                     notify: false,
                     owner: None,
+                    files: vec![],
                 });
             }
             if s.db_outdated {
@@ -304,6 +341,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                     evidence: vec![],
                     notify: true,
                     owner: None,
+                    files: vec![],
                 });
             }
             st.reported = st.reported.max(s.end);
@@ -323,6 +361,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                 evidence: vec![],
                 notify: true,
                 owner: None,
+                files: vec![],
             });
         }
     }
@@ -352,6 +391,7 @@ pub fn judge(st: &mut AvState, r: &AvReport, cfg: &AvCfg, started: Micros) -> Ve
                 evidence: vec![],
                 notify: true,
                 owner: None,
+                files: vec![],
             });
         }
     }

@@ -30,6 +30,9 @@ pub struct Offender {
     pub categories: BTreeSet<String>,
     /// Sanitised evidence, oldest first.
     pub evidence: Vec<Line>,
+    /// Evidence lines beyond the ones kept (the console's live report keeps a few per source).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted: usize,
     /// For a network ban: the addresses in it that took part.
     pub members: Vec<IpAddr>,
     pub place: Option<String>,
@@ -77,15 +80,23 @@ fn log_files(path: &Path, from: Micros) -> Vec<PathBuf> {
 
 /// Ban actions taken since `from`, from the actions log and its rotated (gzip) copies.
 pub fn load_bans(path: &Path, from: Micros) -> Result<Vec<Action>> {
+    let mut out = Vec::new();
+    for_each_ban(path, from, |a| out.push(a))?;
+    out.sort_by_key(|a| a.ts);
+    Ok(out)
+}
+
+/// Each ban action taken since `from`, as it is read (in no particular order): a week of a
+/// busy server's bans is never all in memory at once.
+pub fn for_each_ban(path: &Path, from: Micros, mut f: impl FnMut(Action)) -> Result<()> {
     let files = log_files(path, from);
     if files.is_empty() {
         anyhow::bail!("no actions log at {} (see `actions_log` in the config)", path.display());
     }
-    let mut out = Vec::new();
-    for f in files {
-        let file = std::fs::File::open(&f).with_context(|| format!("opening {}", f.display()))?;
+    for file in files {
+        let opened = std::fs::File::open(&file).with_context(|| format!("opening {}", file.display()))?;
         let reader: Box<dyn Read> =
-            if f.extension().is_some_and(|e| e == "gz") { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
+            if file.extension().is_some_and(|e| e == "gz") { Box::new(flate2::read::GzDecoder::new(opened)) } else { Box::new(opened) };
         // a damaged (rotated, compressed) file still yields what it has up to the damage
         let _ = crate::record::for_each_action_line(reader, |line| {
             if !line.contains("\"ban\"") {
@@ -93,13 +104,12 @@ pub fn load_bans(path: &Path, from: Micros) -> Result<Vec<Action>> {
             }
             if let Ok(a) = serde_json::from_str::<Action>(line) {
                 if a.kind == ActionKind::Ban && a.ts >= from && a.target.is_some() {
-                    out.push(a);
+                    f(a);
                 }
             }
         });
     }
-    out.sort_by_key(|a| a.ts);
-    Ok(out)
+    Ok(())
 }
 
 /// An evidence line (`10-12 14:03:11 invalid user oracle`) with private details withheld;
@@ -167,24 +177,53 @@ pub struct Filter {
 
 /// Groups the bans by target, keeping this host's own evidence only.
 pub fn collect(bans: &[Action], filter: &Filter) -> Vec<Offender> {
-    let mut by: BTreeMap<Net, Offender> = BTreeMap::new();
+    let mut c = Collector::new(filter, usize::MAX, usize::MAX);
     for a in bans {
-        let Some(net) = a.target else { continue };
+        c.add(a);
+    }
+    c.finish()
+}
+
+/// [`collect`] one ban at a time.
+pub struct Collector<'a> {
+    filter: &'a Filter,
+    /// Evidence lines kept per source; the rest are counted in `omitted`.
+    max_evidence: usize,
+    /// Sources kept; bans of further ones are only counted in `beyond`.
+    max_sources: usize,
+    by: BTreeMap<Net, Offender>,
+    /// Sources not kept (see `max_sources`).
+    pub beyond: usize,
+}
+
+impl<'a> Collector<'a> {
+    pub fn new(filter: &'a Filter, max_evidence: usize, max_sources: usize) -> Self {
+        Collector { filter, max_evidence, max_sources, by: BTreeMap::new(), beyond: 0 }
+    }
+
+    pub fn add(&mut self, a: &Action) {
+        let Some(net) = a.target else { return };
+        if !self.by.contains_key(&net) && self.by.len() >= self.max_sources {
+            self.beyond += 1;
+            return;
+        }
         // Peer bans carry another node's evidence; a reinstated ban (put back when a network
         // ban covering it expired) is no new activity.
         if matches!(a.category.as_deref(), Some("from peers" | "reinstated")) || a.message.contains("(from peer ") {
-            continue;
+            return;
         }
-        if !filter.only.is_empty() && !filter.only.iter().any(|f| f.contains_net(&net) || net.contains_net(f)) {
-            continue;
+        let only = &self.filter.only;
+        if !only.is_empty() && !only.iter().any(|f| f.contains_net(&net) || net.contains_net(f)) {
+            return;
         }
-        let o = by.entry(net).or_insert_with(|| Offender {
+        let o = self.by.entry(net).or_insert_with(|| Offender {
             net,
             first: a.ts,
             last: a.ts,
             bans: 0,
             categories: BTreeSet::new(),
             evidence: vec![],
+            omitted: 0,
             members: vec![],
             place: None,
             contact: None,
@@ -205,32 +244,39 @@ pub fn collect(bans: &[Action], filter: &Filter) -> Vec<Offender> {
                 if let Some(text) = sanitize(text) {
                     o.first = o.first.min(t);
                     let line = Line { ts: t, server: None, text };
-                    if !o.evidence.contains(&line) {
+                    if o.evidence.len() >= self.max_evidence {
+                        o.omitted += 1;
+                    } else if !o.evidence.contains(&line) {
                         o.evidence.push(line);
                     }
                 }
             }
         }
     }
-    // A network's members carry their own evidence from their own bans.
-    let member_events: BTreeMap<IpAddr, usize> = by.values().filter(|o| o.net.is_host()).map(|o| (o.net.addr, o.evidence.len())).collect();
-    let mut out: Vec<Offender> = by
-        .into_values()
-        .filter(|o| {
-            let events = o.evidence.len() + o.members.iter().map(|m| member_events.get(m).copied().unwrap_or(1)).sum::<usize>();
-            events >= filter.min_events.max(1)
-        })
-        .collect();
-    for o in &mut out {
-        o.evidence.sort();
-        o.members.sort();
-        // "Seen" is when the activity happened, not when bans were decided.
-        if let (Some(f), Some(l)) = (o.evidence.first(), o.evidence.last()) {
-            (o.first, o.last) = (f.ts, l.ts);
+
+    pub fn finish(self) -> Vec<Offender> {
+        // A network's members carry their own evidence from their own bans.
+        let member_events: BTreeMap<IpAddr, usize> =
+            self.by.values().filter(|o| o.net.is_host()).map(|o| (o.net.addr, o.evidence.len() + o.omitted)).collect();
+        let min = self.filter.min_events.max(1);
+        let mut out: Vec<Offender> = self
+            .by
+            .into_values()
+            .filter(|o| {
+                o.evidence.len() + o.omitted + o.members.iter().map(|m| member_events.get(m).copied().unwrap_or(1)).sum::<usize>() >= min
+            })
+            .collect();
+        for o in &mut out {
+            o.evidence.sort();
+            o.members.sort();
+            // "Seen" is when the activity happened, not when bans were decided.
+            if let (Some(f), Some(l)) = (o.evidence.first(), o.evidence.last()) {
+                (o.first, o.last) = (f.ts, l.ts);
+            }
         }
+        rank(&mut out);
+        out
     }
-    rank(&mut out);
-    out
 }
 
 pub(crate) fn service_of(proto: &str, port: u16) -> Option<&'static str> {
@@ -467,6 +513,7 @@ pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
                     m.categories.extend(o.categories);
                     // duplicates go below, sorted: a peer's report may hold a million lines
                     m.evidence.extend(o.evidence);
+                    m.omitted += o.omitted;
                     m.members.extend(o.members);
                     m.place = m.place.take().or(o.place);
                     m.contact = m.contact.take().or(o.contact);
@@ -487,12 +534,16 @@ pub fn merge(reports: Vec<Report>) -> (Report, Vec<usize>) {
 
 /// Most persistent first: repeated bans, then the amount of evidence.
 pub fn rank(list: &mut [Offender]) {
-    list.sort_by_key(|o| std::cmp::Reverse((o.bans, o.evidence.len() + o.members.len())));
+    list.sort_by_key(|o| std::cmp::Reverse((o.bans, events(o))));
 }
 
 /// Evidence lines (and network members) behind an entry.
 pub fn events(o: &Offender) -> usize {
-    o.evidence.len() + o.members.len()
+    o.evidence.len() + o.omitted + o.members.len()
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 const MAX_LINES: usize = 25;
@@ -555,13 +606,113 @@ fn render_text_raw(r: &Report) -> String {
                     let to = l.server.as_ref().map(|sv| format!("(to {sv}) ")).unwrap_or_default();
                     s += &format!("  {}  {to}{}\n", ts(l.ts), plain(&l.text));
                 }
-                if o.evidence.len() > MAX_LINES {
-                    s += &format!("  ... and {} more\n", o.evidence.len() - MAX_LINES);
+                let more = o.evidence.len().saturating_sub(MAX_LINES) + o.omitted;
+                if more > 0 {
+                    s += &format!("  ... and {more} more\n");
                 }
             }
         }
     }
     s
+}
+
+// ------------------------------------------------------------------ the console's live report
+
+/// Sources in the console's live report, the most persistent first.
+pub const LIVE_SOURCES: usize = 1000;
+/// Log lines per source in it (as many as the text report quotes).
+pub const LIVE_LINES: usize = MAX_LINES;
+/// Sources read for it before the ranking: the report is built inside the daemon, whose
+/// memory is limited (its unit's `MemoryMax`), and a week of a flood's bans would exceed it;
+/// bans of further sources are only counted. (The weekly report, built in a process of its
+/// own, has no such cap.)
+pub const LIVE_MAX_SOURCES: usize = 20_000;
+
+/// This server's abuse report as it stands, for logguard-web (`abuse 24h` / `abuse 7d` on
+/// the console socket): every source of the window, its activity in words, its network from
+/// the geo database ([`locate`]) and its first log lines worded for an abuse desk. No abuse
+/// mailboxes: those take RDAP lookups, which the weekly report makes.
+#[derive(Clone, Debug, Serialize)]
+pub struct Live {
+    pub host: String,
+    pub addresses: Vec<IpAddr>,
+    pub from: Micros,
+    pub to: Micros,
+    /// Sources in the window, also those beyond [`LIVE_SOURCES`].
+    pub sources: usize,
+    pub offenders: Vec<LiveSource>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveSource {
+    pub net: Net,
+    pub first: Micros,
+    pub last: Micros,
+    pub bans: u32,
+    /// Log lines and network members behind it.
+    pub events: usize,
+    pub categories: BTreeSet<String>,
+    /// What it did, as the text report says it.
+    pub activity: String,
+    pub evidence: Vec<Line>,
+    /// Log lines beyond those in `evidence`.
+    pub omitted: usize,
+    pub members: Vec<IpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+/// Builds the live report of the `since` window up to `now` from the actions log at `path`.
+pub fn live(path: &Path, since: crate::time::Dur, now: Micros, host: String, addresses: Vec<IpAddr>) -> Result<Live> {
+    let from = window_start(now, since);
+    let filter = Filter { only: vec![], min_events: 1 };
+    // a few more lines than shown, for the ranking; a port scan's thousands only counted
+    let mut c = Collector::new(&filter, 4 * LIVE_LINES, LIVE_MAX_SOURCES);
+    for_each_ban(path, from, |a| c.add(&a))?;
+    let beyond = c.beyond;
+    let all = c.finish();
+    let sources = all.len() + beyond;
+    let offenders = all
+        .into_iter()
+        .take(LIVE_SOURCES)
+        .map(|o| {
+            let shown = o.evidence.len().min(LIVE_LINES);
+            LiveSource {
+                net: o.net,
+                first: o.first,
+                last: o.last,
+                bans: o.bans,
+                events: events(&o),
+                activity: describe(&o),
+                evidence: o.evidence[..shown].iter().map(|l| Line { ts: l.ts, server: None, text: plain(&l.text) }).collect(),
+                omitted: o.evidence.len() - shown + o.omitted,
+                members: o.members.iter().take(100).copied().collect(),
+                categories: o.categories,
+                country: None,
+                country_name: None,
+                asn: None,
+                org: None,
+            }
+        })
+        .collect();
+    Ok(Live { host, addresses, from, to: now, sources, offenders })
+}
+
+/// Fills in each source's country and network.
+pub fn locate(r: &mut Live, db: &crate::geo::GeoDb) {
+    for o in &mut r.offenders {
+        let g = db.lookup(o.net.addr);
+        o.country = g.country.map(|c| String::from_utf8_lossy(&c).into_owned());
+        o.country_name = g.country_name().map(str::to_string);
+        o.asn = g.asn;
+        o.org = g.org;
+    }
 }
 
 // ------------------------------------------------------------------ abuse contacts (RDAP)
@@ -813,7 +964,7 @@ mod tests {
         let old = collect(
             &[ban(
                 "2026-10-11 15:39:20",
-                "11.33.61.51",
+                "11.39.61.51",
                 "",
                 &["10-11 15:34:44 block TCP/46468", "10-11 15:39:20 port scan: 16 closed ports"],
             )],
@@ -825,11 +976,11 @@ mod tests {
             &[
                 ban(
                     "2026-10-12 13:03:28",
-                    "11.4.32.8",
+                    "11.7.32.8",
                     "port scan",
                     &["10-12 12:55:13 block TCP/9794", "10-12 13:03:28 port scan: 8 closed ports"],
                 ),
-                ban("2026-10-12 16:24:29", "11.4.32.8", "reinstated", &[]),
+                ban("2026-10-12 16:24:29", "11.7.32.8", "reinstated", &[]),
             ],
             &Filter { only: vec![], min_events: 1 },
         );
@@ -873,6 +1024,55 @@ mod tests {
         assert!(text.contains("2026-10-11 09:00:00 UTC  (to 192.0.2.2) connection attempt to closed port TCP/23 (Telnet)"), "{text}");
     }
 
+    /// The console's live report: the window, this server's own bans, a few lines per source.
+    #[test]
+    fn live_report() {
+        let dir = std::env::temp_dir().join(format!("lg-abuse-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("actions.jsonl");
+        let now = time::parse_iso_prefix("2026-10-28 12:00:00").unwrap().0;
+        let scan: Vec<String> = (0..200).map(|i| format!("10-28 10:{:02}:{:02} tripwire block TCP/{}", i / 60, i % 60, 1000 + i)).collect();
+        let scan: Vec<&str> = scan.iter().map(String::as_str).collect();
+        let mut bans = [
+            ban("2026-10-28 11:00:00", "198.51.100.7", "tripwire", &scan),
+            ban("2026-10-25 09:00:00", "192.0.2.5", "ssh", &["10-25 08:59:00 failed password for alice"]),
+            ban("2026-10-28 11:30:00", "192.0.2.6", "from peers", &["10-28 11:29:00 invalid user oracle"]),
+        ];
+        bans[0].message = "ban 198.51.100.7 for 1h".into();
+        let text: String = bans.iter().map(|a| serde_json::to_string(a).unwrap() + "\n").collect();
+        std::fs::write(&log, text).unwrap();
+
+        let day = live(&log, "24h".parse().unwrap(), now, "h".into(), vec![]).unwrap();
+        assert_eq!(day.sources, 1, "the week's ban and the peer's are not in the day's");
+        let o = &day.offenders[0];
+        assert_eq!(o.net.to_string(), "198.51.100.7");
+        assert_eq!((o.evidence.len(), o.omitted, o.events), (LIVE_LINES, 200 - LIVE_LINES, 200));
+        assert_eq!(o.evidence[0].text, "connection attempt to closed port TCP/1000");
+        assert!(o.activity.starts_with("connections to closed ports"), "{}", o.activity);
+
+        let week = live(&log, "7d".parse().unwrap(), now, "h".into(), vec![]).unwrap();
+        assert_eq!(week.sources, 2);
+        let ssh = week.offenders.iter().find(|o| o.net.to_string() == "192.0.2.5").unwrap();
+        assert_eq!(ssh.evidence[0].text, "failed password login (account name withheld)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live report keeps a bounded number of sources (it is built inside the daemon's
+    /// memory limit); the rest are counted, not kept.
+    #[test]
+    fn live_report_sources_are_capped() {
+        let filter = Filter { only: vec![], min_events: 1 };
+        let mut c = Collector::new(&filter, LIVE_LINES, 2);
+        for (i, ip) in ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.1"].iter().enumerate() {
+            c.add(&ban(&format!("2026-10-28 10:0{i}:00"), ip, "ssh", &["10-28 09:59:00 failed password for alice"]));
+        }
+        assert_eq!(c.beyond, 1, "the third source is counted only");
+        let kept = c.finish();
+        assert_eq!(kept.iter().map(|o| o.net.to_string()).collect::<Vec<_>>(), ["192.0.2.1", "192.0.2.2"]);
+        assert_eq!(kept[0].bans, 2, "a kept source's later bans still count");
+    }
+
     /// A peer's report (up to 64 MB unpacked) merges in a moment, whatever it holds.
     #[test]
     fn large_peer_reports_merge_quickly() {
@@ -883,6 +1083,7 @@ mod tests {
             bans: 1,
             categories: BTreeSet::new(),
             evidence: (0..n).map(|i| Line { ts: Micros::from(i), server: None, text: "block TCP/23".into() }).collect(),
+            omitted: 0,
             members: (0..n).map(|i| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i))).collect(),
             place: None,
             contact: None,

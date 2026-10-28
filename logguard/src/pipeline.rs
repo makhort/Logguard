@@ -106,6 +106,10 @@ impl Pipeline {
         if !self.cfg.sources.enabled(rec.source) {
             return Vec::new();
         }
+        // with auditd's file, the journal's copies of its records would count twice
+        if rec.source == crate::record::Source::Audit && rec.cursor.is_some() && !self.cfg.sources.audit_log.as_os_str().is_empty() {
+            return Vec::new();
+        }
         // syslog exports carry systemd's lines about every unit; only the watched ones count
         if rec.source == crate::record::Source::Systemd
             && crate::parse::systemd::parse(&rec.msg).is_none_or(|(unit, _)| !self.cfg.sources.services.contains(&unit))
@@ -144,6 +148,22 @@ impl Pipeline {
             if let Some(sw) = crate::parse::privilege::parse(ident, &rec.msg) {
                 actions.extend(self.engine.on_privilege(&sw, rec.ts));
             }
+        }
+        let auth = match rec.source {
+            crate::record::Source::Auth => {
+                crate::parse::auth::pam(rec.sender.as_ref().and_then(|s| s.ident.as_deref()).unwrap_or(""), &rec.msg)
+            }
+            // sshd's own lockouts (its other PAM lines say what sshd's say)
+            crate::record::Source::Ssh
+                if self.cfg.sources.pam && (rec.msg.starts_with("pam_faillock(") || rec.msg.starts_with("pam_tally")) =>
+            {
+                crate::parse::auth::pam("sshd", &rec.msg)
+            }
+            crate::record::Source::Audit => crate::parse::auth::audit(&rec.msg, &self.cfg.sources.audit_keys),
+            _ => None,
+        };
+        if let Some(a) = auth {
+            actions.extend(self.engine.on_auth(&a, rec.ts));
         }
         actions.extend(self.services_down(rec.ts));
         for note in std::mem::take(&mut self.parsers.ejabberd.ops) {
@@ -253,6 +273,119 @@ mod tests {
     }
 
     use crate::engine::{Severity, Topic};
+
+    /// PAM and the audit log: a failed console login alerts once though PAM and the audit
+    /// log both report it; a brute force on an FTP server is scored like SSH's; the journal's
+    /// audit records don't count twice when auditd's file is read.
+    #[test]
+    fn pam_and_audit_lines() {
+        use crate::record::Sender;
+        let cfg = Config::from_toml("[sources]\naudit_keys = [\"identity\"]").unwrap();
+        let mut p = Pipeline::new(Arc::new(cfg), 0);
+        let pam = |s: i64, ident: &str, msg: &str| Record {
+            ts: s * crate::time::SEC,
+            source: Source::Auth,
+            pid: 1,
+            msg: msg.into(),
+            cursor: Some("c".into()),
+            sender: Some(Box::new(Sender { ident: Some(ident.into()), ..Default::default() })),
+        };
+        let audit = |s: i64, msg: &str| Record {
+            ts: s * crate::time::SEC,
+            source: Source::Audit,
+            pid: 0,
+            msg: msg.into(),
+            cursor: Some("c".into()),
+            sender: None,
+        };
+        let alerts = |a: &[Action]| {
+            a.iter().filter(|a| a.kind == crate::engine::ActionKind::Alert).map(|a| (a.severity, a.message.clone())).collect::<Vec<_>>()
+        };
+        let console = "pam_unix(login:auth): authentication failure; logname=LOGIN uid=0 euid=0 tty=/dev/tty1 ruser= rhost=  user=root";
+        let a = alerts(&p.feed(&pam(10, "login", console)));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].0, Severity::High);
+        assert_eq!(a[0].1, "login as root on tty1 failed (login) - if it wasn't you, someone is trying root's password");
+        let twin = "USER_AUTH pid=1 uid=0 auid=4294967295 msg='op=PAM:authentication acct=\"root\" exe=\"/usr/bin/login\" hostname=? addr=? terminal=/dev/tty1 res=failed'";
+        assert!(alerts(&p.feed(&audit(10, twin))).is_empty(), "the same failure");
+        assert!(alerts(&p.feed(&pam(20, "login", console))).is_empty(), "counted into the next alert");
+        let a = alerts(&p.feed(&pam(20 + 11 * 60, "login", console)));
+        assert!(a[0].1.contains("(login), 3 failures in 11m10s"), "{a:?}");
+
+        // polkit: per user who asked, whatever account they try
+        let polkit = |user: &str| {
+            format!("pam_unix(polkit-1:auth): authentication failure; logname= uid=1000 euid=0 tty= ruser=eve rhost= user={user}")
+        };
+        assert_eq!(alerts(&p.feed(&pam(1000, "polkit-agent-helper-1", &polkit("root")))).len(), 1);
+        assert!(alerts(&p.feed(&pam(1002, "polkit-agent-helper-1", &polkit("gateway")))).is_empty());
+
+        // FTP from the internet: scored, five strikes, no alert per failure
+        let ftp = "pam_unix(vsftpd:auth): authentication failure; logname= uid=0 euid=0 tty=ftp ruser=admin rhost=203.0.113.9  user=admin";
+        let mut bans = 0;
+        for s in 0..5 {
+            let a = p.feed(&pam(2000 + s, "vsftpd", ftp));
+            assert!(alerts(&a).iter().all(|(sev, m)| *sev != Severity::High || m.contains("ban")), "{a:?}");
+            bans += a.iter().filter(|a| a.kind == crate::engine::ActionKind::Ban).count();
+        }
+        assert_eq!(bans, 1);
+        assert_eq!(p.engine.export(None).bans.len(), 1);
+        // abuse reports quote the evidence without the account
+        let quoted = crate::abuse::sanitize("failed vsftpd password for admin").unwrap();
+        assert!(!quoted.contains("admin") && quoted.contains("vsftpd"), "{quoted}");
+
+        // account changes, auditd, rule keys
+        let a = alerts(&p.feed(&pam(3000, "usermod", "add 'eve' to group 'sudo'")));
+        assert_eq!(a[0].0, Severity::High);
+        let grp =
+            "GRP_MGMT pid=1 uid=0 auid=1000 msg='op=add-user-to-group grp=\"sudo\" acct=\"eve\" exe=\"/usr/sbin/usermod\" res=success'";
+        assert!(alerts(&p.feed(&audit(3000, grp))).is_empty(), "the same change");
+        let a = alerts(&p.feed(&audit(3100, "CONFIG_CHANGE op=set audit_enabled=0 old=1 auid=1000 ses=2 res=1")));
+        assert_eq!(a[0].0, Severity::High);
+        let sys =
+            "SYSCALL arch=c000003e syscall=257 success=yes auid=1000 uid=0 tty=pts0 comm=\"vim\" exe=\"/usr/bin/vim\" key=\"identity\"";
+        assert_eq!(alerts(&p.feed(&audit(3200, sys)))[0].0, Severity::Warning);
+
+        // auditd's file: the journal's copies are left out
+        let file = Arc::new(Config::from_toml("[sources]\naudit_log = \"/var/log/audit/audit.log\"").unwrap());
+        let mut q = Pipeline::new(file, 0);
+        let off = "CONFIG_CHANGE op=set audit_enabled=0 old=1 auid=1000 ses=2 res=1";
+        assert!(q.feed(&audit(10, off)).is_empty());
+        let from_file = Record { cursor: None, ..audit(10, &format!("type=CONFIG_CHANGE msg=audit(1.2:3): {}", &off[14..])) };
+        assert_eq!(alerts(&q.feed(&from_file)).len(), 1);
+        // pam = false, audit = false
+        let mut off_cfg = Pipeline::new(Arc::new(Config::from_toml("[sources]\npam = false\naudit = false").unwrap()), 0);
+        assert!(off_cfg.feed(&pam(10, "login", console)).is_empty() && off_cfg.feed(&audit(10, twin)).is_empty());
+    }
+
+    /// A built-in app source (`[sources] apps`): an nginx error log's lines, as `tail -F`
+    /// delivers them, through the engine to a ban.
+    #[test]
+    fn app_lines_ban() {
+        let cfg = Config::from_toml("[sources]\napps = [\"nginx\"]\n[sources.app_logs]\nnginx_error = \"/srv/log/error.log\"").unwrap();
+        let mut p = Pipeline::new(Arc::new(cfg), 0);
+        let line = |s: u32, user: &str| {
+            crate::record::Record {
+            ts: i64::from(s) * crate::time::SEC,
+            source: Source::Custom,
+            pid: 0,
+            msg: format!("2026/10/25 10:00:0{s} [error] 9#9: *{s} user \"{user}\": password mismatch, client: 198.51.100.8, server: x, request: \"GET / HTTP/1.1\""),
+            cursor: None,
+            sender: Some(Box::new(crate::record::Sender { file: Some("/srv/log/error.log".into()), ..Default::default() })),
+        }
+        };
+        let bans = |a: &[crate::engine::Action]| a.iter().filter(|a| a.kind == crate::engine::ActionKind::Ban).count();
+        for s in 1..5 {
+            assert_eq!(bans(&p.feed(&line(s, "admin"))), 0, "25 points each");
+        }
+        assert_eq!(bans(&p.feed(&line(5, "root"))), 1, "five strikes");
+        let snap = p.snapshot(50);
+        let auth = snap.patterns.iter().find(|v| v.stats.name == "nginx_auth").unwrap();
+        assert_eq!((auth.from.as_str(), auth.stats.matches), ("file /srv/log/error.log", 5));
+        // another file's line isn't nginx's
+        let mut other = line(6, "x");
+        other.sender = Some(Box::new(crate::record::Sender { file: Some("/var/log/other.log".into()), ..Default::default() }));
+        assert!(p.feed(&other).is_empty());
+    }
 
     #[test]
     fn privilege_and_custom_lines() {

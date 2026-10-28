@@ -38,6 +38,8 @@ enum Msg {
     Peer(Box<crate::cluster::Envelope>, Option<std::net::IpAddr>),
     Delivered(usize, Result<(), String>),
     Feeds(Vec<crate::net::Net>, Box<crate::feeds::FeedStatus>),
+    /// A `[waf]` refresh: the list, and each ban source's decisions.
+    Waf(Box<crate::waf::WafUpdate>),
     /// The cluster peers resolved again, with what could not be resolved.
     PeerNets(Vec<crate::net::Net>, Vec<String>),
     Certs(Vec<crate::digest::CertStatus>),
@@ -59,11 +61,17 @@ enum Msg {
     Patches(Box<crate::patches::PatchReport>),
     Verify(Box<crate::verify::VerifyReport>),
     Proc(Box<crate::procwatch::ProcReport>),
+    SshAudit(Box<crate::sshaudit::SshAuditReport>),
     /// A completed handshake with a honeypot listener (`[ports] honeypot`), with its time.
     Honeypot(crate::honeypot::Hit, time::Micros),
     /// A line of a log file a pattern of your own reads (`[[patterns]] file`).
     Custom(Record),
+    /// A scan of changed files finished (`[antivirus] scan_changed`).
+    FileScan(Box<crate::filescan::ScanReport>),
 }
+
+/// Most files handed to one scan of changed files; the rest wait for the next.
+const MAX_SCAN_BATCH: usize = 200;
 
 /// The journal fields `record::parse_journal_json` reads (journalctl adds the cursor and the
 /// time itself). Only these are printed: any local user can log entries with hundreds of
@@ -244,9 +252,9 @@ fn follow(
     });
 }
 
-/// Follows a log file a pattern of your own reads (`tail -F`, from its end: lines written
-/// while logguard was down aren't read), as `Source::Custom` records stamped when read.
-fn follow_file(path: String, tx: SyncSender<Msg>, stop: Arc<AtomicBool>) {
+/// Follows a log file a pattern reads, or auditd's (`tail -F`, from its end: lines written
+/// while logguard was down aren't read), as records of `source` stamped when read.
+fn follow_file(path: String, source: crate::record::Source, tx: SyncSender<Msg>, stop: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut warned = false;
         while !stop.load(Ordering::Relaxed) {
@@ -261,7 +269,7 @@ fn follow_file(path: String, tx: SyncSender<Msg>, stop: Arc<AtomicBool>) {
                 Err(e) => {
                     if !warned {
                         warned = true;
-                        eprintln!("logguard: [[patterns]] {path}: cannot run tail: {e}");
+                        eprintln!("logguard: {path}: cannot run tail: {e}");
                     }
                     thread::sleep(Duration::from_secs(30));
                     continue;
@@ -272,8 +280,9 @@ fn follow_file(path: String, tx: SyncSender<Msg>, stop: Arc<AtomicBool>) {
             while matches!(crate::record::read_line_capped(&mut reader, &mut buf, MAX_FOLLOWED_LINE), Ok(n) if n > 0) {
                 let msg = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
                 buf.clear();
-                let sender = Some(Box::new(crate::record::Sender { file: Some(path.clone()), ..Default::default() }));
-                let rec = Record { ts: time::now(), source: crate::record::Source::Custom, pid: 0, msg, cursor: None, sender };
+                let sender = (source == crate::record::Source::Custom)
+                    .then(|| Box::new(crate::record::Sender { file: Some(path.clone()), ..Default::default() }));
+                let rec = Record { ts: time::now(), source, pid: 0, msg, cursor: None, sender };
                 if tx.send(Msg::Custom(rec)).is_err() {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -392,6 +401,93 @@ fn serve_control(path: PathBuf, control: SyncSender<Control>) -> Result<()> {
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    answer(listener, control, |cmd| Ok(cmd.to_string()), None);
+    Ok(())
+}
+
+/// The console socket (`[console]`, for logguard-web): snapshots, the digest preview and abuse
+/// reports only. It is bound after the control socket, whose owner is this process.
+fn serve_console(
+    cfg: &crate::console::ConsoleCfg,
+    control_socket: &Path,
+    control: SyncSender<Control>,
+    reports: Arc<AbuseReports>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let gid = crate::console::group(cfg)?;
+    let me = fs::symlink_metadata(control_socket).context("the control socket is needed first")?.uid();
+    let listener = crate::console::bind(cfg, gid, me)?;
+    answer(listener, control, console_admit, Some(reports));
+    Ok(())
+}
+
+/// How long a built abuse report is handed out again (the console asks while its page is open).
+const ABUSE_FRESH: Duration = Duration::from_secs(60);
+/// Abuse report requests in progress or waiting; more are refused.
+const ABUSE_WAITING: usize = 2;
+
+/// The console socket's abuse reports. Reading a week of the actions log takes a moment and
+/// needs nothing of the main loop's, so they are built beside it: one at a time, each kept a
+/// minute.
+struct AbuseReports {
+    actions_log: Option<PathBuf>,
+    /// The main loop's geo database, for the sources' countries and networks.
+    geo: Arc<Mutex<Option<Arc<crate::geo::GeoDb>>>>,
+    /// (command, when, answer)
+    built: Mutex<Vec<(String, Instant, String)>>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl AbuseReports {
+    fn new(actions_log: Option<PathBuf>, geo: Arc<Mutex<Option<Arc<crate::geo::GeoDb>>>>) -> Self {
+        AbuseReports { actions_log, geo, built: Mutex::new(vec![]), waiting: Default::default() }
+    }
+
+    fn answer(&self, cmd: &str) -> String {
+        let Some(since) = crate::console::abuse_window(cmd) else { return format!("error: unknown command '{cmd}'") };
+        let Some(path) = &self.actions_log else {
+            return "error: actions_log is off in logguard's configuration: no abuse reports".into();
+        };
+        let mut built = self.built.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, text)) = built.iter().find(|(c, at, _)| c == cmd && at.elapsed() < ABUSE_FRESH) {
+            return text.clone();
+        }
+        let addresses = crate::net::local_addresses().into_iter().filter(|a| !crate::engine::is_non_global(*a)).collect();
+        let text = match crate::abuse::live(path, since, time::now(), crate::cluster::hostname(), addresses) {
+            Ok(mut r) => {
+                // under the lock: the main loop releases the database (before a reload) only
+                // when no report is using it
+                if let Some(db) = self.geo.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    crate::abuse::locate(&mut r, db);
+                }
+                serde_json::to_string(&r).unwrap_or_else(|e| format!("error: {e}"))
+            }
+            Err(e) => format!("error: {e:#}"),
+        };
+        built.retain(|(c, at, _)| c != cmd && at.elapsed() < ABUSE_FRESH);
+        if !text.starts_with("error: ") {
+            built.push((cmd.to_string(), Instant::now(), text.clone()));
+        }
+        text
+    }
+}
+
+/// What the console socket passes on to the main loop: reading commands only.
+fn console_admit(cmd: &str) -> Result<String, String> {
+    crate::console::read_only(cmd)
+        .map(str::to_string)
+        .ok_or_else(|| format!("error: read-only socket: only {} (the control socket has the rest)", crate::console::COMMANDS.join(", ")))
+}
+
+/// Answers each connection's command (an empty one asks for the snapshot) through the main
+/// loop; `admit` turns it into the command to run, or refuses it with the reply. Abuse
+/// reports (the console socket's) are built by `reports`, beside the main loop.
+fn answer(
+    listener: UnixListener,
+    control: SyncSender<Control>,
+    admit: fn(&str) -> Result<String, String>,
+    reports: Option<Arc<AbuseReports>>,
+) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
@@ -403,7 +499,30 @@ fn serve_control(path: PathBuf, control: SyncSender<Control>) -> Result<()> {
             let _ = (&mut s).take(4096).read_to_end(&mut cmd);
             let cmd = String::from_utf8_lossy(&cmd).trim().to_string();
             let cmd = if cmd.is_empty() { "snapshot".to_string() } else { cmd };
-            // Executed by the main loop (it owns all state); the socket is root-only (0600).
+            let cmd = match admit(&cmd) {
+                Ok(cmd) => cmd,
+                Err(refused) => {
+                    let _ = s.write_all(refused.as_bytes());
+                    continue;
+                }
+            };
+            if let Some(r) = reports.as_ref().filter(|_| crate::console::abuse_window(&cmd).is_some()) {
+                if r.waiting.fetch_add(1, Ordering::SeqCst) >= ABUSE_WAITING {
+                    r.waiting.fetch_sub(1, Ordering::SeqCst);
+                    let _ = s.write_all(b"error: busy building abuse reports: ask again in a moment");
+                    continue;
+                }
+                let r = Arc::clone(r);
+                thread::spawn(move || {
+                    let reply = r.answer(&cmd);
+                    r.waiting.fetch_sub(1, Ordering::SeqCst);
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
+                    let _ = s.write_all(reply.as_bytes());
+                });
+                continue;
+            }
+            // Executed by the main loop (it owns all state); the control socket is root-only
+            // (0600), the console socket only reads.
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let reply = match control.send((cmd, reply_tx)) {
                 Ok(()) => reply_rx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| "error: daemon did not answer".into()),
@@ -412,7 +531,6 @@ fn serve_control(path: PathBuf, control: SyncSender<Control>) -> Result<()> {
             let _ = s.write_all(reply.as_bytes());
         }
     });
-    Ok(())
 }
 
 /// The saved state; or why it couldn't be used. An unreadable file is kept aside (it would
@@ -603,6 +721,14 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         // Disabling feeds in the config removes a previously loaded list.
         let _ = enforcer.load_feeds(&[]);
     }
+    if !cfg.geoblock.enabled {
+        // the same for [geoblock]; when enabled, it loads with the geo database
+        let _ = enforcer.load_geoblock(&[]);
+    }
+    if !cfg.waf.enabled || !cfg.waf.sources.iter().any(|s| s.action == crate::waf::WafAction::List) {
+        // and for [waf] lists: what an earlier configuration loaded
+        let _ = enforcer.load_waf(&[]);
+    }
     eprintln!(
         "logguard: started, mode={:?} backend={} notify={} resume={} active_bans={}",
         cfg.mode,
@@ -616,13 +742,20 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     // Operator commands and snapshot requests get their own channel, checked every loop
     // iteration, so a journal backlog never makes the TUI wait.
     let (ctrl_tx, ctrl_rx) = sync_channel::<Control>(16);
-    if let Err(e) = serve_control(cfg.socket.clone(), ctrl_tx) {
-        eprintln!("logguard: control socket disabled: {e:#}");
+    // The geo database the main loop has, for the feeds' ASN lists and the console's abuse
+    // reports: used under the lock, so it is released (before a reload) only when nothing uses it.
+    let geo_slot: Arc<Mutex<Option<Arc<crate::geo::GeoDb>>>> = Arc::new(Mutex::new(None));
+    match serve_control(cfg.socket.clone(), ctrl_tx.clone()) {
+        Ok(()) if cfg.console.enabled() => {
+            let reports = Arc::new(AbuseReports::new(cfg.actions_log.clone(), Arc::clone(&geo_slot)));
+            if let Err(e) = serve_console(&cfg.console, &cfg.socket, ctrl_tx, reports) {
+                eprintln!("logguard: console socket disabled: {e:#}");
+            }
+        }
+        Ok(()) => {}
+        Err(e) => eprintln!("logguard: control socket disabled (and so the console socket): {e:#}"),
     }
     let protected: Vec<crate::net::Net> = cfg.allowlist.nets.iter().chain(never_block.iter()).copied().collect();
-    // The geo database the main loop has, for the feeds' ASN lists: used under the lock, so
-    // it is released (before a reload) only when no list is being expanded with it.
-    let geo_slot: Arc<Mutex<Option<Arc<crate::geo::GeoDb>>>> = Arc::new(Mutex::new(None));
     let feeds_refresh = if cfg.feeds.enabled {
         let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
         let (tx, fcfg, protected, slot) = (tx.clone(), cfg.feeds.clone(), protected.clone(), Arc::clone(&geo_slot));
@@ -633,6 +766,23 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 return;
             }
             match refresh_rx.recv_timeout(Duration::from_secs(fcfg.refresh.0.max(3600))) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return,
+            }
+        });
+        Some(refresh_tx)
+    } else {
+        None
+    };
+    let waf_refresh = if cfg.waf.enabled {
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, wcfg, protected) = (tx.clone(), cfg.waf.clone(), protected.clone());
+        thread::spawn(move || loop {
+            let update = crate::waf::refresh(&wcfg, &protected, time::now());
+            if tx.send(Msg::Waf(Box::new(update))).is_err() {
+                return;
+            }
+            match refresh_rx.recv_timeout(Duration::from_secs(wcfg.refresh.0.max(10))) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return,
             }
@@ -671,6 +821,7 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         });
     }
     let mut feed_nets: Vec<crate::net::Net> = Vec::new();
+    let mut geo_nets: Vec<crate::net::Net> = Vec::new();
     if cfg.geo.enabled {
         let (tx, gcfg, stop) = (tx.clone(), cfg.geo.clone(), Arc::clone(&stop));
         thread::spawn(move || {
@@ -689,7 +840,7 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                         }
                         let _ = ack_rx.recv_timeout(Duration::from_secs(60));
                     }
-                    match crate::geo::GeoDb::load(&gcfg.dir) {
+                    match crate::geo::GeoDb::open(&gcfg) {
                         Ok(db) => {
                             eprintln!("logguard: geo database loaded ({})", db.summary);
                             loaded = true;
@@ -712,8 +863,8 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     }
     // Where each followed log was left (see `follow`).
     let position = |name: &str| pipe.engine.followers.get(name).copied().unwrap_or(0);
-    if cfg.sources.nextcloud {
-        let nc = &cfg.nextcloud;
+    if cfg.sources.nextcloud_aio {
+        let nc = &cfg.nextcloud_aio;
         if !nc.apache_container.is_empty() {
             let container = nc.apache_container.clone();
             follow(
@@ -856,6 +1007,20 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             }
         });
     }
+    if cfg.ssh_audit.enabled {
+        let (tx, scfg, stop) = (tx.clone(), cfg.ssh_audit.clone(), Arc::clone(&stop));
+        thread::spawn(move || {
+            // a few minutes after start: sshd may be restarting with logguard (a reboot, an upgrade)
+            while nap(Duration::from_secs(300), &stop) {
+                if tx.send(Msg::SshAudit(Box::new(crate::sshaudit::scan(&scfg, time::now())))).is_err() {
+                    return;
+                }
+                if !nap(Duration::from_secs(scfg.interval.0.max(600).saturating_sub(300)), &stop) {
+                    return;
+                }
+            }
+        });
+    }
     if cfg.procwatch.enabled {
         let (tx, pcfg, stop) = (tx.clone(), cfg.procwatch.clone(), Arc::clone(&stop));
         thread::spawn(move || loop {
@@ -878,11 +1043,35 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             Arc::clone(&stop),
         )
     };
-    for p in &cfg.patterns {
-        if let Some(f) = &p.file {
-            follow_file(f.display().to_string(), tx.clone(), Arc::clone(&stop));
-        }
+    for line in &cfg.app_logs_found {
+        eprintln!("logguard: [sources] apps: {line}");
     }
+    // one tail per file, however many patterns read it (each line counts once)
+    let files: std::collections::BTreeSet<&std::path::PathBuf> = cfg.all_patterns().flat_map(|p| p.files()).collect();
+    for f in files {
+        follow_file(f.display().to_string(), crate::record::Source::Custom, tx.clone(), Arc::clone(&stop));
+    }
+    if cfg.sources.audit && !cfg.sources.audit_log.as_os_str().is_empty() {
+        follow_file(cfg.sources.audit_log.display().to_string(), crate::record::Source::Audit, tx.clone(), Arc::clone(&stop));
+    }
+    // Scans of changed files, one batch at a time: the engine queues the files the integrity
+    // watches report, the main loop hands them over while no scan runs.
+    let scan_tx: Option<SyncSender<Vec<crate::filescan::Job>>> =
+        (cfg.antivirus.scan_changed != crate::filescan::Scanners::None).then(|| {
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<crate::filescan::Job>>(1);
+            let (tx, av) = (tx.clone(), cfg.antivirus.clone());
+            let work = cfg.state_file.parent().map_or_else(|| PathBuf::from("/var/lib/logguard"), Path::to_path_buf);
+            thread::spawn(move || {
+                while let Ok(jobs) = job_rx.recv() {
+                    let report = crate::filescan::scan(&av, jobs, &work, &time::now);
+                    if tx.send(Msg::FileScan(Box::new(report))).is_err() {
+                        return;
+                    }
+                }
+            });
+            job_tx
+        });
+    let mut scan_busy = false;
     if cfg.antivirus.enabled {
         let (tx, path, stop) = (tx.clone(), cfg.antivirus.log.clone(), Arc::clone(&stop));
         thread::spawn(move || {
@@ -902,6 +1091,9 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     // or they'd move the engine clock forward and squash the backlog into one burst.
     let mut deferred_peers: Vec<(crate::cluster::Envelope, Option<std::net::IpAddr>)> = Vec::new();
     let mut deferred_exposure: Option<crate::exposure::ExposureReport> = None;
+    let mut deferred_waf: Option<Box<crate::waf::WafUpdate>> = None;
+    // what the sets waf4/waf6 hold
+    let mut waf_nets: Vec<crate::net::Net> = Vec::new();
     let mut deferred_live: Vec<(&'static str, Record)> = Vec::new();
     let mut deferred_positions: Vec<(&'static str, time::Micros)> = Vec::new();
     let mut deferred_events: Vec<crate::event::Event> = Vec::new();
@@ -936,7 +1128,7 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                     }
                 });
             }
-            let (inbox, skew, limits) = (c.cfg.inbox.clone(), c.cfg.max_clock_skew, c.limits.clone());
+            let (inbox, skew, limits, node_keys) = (c.cfg.inbox.clone(), c.cfg.max_clock_skew, c.limits.clone(), c.node_keys.clone());
             let senders = crate::cluster::Senders::default();
             // A file from a peer is written here, in the connection's thread: it carries no facts.
             let deliver = move |env: crate::cluster::Envelope, from: Option<std::net::IpAddr>| {
@@ -949,7 +1141,19 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                     eprintln!("logguard: cluster: file from {} refused: [cluster] peer_accept doesn't allow files from there", env.from);
                     return true;
                 }
-                if !own_name {
+                // signed by the key pinned for its name ([cluster] nodes): its sender's for sure
+                let signed = match crate::cluster::file_signed(&node_keys, &env) {
+                    Ok(signed) => signed,
+                    Err(why) => {
+                        eprintln!(
+                            "logguard: cluster: file from '{}' ({}) refused: {why}",
+                            crate::event::clean(&env.from, 64),
+                            from.map_or("?".into(), |ip| ip.to_string())
+                        );
+                        return true;
+                    }
+                };
+                if !own_name && !signed {
                     eprintln!(
                         "logguard: cluster: file from '{}' ({}) refused: a peer limited by [cluster] peer_accept sends under its own node name only",
                         crate::event::clean(&env.from, 64),
@@ -1017,6 +1221,8 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
         let instead = match enforcer.kind {
             crate::enforce::Kind::Ufw => "ufw instead: no rate limits, no blocklist feeds, ufw rules don't expire on their own",
             crate::enforce::Kind::Iptables => "iptables instead: no rate limits, no blocklist feeds, bans end only while logguard runs",
+            crate::enforce::Kind::Firewalld => "firewalld instead: no rate limits, no blocklist feeds, bans end only while logguard runs",
+            crate::enforce::Kind::Ipset => "ipset instead: no rate limits",
             _ => "nothing (shadow): no bans are applied",
         };
         let msg = format!("nftables setup failed, enforcing with {instead}. Error: {err}");
@@ -1071,7 +1277,16 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     let mut caught_up = false;
     while !stop.load(Ordering::Relaxed) {
         while let Ok((cmd, reply)) = ctrl_rx.try_recv() {
-            let (text, actions) = control(&cmd, &mut pipe, &cluster, &cfg, &feeds_refresh, &enforcer, &mut feed_nets, caught_up);
+            let (text, actions) = control(
+                &cmd,
+                &mut pipe,
+                &cluster,
+                &cfg,
+                (&feeds_refresh, &waf_refresh),
+                &enforcer,
+                (&mut feed_nets, &mut waf_nets),
+                caught_up,
+            );
             for a in actions {
                 sink.handle(&enforcer, &mut pipe.engine, a);
             }
@@ -1082,6 +1297,9 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 for a in pipe.engine.on_exposure(r, cfg.sources.ufw) {
                     sink.handle(&enforcer, &mut pipe.engine, a);
                 }
+            }
+            if let Some(u) = deferred_waf.take() {
+                apply_waf(*u, &mut pipe, &cfg, &enforcer, &mut sink, &mut waf_nets);
             }
             for (name, rec) in std::mem::take(&mut deferred_live) {
                 for a in feed_live(&mut pipe, name, rec) {
@@ -1226,6 +1444,19 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
             }
             Ok(Msg::Geo(db, errors)) => {
                 if let Some(db) = db {
+                    if cfg.geoblock.enabled {
+                        let (loaded, status) = apply_geoblock(&db, &cfg.geoblock, &protected, &enforcer);
+                        if let Some(nets) = loaded {
+                            geo_nets = nets;
+                        }
+                        if let Some(e) = &status.error {
+                            let msg = format!("[geoblock] not loaded: {e}");
+                            for a in pipe.engine.system_alert_wall("geoblock", 86_400 * time::SEC, Severity::Warning, msg, time::now()) {
+                                sink.handle(&enforcer, &mut pipe.engine, a);
+                            }
+                        }
+                        pipe.engine.geoblock = Some(status);
+                    }
                     *geo_slot.lock().unwrap() = Some(Arc::clone(&db));
                     pipe.engine.geo = Some(db);
                     // the ASN lists waited for it
@@ -1288,6 +1519,9 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 }
                 pipe.engine.resources = Some(*r);
             }
+            // its bans are decided on the wall clock
+            Ok(Msg::Waf(u)) if !caught_up => deferred_waf = Some(u),
+            Ok(Msg::Waf(u)) => apply_waf(*u, &mut pipe, &cfg, &enforcer, &mut sink, &mut waf_nets),
             Ok(Msg::Exposure(r)) if !caught_up => deferred_exposure = Some(*r),
             Ok(Msg::Exposure(r)) => {
                 for a in pipe.engine.on_exposure(*r, cfg.sources.ufw) {
@@ -1355,6 +1589,17 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                     sink.handle(&enforcer, &mut pipe.engine, a);
                 }
             }
+            Ok(Msg::SshAudit(r)) => {
+                for a in pipe.engine.on_ssh_audit(*r) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
+            Ok(Msg::FileScan(r)) => {
+                scan_busy = false;
+                for a in pipe.engine.on_file_scan(&r) {
+                    sink.handle(&enforcer, &mut pipe.engine, a);
+                }
+            }
             Ok(Msg::Honeypot(hit, ts)) => {
                 let ev = crate::event::Event::new(ts, hit.ip, crate::event::Signal::TripwireConnect)
                     .port(Some(hit.port))
@@ -1388,6 +1633,12 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if let (Some(jobs), false) = (&scan_tx, scan_busy) {
+            let batch = pipe.engine.take_scans(MAX_SCAN_BATCH);
+            if !batch.is_empty() {
+                scan_busy = jobs.send(batch).is_ok();
+            }
         }
         if caught_up && last_tick.elapsed() >= Duration::from_secs(1) {
             last_tick = Instant::now();
@@ -1469,8 +1720,9 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
                 eprintln!("logguard: updating the kernel tripwire ports: {e:#}");
             }
             let missing = !enforcer.table_present();
-            if let Some(msg) =
-                missing.then(|| enforcer.heal(&pipe.engine.active_bans(), &pipe.engine.allowed(), &feed_nets, time::now())).flatten()
+            if let Some(msg) = missing
+                .then(|| enforcer.heal(&pipe.engine.active_bans(), &pipe.engine.allowed(), &feed_nets, &waf_nets, &geo_nets, time::now()))
+                .flatten()
             {
                 eprintln!("logguard: {msg}");
                 for a in pipe.engine.system_alert_wall("nft-heal", 10 * time::MIN, Severity::High, msg, time::now()) {
@@ -1500,7 +1752,109 @@ pub fn run(cfg: Arc<Config>) -> Result<()> {
     }
     save_state(&cfg.state_file, &pipe.engine.export(cursor))?;
     let _ = fs::remove_file(&cfg.socket);
+    if cfg.console.enabled() {
+        let _ = fs::remove_file(&cfg.console.socket);
+    }
     Ok(())
+}
+
+/// Applies a `[waf]` refresh: loads the list (when it changed), brings each ban source's bans
+/// in line with its decisions, and raises a `system` alert (daily) about sources that fail.
+fn apply_waf(
+    u: crate::waf::WafUpdate,
+    pipe: &mut Pipeline,
+    cfg: &Config,
+    enforcer: &Enforcer,
+    sink: &mut ActionSink,
+    waf_nets: &mut Vec<crate::net::Net>,
+) {
+    let mut status = u.status;
+    let was_applied = pipe.engine.waf.as_ref().is_some_and(|w| w.applied);
+    status.applied = was_applied;
+    match u.list {
+        Some(list) if list != *waf_nets || (!was_applied && !list.is_empty()) => match enforcer.load_waf(&list) {
+            Ok(applied) => {
+                status.applied = applied;
+                if applied || list.is_empty() {
+                    *waf_nets = list;
+                }
+            }
+            Err(e) => status.error = Some(format!("loading the list into the firewall: {e:#}")),
+        },
+        Some(_) => {}
+        // refused (too many): what is loaded stays
+        None => {
+            status.list_v4 = waf_nets.iter().filter(|n| n.is_v4()).count();
+            status.list_v6 = waf_nets.len() - status.list_v4;
+        }
+    }
+    pipe.engine.now = pipe.engine.now.max(time::now());
+    for (name, decisions) in u.bans {
+        let Some(src) = cfg.waf.sources.iter().find(|s| s.name == name) else { continue };
+        let skipped = match decisions {
+            Some(d) => {
+                let (actions, skipped) = pipe.engine.waf_sync(src, &d);
+                for a in actions {
+                    sink.handle(enforcer, &mut pipe.engine, a);
+                }
+                Some(skipped)
+            }
+            None => None,
+        };
+        let banned = pipe.engine.waf_bans(&name).len();
+        let last = pipe.engine.waf.as_ref().and_then(|w| w.sources.iter().find(|s| s.name == name)).map(|s| s.skipped);
+        if let Some(st) = status.sources.iter_mut().find(|s| s.name == name) {
+            st.banned = banned;
+            st.skipped = skipped.or(last).unwrap_or(0);
+        }
+    }
+    let problems = status.problems();
+    if !problems.is_empty() {
+        let msg = format!("[waf] problems: {}", problems.join("; "));
+        for a in pipe.engine.system_alert_wall("waf", 86_400 * time::SEC, Severity::Warning, msg, time::now()) {
+            sink.handle(enforcer, &mut pipe.engine, a);
+        }
+    }
+    pipe.engine.waf = Some(status);
+}
+
+/// `[geoblock]`'s networks from a freshly loaded geo database, loaded into the firewall: the
+/// networks now in it (None: refused, the last ones stay), and the status.
+fn apply_geoblock(
+    db: &crate::geo::GeoDb,
+    gcfg: &crate::geo::GeoblockCfg,
+    keep: &[crate::net::Net],
+    enforcer: &Enforcer,
+) -> (Option<Vec<crate::net::Net>>, crate::geo::GeoblockStatus) {
+    let nets = db.blocked_networks(gcfg, keep);
+    let v4 = nets.iter().filter(|n| n.is_v4()).count();
+    let (countries, only_countries) = gcfg.country_codes();
+    let mut status = crate::geo::GeoblockStatus {
+        computed: time::now(),
+        what: gcfg.describe(),
+        v4,
+        v6: nets.len() - v4,
+        countries,
+        only_countries,
+        asns: gcfg.asns.clone(),
+        ..Default::default()
+    };
+    if nets.len() > gcfg.max_entries {
+        status.error = Some(format!("{} networks exceed max_entries {}", nets.len(), gcfg.max_entries));
+        return (None, status);
+    }
+    match enforcer.load_geoblock(&nets) {
+        Ok(applied) => status.applied = applied,
+        Err(e) => status.error = Some(format!("loading into {}: {e:#}", enforcer.name())),
+    }
+    eprintln!(
+        "logguard: geoblock ({}): {} IPv4 + {} IPv6 networks{}",
+        status.what,
+        status.v4,
+        status.v6,
+        if status.applied { String::new() } else { format!(", not applied ({})", enforcer.name()) }
+    );
+    (status.error.is_none().then_some(nets), status)
 }
 
 fn full_snapshot(pipe: &Pipeline, cluster: &Option<crate::cluster::Cluster>) -> crate::engine::Snapshot {
@@ -1543,14 +1897,16 @@ fn control(
     pipe: &mut Pipeline,
     cluster: &Option<crate::cluster::Cluster>,
     cfg: &Config,
-    feeds_refresh: &Option<std::sync::mpsc::Sender<()>>,
+    (feeds_refresh, waf_refresh): (&Option<std::sync::mpsc::Sender<()>>, &Option<std::sync::mpsc::Sender<()>>),
     enforcer: &Enforcer,
-    feed_nets: &mut Vec<crate::net::Net>,
+    (feed_nets, waf_nets): (&mut Vec<crate::net::Net>, &mut Vec<crate::net::Net>),
     caught_up: bool,
 ) -> (String, Vec<Action>) {
     let now = time::now();
     if cmd == "snapshot" {
-        return (serde_json::to_string(&full_snapshot(pipe, cluster)).unwrap_or_else(|e| format!("error: {e}")), vec![]);
+        let mut snap = full_snapshot(pipe, cluster);
+        snap.backend = Some(enforcer.name().into());
+        return (serde_json::to_string(&snap).unwrap_or_else(|e| format!("error: {e}")), vec![]);
     }
     if caught_up {
         // during catch-up the engine runs on record time; don't jump it to the wall clock
@@ -1561,10 +1917,33 @@ fn control(
         |i: usize| -> Result<crate::net::Net, String> { words.get(i).ok_or("missing address".to_string())?.parse::<crate::net::Net>() };
     let summarize = |actions: &[Action]| actions.iter().map(|a| a.message.clone()).collect::<Vec<_>>().join("\n");
     match words.as_slice() {
-        ["unban", ..] => match net(1).and_then(|n| pipe.engine.operator_unban(n)) {
-            Ok(actions) => (format!("ok\n{}", summarize(&actions)), actions),
-            Err(e) => (format!("error: {e}"), vec![]),
-        },
+        ["unban", ..] => {
+            // a WAF's ban comes back with its next read while the WAF still lists it
+            let from_waf: Vec<String> = match net(1) {
+                Ok(n) => pipe
+                    .engine
+                    .active_bans()
+                    .iter()
+                    .filter(|b| n.contains_net(&b.net) && b.origin.is_none() && b.reason.starts_with("waf "))
+                    .map(|b| b.net.to_string())
+                    .collect(),
+                Err(_) => vec![],
+            };
+            match net(1).and_then(|n| pipe.engine.operator_unban(n)) {
+                Ok(actions) => {
+                    let mut text = format!("ok\n{}", summarize(&actions));
+                    if !from_waf.is_empty() {
+                        text += &format!(
+                            "\nnote: {} banned by [waf]: banned again at its next read while the WAF lists it; \
+                             delete the decision there, or `logguard allow` it",
+                            from_waf.join(", ")
+                        );
+                    }
+                    (text, actions)
+                }
+                Err(e) => (format!("error: {e}"), vec![]),
+            }
+        }
         ["allow", _, secs, note @ ..] => {
             let secs: i64 = match secs.parse::<i64>() {
                 // capped at a year: also keeps `now + secs` far from overflowing
@@ -1576,9 +1955,15 @@ fn control(
                     let note = if note.is_empty() { "operator".to_string() } else { note.join(" ") };
                     let actions = pipe.engine.operator_allow(n, now + secs * time::SEC, note);
                     let mut text = format!("ok\n{}", summarize(&actions));
-                    // ufw can't let it through a wider ban (an allow rule would open every port)
-                    if let Some(b) = pipe.engine.covering_ban(&n).filter(|_| enforcer.kind == crate::enforce::Kind::Ufw) {
-                        text += &format!("\nnote: with ufw it stays blocked by the ban on {0}: `logguard unban {0}` to let it in", b.net);
+                    // ufw and firewalld can't let it through a wider ban (an allow rule would open every
+                    // port; a zone's sources have no exceptions)
+                    let through = matches!(enforcer.kind, crate::enforce::Kind::Ufw | crate::enforce::Kind::Firewalld);
+                    if let Some(b) = pipe.engine.covering_ban(&n).filter(|_| through) {
+                        text += &format!(
+                            "\nnote: with {1} it stays blocked by the ban on {0}: `logguard unban {0}` to let it in",
+                            b.net,
+                            enforcer.name()
+                        );
                     }
                     (text, actions)
                 }
@@ -1634,6 +2019,24 @@ fn control(
             }
             Err(e) => (format!("error: {e:#}"), vec![]),
         },
+        ["waf", "refresh"] => match waf_refresh {
+            Some(tx) => {
+                let _ = tx.send(());
+                ("ok: reading the [waf] sources (see `logguard waf` in a minute)".into(), vec![])
+            }
+            None => ("error: [waf] enabled = false".into(), vec![]),
+        },
+        ["waf", "clear"] => match enforcer.load_waf(&[]) {
+            Ok(_) => {
+                waf_nets.clear();
+                if let Some(w) = pipe.engine.waf.as_mut() {
+                    w.applied = false;
+                    w.error = Some("list cleared by operator (loaded again at the next refresh; its bans stay)".into());
+                }
+                ("ok: [waf] list sets emptied (bans from WAFs stay: `logguard unban` them)".into(), vec![])
+            }
+            Err(e) => (format!("error: {e:#}"), vec![]),
+        },
         ["digest"] => {
             let node = cluster.as_ref().map_or_else(crate::cluster::hostname, |c| c.node_id.clone());
             let (subject, body) =
@@ -1675,6 +2078,55 @@ pub fn fetch_snapshot(socket: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waf_updates_become_bans() {
+        use crate::waf::{Decision, SourceStatus, WafAction, WafStatus, WafUpdate};
+        let cfg = Arc::new(
+            Config::from_toml(
+                "[waf]\nenabled = true\n[[waf.sources]]\nname = \"crowdsec\"\nformat = \"crowdsec\"\nfile = \"/dev/null\"\n\
+                 [[waf.sources]]\nname = \"capi\"\nfile = \"/dev/null\"\naction = \"list\"\n",
+            )
+            .unwrap(),
+        );
+        let mut pipe = Pipeline::new(Arc::clone(&cfg), 0);
+        let enforcer = Enforcer::shadow();
+        let mut sink = ActionSink::new(None, Notifier::new(&cfg.notify, cfg.mode));
+        let mut waf_nets = Vec::new();
+        let now = time::now();
+        let status = |error: Option<&str>| WafStatus {
+            refreshed: now,
+            sources: vec![
+                SourceStatus { name: "crowdsec".into(), action: WafAction::Ban, error: error.map(String::from), ..Default::default() },
+                SourceStatus { name: "capi".into(), action: WafAction::List, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let ip: crate::net::Net = "11.18.9.9".parse().unwrap();
+        let decision =
+            Decision { net: ip, until: Some(now + 3600 * time::SEC), kind: "ban".into(), origin: "crowdsec".into(), reason: "x".into() };
+        let update = WafUpdate {
+            status: status(None),
+            list: Some(vec!["6.6.6.0/24".parse().unwrap()]),
+            bans: vec![("crowdsec".into(), Some(vec![decision]))],
+        };
+        apply_waf(update, &mut pipe, &cfg, &enforcer, &mut sink, &mut waf_nets);
+        assert!(pipe.engine.banned_by(ip.addr).is_some_and(|b| b.reason == "waf crowdsec: x"));
+        let w = pipe.engine.waf.clone().unwrap();
+        assert_eq!((w.sources[0].banned, w.applied, waf_nets.len()), (1, false, 0), "shadow mode: the list isn't loaded");
+
+        // the WAF can't be read: its ban stays, and the admins hear of it
+        let update = WafUpdate { status: status(Some("connection refused")), list: Some(vec![]), bans: vec![("crowdsec".into(), None)] };
+        apply_waf(update, &mut pipe, &cfg, &enforcer, &mut sink, &mut waf_nets);
+        assert!(pipe.engine.banned_by(ip.addr).is_some());
+        assert_eq!(pipe.engine.waf.as_ref().unwrap().sources[0].banned, 1);
+        assert!(pipe.snapshot(10).alerts.iter().any(|a| a.message.contains("[waf] problems: crowdsec: connection refused")));
+
+        // it can again, and the decision is gone: so is the ban
+        let update = WafUpdate { status: status(None), list: Some(vec![]), bans: vec![("crowdsec".into(), Some(vec![]))] };
+        apply_waf(update, &mut pipe, &cfg, &enforcer, &mut sink, &mut waf_nets);
+        assert!(pipe.engine.banned_by(ip.addr).is_none());
+    }
 
     #[test]
     fn unreadable_state_is_kept_aside() {
@@ -1780,6 +2232,69 @@ mod tests {
     }
 
     #[test]
+    fn console_socket_only_reads() {
+        let dir = std::env::temp_dir().join(format!("logguard-console-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("console.sock");
+        let _ = fs::remove_file(&path);
+        let (tx, rx) = sync_channel::<Control>(4);
+        let log = dir.join("actions.jsonl");
+        let ban = crate::engine::Action {
+            ts: time::now() - 3600 * time::SEC,
+            kind: crate::engine::ActionKind::Ban,
+            severity: Severity::High,
+            target: Some("203.0.113.9".parse().unwrap()),
+            until: None,
+            message: "ban 203.0.113.9 for 1h (offence #1)".into(),
+            evidence: vec![format!("{} tripwire block TCP/23", &time::fmt_ts(time::now() - 3600 * time::SEC)[5..19])],
+            superseded: vec![],
+            applied: true,
+            topic: None,
+            accounts: vec![],
+            user_note: None,
+            notice: None,
+            category: Some("tripwire".into()),
+        };
+        fs::write(&log, serde_json::to_string(&ban).unwrap() + "\n").unwrap();
+        let reports = Arc::new(AbuseReports::new(Some(log), Arc::default()));
+        answer(UnixListener::bind(&path).unwrap(), tx, console_admit, Some(reports));
+        let ask = |cmd: &str| {
+            let (path, cmd) = (path.clone(), cmd.to_string());
+            thread::spawn(move || control_command(&path, &cmd).unwrap())
+        };
+        for refused in [
+            "unban 192.0.2.1",
+            "ban 192.0.2.1 60",
+            "allow 192.0.2.1 60",
+            "disallow 192.0.2.1",
+            "feeds clear",
+            "waf clear",
+            "waf refresh",
+            "digest send",
+        ] {
+            let reply = ask(refused).join().unwrap();
+            assert!(reply.starts_with("error: read-only socket"), "{refused}: {reply}");
+        }
+        assert!(rx.try_recv().is_err(), "nothing refused reaches the main loop");
+        for (cmd, want) in [("", "snapshot"), ("snapshot", "snapshot"), ("digest", "digest")] {
+            let client = ask(cmd);
+            let (got, reply) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(got, want);
+            reply.send(format!("answer to {got}")).unwrap();
+            assert_eq!(client.join().unwrap(), format!("answer to {want}"));
+        }
+        // abuse reports are built beside the main loop, from the actions log
+        for cmd in ["abuse", "abuse 24h"] {
+            let reply = ask(cmd).join().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&reply).unwrap_or_else(|e| panic!("{e}: {reply}"));
+            assert_eq!(v["offenders"][0]["net"], "203.0.113.9", "{reply}");
+            assert!(v["offenders"][0]["evidence"][0]["text"].as_str().unwrap().contains("closed port TCP/23 (Telnet)"), "{reply}");
+        }
+        assert!(rx.try_recv().is_err(), "abuse reports don't reach the main loop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn notifies_systemd() {
         let dir = std::env::temp_dir().join(format!("logguard-notify-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -1836,11 +2351,18 @@ mod tests {
         for f in ["MESSAGE", "SYSLOG_IDENTIFIER", "_SYSTEMD_UNIT", "_PID", "_EXE", "_TRANSPORT", "_UID"] {
             assert!(fields.split(',').any(|x| x == f), "{f}");
         }
-        let tail = &args[args.len() - 13..];
+        let tail = &args[args.len() - 19..];
         assert_eq!(tail[0], "_SYSTEMD_UNIT=ejabberd.service");
         assert_eq!(tail[1], "+");
         assert_eq!(tail[8], "_TRANSPORT=kernel");
         assert_eq!(tail[12], "SYSLOG_IDENTIFIER=sudo");
+        assert_eq!(
+            (tail[14].as_str(), tail[16].as_str(), tail[18].as_str()),
+            ("SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10", "_TRANSPORT=audit")
+        );
+        // with auditd's file, not the journal's copies
+        let file = Config::from_toml("[sources]\naudit_log = \"/var/log/audit/audit.log\"").unwrap();
+        assert!(!journalctl_args(&file, None).contains(&"_TRANSPORT=audit".to_string()));
         let args = journalctl_args(&cfg, Some("s=1;i=2"));
         assert!(args.contains(&"--after-cursor=s=1;i=2".to_string()));
     }
