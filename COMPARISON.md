@@ -4,7 +4,7 @@
 a briefing for teams thinking about adopting it.**
 
 The state is as of 2026-10-28: logguard 0.3.0 and its web console, logguard-web 0.1.0 (commit
-`01e37a6`), compared with the releases and documentation of the other tools as of 2026-10-25. Feature claims about logguard come from its
+`b1ceffe`), compared with the releases and documentation of the other tools as of 2026-10-25. Feature claims about logguard come from its
 [README](logguard/README.md) and code. Claims about the other tools come from their documentation,
 release pages and advisories (see [Sources](#20-method-and-sources)). Products change, so check a
 tool's current documentation before you decide on one detail.
@@ -653,7 +653,7 @@ logguard works well next to:
 
 ## 20. Method and sources
 
-The logguard facts and numbers come from its READMEs and code at commit `01e37a6`; the
+The logguard facts and numbers come from its READMEs and code at commit `b1ceffe`; the
 measurements are the ones those READMEs report, the Fedora run included. The other tools were assessed from their
 documentation, release pages and advisories as of 2026-10-25. "✓" and "◐" mean what a tool
 offers out of the box or as a documented option, not everything a custom script could add. The
